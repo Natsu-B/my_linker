@@ -1,3 +1,29 @@
+#[macro_use]
+macro_rules! debugs {
+    ($expr:expr) => {{
+        #[allow(unused_unsafe)]
+        unsafe {
+            if crate::DEBUG_LEVEL.assume_init() >= 4 {
+                $expr
+            }
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! debugs_or {
+    ($debug:expr, $normal:expr) => {{
+        #[allow(unused_unsafe)]
+        unsafe {
+            if crate::DEBUG_LEVEL.assume_init() >= 4 {
+                $debug
+            } else {
+                $normal
+            }
+        }
+    }};
+}
+
 #[macro_export]
 macro_rules! pr_err {
     ($($arg:tt)*) => {{
