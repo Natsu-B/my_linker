@@ -13,7 +13,7 @@ struct Args {
 
     /// Input file
     #[clap(value_name = "InputFile", required = true)]
-    input: String,
+    input: Vec<String>,
 
     /// Debug Level 0: None, 1: Error, 2: Warning, 3: Info, 4: Debug
     #[clap(short, long, default_value_t = 2)]
