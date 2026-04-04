@@ -2,7 +2,8 @@
 macro_rules! pr_err {
     ($($arg:tt)*) => {{
         use colored::Colorize;
-        unsafe { if DEBUG_LEVEL.assume_init() >= 1 {
+        #[allow(unused_unsafe)]
+        unsafe { if crate::DEBUG_LEVEL.assume_init() >= 1 {
             eprintln!("{}", "ERROR:".red().bold());
             eprintln!($($arg)*);
         } }
@@ -13,7 +14,8 @@ macro_rules! pr_err {
 macro_rules! pr_warn {
     ($($arg:tt)*) => {{
         use colored::Colorize;
-        unsafe { if DEBUG_LEVEL.assume_init() >= 2 {
+        #[allow(unused_unsafe)]
+        unsafe { if crate::DEBUG_LEVEL.assume_init() >= 2 {
             eprintln!("{}", "WARNING:".yellow().bold());
             eprintln!($($arg)*);
         } }
@@ -24,7 +26,8 @@ macro_rules! pr_warn {
 macro_rules! pr_info {
     ($($arg:tt)*) => {{
         use colored::Colorize;
-        unsafe { if DEBUG_LEVEL.assume_init() >= 3 {
+        #[allow(unused_unsafe)]
+        unsafe { if crate::DEBUG_LEVEL.assume_init() >= 3 {
             println!("{}", "INFO:".blue().bold());
             println!($($arg)*);
         } }
@@ -35,7 +38,8 @@ macro_rules! pr_info {
 macro_rules! pr_debug {
     ($($arg:tt)*) => {{
         use colored::Colorize;
-        unsafe { if DEBUG_LEVEL.assume_init() >= 4 {
+        #[allow(unused_unsafe)]
+        unsafe { if crate::DEBUG_LEVEL.assume_init() >= 4 {
             println!("{}", "DEBUG:".green().bold());
             println!($($arg)*);
         } }
