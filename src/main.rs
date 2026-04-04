@@ -1,9 +1,14 @@
 use std::{mem::MaybeUninit, ptr};
 
+use anyhow::Result;
 use clap::Parser;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+
+use crate::open::open_file_and_mmap;
 
 #[macro_use]
 pub mod debug;
+mod open;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -22,8 +27,9 @@ struct Args {
 
 static mut DEBUG_LEVEL: MaybeUninit<u8> = MaybeUninit::uninit();
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+
     // # Safety
     // This is safe because we only write to DEBUG_LEVEL once and it is not accessed before
     unsafe {
@@ -31,4 +37,28 @@ fn main() {
     }
 
     pr_debug!("Arguments: {:?}", args);
+
+    // open files and create memory maps in parallel
+    let mmaps_result = args
+        .input
+        .par_iter()
+        .map(open_file_and_mmap)
+        .collect::<Vec<Result<_>>>();
+
+    let mut has_err = 0;
+    let mut mmaps = Vec::with_capacity(mmaps_result.len());
+
+    for mmap_result in mmaps_result {
+        match mmap_result {
+            Ok(mmap) => mmaps.push(mmap),
+            Err(err) => {
+                debugs_or!(pr_err!("{:?}", err), pr_err!("{}", err));
+                has_err += 1;
+            }
+        }
+    }
+
+    anyhow::ensure!(has_err == 0, "{} file(s) failed to process", has_err);
+
+    Ok(())
 }
