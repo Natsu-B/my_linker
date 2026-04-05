@@ -4,8 +4,6 @@ use anyhow::Result;
 use clap::Parser;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
-use crate::open::open_file_and_mmap;
-
 #[macro_use]
 pub mod debug;
 mod open;
@@ -42,17 +40,20 @@ fn main() -> anyhow::Result<()> {
     let mmaps_result = args
         .input
         .par_iter()
-        .map(open_file_and_mmap)
-        .collect::<Vec<Result<_>>>();
+        .map(|file_name| (open::open_file_and_mmap(file_name), file_name.clone()))
+        .collect::<Vec<(Result<_>, _)>>();
 
     let mut has_err = 0;
     let mut mmaps = Vec::with_capacity(mmaps_result.len());
 
     for mmap_result in mmaps_result {
         match mmap_result {
-            Ok(mmap) => mmaps.push(mmap),
-            Err(err) => {
-                debugs_or!(pr_err!("{:?}", err), pr_err!("{}", err));
+            (Ok(mmap), file_name) => mmaps.push((mmap, file_name)),
+            (Err(err), file_name) => {
+                debugs_or!(
+                    pr_err!("file:{}: {:?}", file_name, err),
+                    pr_err!("file:{}: {}", file_name, err)
+                );
                 has_err += 1;
             }
         }
