@@ -2,11 +2,12 @@ use std::{mem::MaybeUninit, ptr};
 
 use anyhow::Result;
 use clap::Parser;
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
 #[macro_use]
 pub mod debug;
 mod open;
+mod parse;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -36,19 +37,25 @@ fn main() -> anyhow::Result<()> {
 
     pr_debug!("Arguments: {:?}", args);
 
+    // TODO
+    anyhow::ensure!(
+        args.input.len() == 1,
+        "currently only one input file is supported"
+    );
+
     // open files and create memory maps in parallel
     let mmaps_result = args
         .input
         .par_iter()
-        .map(|file_name| (open::open_file_and_mmap(file_name), file_name.clone()))
-        .collect::<Vec<(Result<_>, _)>>();
+        .map(open::open_file_and_mmap)
+        .collect::<Vec<Result<_>>>();
 
     let mut has_err = 0;
     let mut mmaps = Vec::with_capacity(mmaps_result.len());
 
-    for mmap_result in mmaps_result {
+    for mmap_result in mmaps_result.iter().zip(&args.input) {
         match mmap_result {
-            (Ok(mmap), file_name) => mmaps.push((mmap, file_name)),
+            (Ok(mmap), _) => mmaps.push(mmap),
             (Err(err), file_name) => {
                 debugs_or!(
                     pr_err!("file:{}: {:?}", file_name, err),
@@ -59,7 +66,32 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    anyhow::ensure!(has_err == 0, "{} file(s) failed to process", has_err);
+    anyhow::ensure!(has_err == 0, "{} file(s) failed to open", has_err);
+
+    pr_debug!("Start parsing files...");
+    let parse_result = mmaps
+        .par_iter()
+        .zip(args.input)
+        .map(|(mmap, file_name)| parse::parse(mmap, file_name))
+        .collect::<Vec<Result<_>>>();
+
+    for parse_result in parse_result.iter() {
+        match parse_result {
+            Ok(object_file) => {
+                pr_debug!(
+                    "file:{}: parsed successfully\nresult: {:#?}",
+                    object_file.file_name,
+                    object_file
+                );
+            }
+            Err(err) => {
+                debugs_or!(pr_err!("{:?}", err), pr_err!("{}", err));
+                has_err += 1;
+            }
+        }
+    }
+
+    anyhow::ensure!(has_err == 0, "{} file(s) failed to parse", has_err);
 
     Ok(())
 }
