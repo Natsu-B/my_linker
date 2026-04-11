@@ -541,6 +541,11 @@ impl<'elf, 'data> Elf64Rela<'elf, 'data> {
     pub fn addend(&self) -> i64 {
         self.header.r_addend.read(self.section.elf.endian)
     }
+
+    pub fn target_idx(&self) -> u32 {
+        // sh_info is used to store the target section index for RELA entries
+        self.section.header.sh_info.read(self.section.elf.endian)
+    }
 }
 
 #[derive(Debug)]

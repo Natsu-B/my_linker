@@ -23,7 +23,6 @@ pub struct ObjectSection<'a> {
     pub align: u64,
     pub data: Option<&'a [u8]>,
     pub size: u64,
-    pub relocations: Vec<ObjectRelocation>,
 }
 
 #[derive(Debug)]
@@ -37,7 +36,8 @@ pub struct ObjectSymbol<'a> {
 
 #[derive(Debug)]
 pub struct ObjectRelocation {
-    pub target_idx: u16,
+    pub symbol_idx: u16,
+    pub target_idx: u32,
     pub offset: u64,
     pub info: Elf64RelaInfo,
     pub addend: i64,
@@ -87,7 +87,6 @@ pub fn parse<'a>(mmap: &'a Mmap, file_name: String) -> Result<ObjectFile<'a>> {
                     align: section.align(),
                     data: section.data(),
                     size: section.size(),
-                    relocations: Vec::new(),
                 };
                 object_file.sections.push(section);
             }
@@ -116,7 +115,8 @@ pub fn parse<'a>(mmap: &'a Mmap, file_name: String) -> Result<ObjectFile<'a>> {
                         relocation.addend()
                     );
                     let relocation = ObjectRelocation {
-                        target_idx: section.idx(),
+                        target_idx: relocation.target_idx(),
+                        symbol_idx: section.idx(),
                         offset: relocation.offset(),
                         info: relocation.info(),
                         addend: relocation.addend(),
