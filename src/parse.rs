@@ -94,7 +94,7 @@ pub struct ObjectSymbol<'a> {
 #[derive(Debug)]
 pub struct ObjectRelocation {
     /// Index of the relocation section that contains this entry.
-    pub symbol_section_idx: u16,
+    pub reloc_section_idx: u16,
 
     /// Index of the section to which this relocation applies.
     pub target_idx: u32,
@@ -182,7 +182,7 @@ pub fn parse<'a>(mmap: &'a Mmap, file_name: String) -> Result<ObjectFile<'a>> {
                     );
                     let relocation = ObjectRelocation {
                         target_idx: relocation.target_idx(),
-                        symbol_section_idx: section.idx(),
+                        reloc_section_idx: section.idx(),
                         offset: relocation.offset(),
                         info: relocation.info(),
                         addend: relocation.addend(),
