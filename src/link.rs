@@ -53,6 +53,7 @@ pub fn link(object_files: Vec<ObjectFile>) -> Result<LinkedResult> {
                     object_file.file_name
                 );
                 let size = section.size;
+                va = va.next_multiple_of(section.align);
                 sections.push(SectionPlacement {
                     out_idx: BSS_IDX,
                     addr: va,
@@ -67,6 +68,7 @@ pub fn link(object_files: Vec<ObjectFile>) -> Result<LinkedResult> {
                     object_file.file_name
                 );
                 let size = section.size;
+                va = va.next_multiple_of(section.align);
                 sections.push(SectionPlacement {
                     out_idx: TEXT_IDX,
                     addr: va,
@@ -81,6 +83,7 @@ pub fn link(object_files: Vec<ObjectFile>) -> Result<LinkedResult> {
                     object_file.file_name
                 );
                 let size = section.size;
+                va = va.next_multiple_of(section.align);
                 sections.push(SectionPlacement {
                     out_idx: DATA_IDX,
                     addr: va,
@@ -95,6 +98,7 @@ pub fn link(object_files: Vec<ObjectFile>) -> Result<LinkedResult> {
                     object_file.file_name
                 );
                 let size = section.size;
+                va = va.next_multiple_of(section.align);
                 sections.push(SectionPlacement {
                     out_idx: RODATA_IDX,
                     addr: va,
