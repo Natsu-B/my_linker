@@ -1,16 +1,19 @@
-use std::ops::Deref;
+use std::cell::OnceCell;
 
 use crate::{
     parse::{ObjectFile, ObjectSection},
     script,
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use elf::{Elf64SectionFlags, Elf64SectionType};
+use num::integer::lcm;
 
 pub struct SectionPlacement<'a> {
     out_idx: u16,
-    addr: u64,
-    output_data: ObjectSection<'a>,
+    size: u64,
+    align: u64,
+    va: OnceCell<u64>,
+    output_data: Vec<(ObjectSection<'a>, u64 /* offset */)>,
 }
 
 pub fn link(object_files: Vec<ObjectFile>) -> Result<Vec<SectionPlacement>> {
@@ -28,15 +31,12 @@ pub fn link(object_files: Vec<ObjectFile>) -> Result<Vec<SectionPlacement>> {
     // else:
     //   .rodata
 
-    let va_guard = script::LINKER_DATA.read().unwrap();
-    let mut va = va_guard.vart_addr;
-
     const TEXT_IDX: u16 = 0;
     const BSS_IDX: u16 = 1;
     const DATA_IDX: u16 = 2;
     const RODATA_IDX: u16 = 3;
 
-    let mut sections = Vec::with_capacity(object_files.len());
+    let mut sections: Vec<SectionPlacement<'_>> = Vec::with_capacity(object_files.len());
     for object_file in object_files {
         pr_debug!("Object file: {}", object_file.file_name);
         for section in object_file.sections {
@@ -51,13 +51,21 @@ pub fn link(object_files: Vec<ObjectFile>) -> Result<Vec<SectionPlacement>> {
                     object_file.file_name
                 );
                 let size = section.size;
-                va = va.next_multiple_of(section.align);
-                sections.push(SectionPlacement {
-                    out_idx: BSS_IDX,
-                    addr: va,
-                    output_data: section,
-                });
-                va += size;
+                let bss_section = sections.iter_mut().find(|x| x.out_idx == BSS_IDX);
+                if let Some(bss_section) = bss_section {
+                    let bss_offset = bss_section.size.next_multiple_of(section.align);
+                    bss_section.size = bss_offset + size;
+                    bss_section.align = lcm(bss_section.align, section.align);
+                    bss_section.output_data.push((section, bss_offset));
+                } else {
+                    sections.push(SectionPlacement {
+                        out_idx: BSS_IDX,
+                        size: size,
+                        align: section.align,
+                        output_data: vec![(section, 0)],
+                        va: OnceCell::new(),
+                    });
+                }
             } else if section.flags.get(Elf64SectionFlags::SHF_EXECINSTR) != 0 {
                 pr_debug!("    Type: .text");
                 ensure!(
@@ -66,13 +74,21 @@ pub fn link(object_files: Vec<ObjectFile>) -> Result<Vec<SectionPlacement>> {
                     object_file.file_name
                 );
                 let size = section.size;
-                va = va.next_multiple_of(section.align);
-                sections.push(SectionPlacement {
-                    out_idx: TEXT_IDX,
-                    addr: va,
-                    output_data: section,
-                });
-                va += size;
+                let text_section = sections.iter_mut().find(|x| x.out_idx == TEXT_IDX);
+                if let Some(text_section) = text_section {
+                    let text_offset = text_section.size.next_multiple_of(section.align);
+                    text_section.size = text_offset + size;
+                    text_section.align = lcm(text_section.align, section.align);
+                    text_section.output_data.push((section, text_offset));
+                } else {
+                    sections.push(SectionPlacement {
+                        out_idx: TEXT_IDX,
+                        size: size,
+                        align: section.align,
+                        output_data: vec![(section, 0)],
+                        va: OnceCell::new(),
+                    });
+                }
             } else if section.flags.get(Elf64SectionFlags::SHF_WRITE) != 0 {
                 pr_debug!("    Type: .data");
                 ensure!(
@@ -81,13 +97,21 @@ pub fn link(object_files: Vec<ObjectFile>) -> Result<Vec<SectionPlacement>> {
                     object_file.file_name
                 );
                 let size = section.size;
-                va = va.next_multiple_of(section.align);
-                sections.push(SectionPlacement {
-                    out_idx: DATA_IDX,
-                    addr: va,
-                    output_data: section,
-                });
-                va += size;
+                let data_section = sections.iter_mut().find(|x| x.out_idx == DATA_IDX);
+                if let Some(data_section) = data_section {
+                    let data_offset = data_section.size.next_multiple_of(section.align);
+                    data_section.size = data_offset + size;
+                    data_section.align = lcm(data_section.align, section.align);
+                    data_section.output_data.push((section, data_offset));
+                } else {
+                    sections.push(SectionPlacement {
+                        out_idx: DATA_IDX,
+                        size: size,
+                        align: section.align,
+                        output_data: vec![(section, 0)],
+                        va: OnceCell::new(),
+                    });
+                }
             } else {
                 pr_debug!("    Type: .rodata");
                 ensure!(
@@ -96,15 +120,37 @@ pub fn link(object_files: Vec<ObjectFile>) -> Result<Vec<SectionPlacement>> {
                     object_file.file_name
                 );
                 let size = section.size;
-                va = va.next_multiple_of(section.align);
-                sections.push(SectionPlacement {
-                    out_idx: RODATA_IDX,
-                    addr: va,
-                    output_data: section,
-                });
-                va += size;
+                let rodata_section = sections.iter_mut().find(|x| x.out_idx == RODATA_IDX);
+                if let Some(rodata_section) = rodata_section {
+                    let rodata_offset = rodata_section.size.next_multiple_of(section.align);
+                    rodata_section.size = rodata_offset + size;
+                    rodata_section.align = lcm(rodata_section.align, section.align);
+                    rodata_section.output_data.push((section, rodata_offset));
+                } else {
+                    sections.push(SectionPlacement {
+                        out_idx: RODATA_IDX,
+                        size: size,
+                        align: section.align,
+                        output_data: vec![(section, 0)],
+                        va: OnceCell::new(),
+                    });
+                }
             }
         }
+    }
+
+    sections.sort_unstable_by_key(|x| x.out_idx);
+
+    pr_debug!("Section virtual addresses:");
+    let va_guard = script::LINKER_DATA.read().unwrap();
+    let mut current_va = va_guard.vart_addr;
+
+    // already sorted by out_idx
+    for section in sections.iter_mut() {
+        current_va = current_va.next_multiple_of(section.align);
+        section.va.set(current_va).unwrap();
+        pr_debug!("  out_idx: {}, va: {:#x}", section.out_idx, current_va);
+        current_va += section.size;
     }
 
     Ok(sections)

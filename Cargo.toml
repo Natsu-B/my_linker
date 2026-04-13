@@ -10,3 +10,4 @@ anyhow = "1.0.102"
 memmap2 = "0.9.10"
 rayon = "1.11.0"
 elf = { path = "./elf" }
+num = "0.4.3"
