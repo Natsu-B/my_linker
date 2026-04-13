@@ -1,7 +1,7 @@
 use std::cell::OnceCell;
 
 use crate::{
-    parse::{ObjectFile, ObjectSection},
+    parse::{ObjectFile, ObjectRelocation, ObjectSection, ObjectSymbol},
     script,
 };
 use anyhow::{Result, ensure};
@@ -17,7 +17,13 @@ pub struct SectionPlacement<'a> {
     output_data: Vec<(ObjectSection<'a>, u64 /* offset */)>,
 }
 
-pub fn link(object_files: Vec<ObjectFile>) -> Result<Vec<SectionPlacement>> {
+pub fn link(
+    object_files: Vec<ObjectFile>,
+) -> Result<(
+    Vec<SectionPlacement>,
+    Vec<ObjectSymbol>,
+    Vec<ObjectRelocation>,
+)> {
     pr_debug!("Linking {} object files", object_files.len());
 
     // TODO:
@@ -38,6 +44,9 @@ pub fn link(object_files: Vec<ObjectFile>) -> Result<Vec<SectionPlacement>> {
     const RODATA_IDX: u16 = 3;
 
     let mut sections: Vec<SectionPlacement<'_>> = Vec::with_capacity(object_files.len());
+    let mut symbols: Vec<ObjectSymbol> = Vec::new();
+    let mut relocations: Vec<ObjectRelocation> = Vec::new();
+
     for object_file in object_files {
         pr_debug!("Object file: {}", object_file.file_name);
         for section in object_file.sections {
@@ -142,6 +151,21 @@ pub fn link(object_files: Vec<ObjectFile>) -> Result<Vec<SectionPlacement>> {
                 }
             }
         }
+
+        for symbol in object_file.symbols {
+            pr_debug!("  Symbol: {}", symbol.name);
+            symbols.push(symbol);
+        }
+
+        for relocation in object_file.relocations {
+            pr_debug!(
+                "  Relocation: offset={:#x}, info={:?}, addend={}",
+                relocation.offset,
+                relocation.target_idx,
+                relocation.addend
+            );
+            relocations.push(relocation);
+        }
     }
 
     sections.sort_unstable_by_key(|x| x.out_idx);
@@ -158,5 +182,5 @@ pub fn link(object_files: Vec<ObjectFile>) -> Result<Vec<SectionPlacement>> {
         current_va += section.size;
     }
 
-    Ok(sections)
+    Ok((sections, symbols, relocations))
 }
