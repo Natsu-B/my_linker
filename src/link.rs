@@ -7,15 +7,13 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use elf::{Elf64SectionFlags, Elf64SectionType};
 
-pub struct LinkedResult {}
-
-struct SectionPlacement<'a> {
+pub struct SectionPlacement<'a> {
     out_idx: u16,
     addr: u64,
     output_data: ObjectSection<'a>,
 }
 
-pub fn link(object_files: Vec<ObjectFile>) -> Result<LinkedResult> {
+pub fn link(object_files: Vec<ObjectFile>) -> Result<Vec<SectionPlacement>> {
     pr_debug!("Linking {} object files", object_files.len());
 
     // TODO:
@@ -109,5 +107,5 @@ pub fn link(object_files: Vec<ObjectFile>) -> Result<LinkedResult> {
         }
     }
 
-    Ok(LinkedResult {})
+    Ok(sections)
 }
