@@ -43,7 +43,7 @@ pub fn link(object_files: Vec<ObjectFile>) -> Result<LinkedResult> {
         pr_debug!("Object file: {}", object_file.file_name);
         for section in object_file.sections {
             pr_debug!("  Section: {}", section.name);
-            if section.flags.get(Elf64SectionFlags::SHF_WRITE) == 0 {
+            if section.flags.get(Elf64SectionFlags::SHF_ALLOC) == 0 {
                 continue;
             } else if section.ty == Elf64SectionType::SHT_NOBITS {
                 pr_debug!("    Type: .bss");
@@ -52,12 +52,13 @@ pub fn link(object_files: Vec<ObjectFile>) -> Result<LinkedResult> {
                     "invalid section: .bss section cannot have SHF_EXECINSTR flag in file: {}",
                     object_file.file_name
                 );
-                va += section.size;
+                let size = section.size;
                 sections.push(SectionPlacement {
                     out_idx: BSS_IDX,
                     addr: va,
                     output_data: section,
                 });
+                va += size;
             } else if section.flags.get(Elf64SectionFlags::SHF_EXECINSTR) != 0 {
                 pr_debug!("    Type: .text");
                 ensure!(
@@ -65,12 +66,13 @@ pub fn link(object_files: Vec<ObjectFile>) -> Result<LinkedResult> {
                     "invalid section: .text section cannot have SHF_WRITE flag in file: {}",
                     object_file.file_name
                 );
-                va += section.size;
+                let size = section.size;
                 sections.push(SectionPlacement {
                     out_idx: TEXT_IDX,
                     addr: va,
                     output_data: section,
                 });
+                va += size;
             } else if section.flags.get(Elf64SectionFlags::SHF_WRITE) != 0 {
                 pr_debug!("    Type: .data");
                 ensure!(
@@ -78,12 +80,13 @@ pub fn link(object_files: Vec<ObjectFile>) -> Result<LinkedResult> {
                     "invalid section: .data section cannot have SHF_EXECINSTR flag in file: {}",
                     object_file.file_name
                 );
-                va += section.size;
+                let size = section.size;
                 sections.push(SectionPlacement {
                     out_idx: DATA_IDX,
                     addr: va,
                     output_data: section,
                 });
+                va += size;
             } else {
                 pr_debug!("    Type: .rodata");
                 ensure!(
@@ -91,12 +94,13 @@ pub fn link(object_files: Vec<ObjectFile>) -> Result<LinkedResult> {
                     "invalid section: .rodata section cannot have SHF_EXECINSTR flag in file: {}",
                     object_file.file_name
                 );
-                va += section.size;
+                let size = section.size;
                 sections.push(SectionPlacement {
                     out_idx: RODATA_IDX,
                     addr: va,
                     output_data: section,
                 });
+                va += size;
             }
         }
     }
