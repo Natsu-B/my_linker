@@ -68,7 +68,8 @@ fn main() -> anyhow::Result<()> {
     let parse_result = mmaps
         .par_iter()
         .zip(args.input)
-        .map(|(mmap, file_name)| parse::parse(mmap, file_name))
+        .enumerate()
+        .map(|(i, (mmap, file_name))| parse::parse(mmap, file_name, i))
         .collect::<Vec<Result<_>>>();
     let mut parsed = Vec::with_capacity(parse_result.len());
 

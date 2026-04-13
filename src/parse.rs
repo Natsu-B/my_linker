@@ -34,6 +34,9 @@ pub struct ObjectFile<'a> {
 /// together with its metadata and optional raw contents.
 #[derive(Debug)]
 pub struct ObjectSection<'a> {
+    /// file idx
+    pub file_idx: usize,
+
     /// Section index in the ELF section table.
     pub idx: u16,
 
@@ -65,6 +68,9 @@ pub struct ObjectSection<'a> {
 /// file symbols, or other linker-visible entities.
 #[derive(Debug)]
 pub struct ObjectSymbol<'a> {
+    /// file idx
+    pub file_idx: usize,
+
     /// Section index associated with the symbol.
     ///
     /// This indicates where the symbol is defined, or whether it is undefined,
@@ -93,6 +99,9 @@ pub struct ObjectSymbol<'a> {
 /// must be adjusted once symbol addresses are known.
 #[derive(Debug)]
 pub struct ObjectRelocation {
+    /// file idx
+    pub file_idx: usize,
+
     /// Index of the relocation section that contains this entry.
     pub reloc_section_idx: u16,
 
@@ -109,7 +118,7 @@ pub struct ObjectRelocation {
     pub addend: i64,
 }
 
-pub fn parse<'a>(mmap: &'a Mmap, file_name: String) -> Result<ObjectFile<'a>> {
+pub fn parse<'a>(mmap: &'a Mmap, file_name: String, file_idx: usize) -> Result<ObjectFile<'a>> {
     let elf = elf::Elf64::new(mmap)
         .with_context(|| format!("failed to parse ELF file: {}", file_name))?;
 
@@ -146,6 +155,7 @@ pub fn parse<'a>(mmap: &'a Mmap, file_name: String) -> Result<ObjectFile<'a>> {
                     pr_debug!("  Type: NOBITS");
                 }
                 let section = ObjectSection::<'a> {
+                    file_idx,
                     idx: section.idx(),
                     name: section.name()?,
                     ty: section.section_type(),
@@ -161,6 +171,7 @@ pub fn parse<'a>(mmap: &'a Mmap, file_name: String) -> Result<ObjectFile<'a>> {
                 for symbol in section.symbols()? {
                     pr_debug!("    Symbol: {}", symbol.name()?);
                     let symbol = ObjectSymbol {
+                        file_idx,
                         idx: symbol.section_idx(),
                         name: symbol.name()?,
                         info: symbol.info(),
@@ -181,6 +192,7 @@ pub fn parse<'a>(mmap: &'a Mmap, file_name: String) -> Result<ObjectFile<'a>> {
                         relocation.addend()
                     );
                     let relocation = ObjectRelocation {
+                        file_idx,
                         target_idx: relocation.target_idx(),
                         reloc_section_idx: section.idx(),
                         offset: relocation.offset(),
