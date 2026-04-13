@@ -10,6 +10,7 @@ use num::integer::lcm;
 
 pub struct SectionPlacement<'a> {
     out_idx: u16,
+    name: String,
     size: u64,
     align: u64,
     va: OnceCell<u64>,
@@ -60,6 +61,7 @@ pub fn link(object_files: Vec<ObjectFile>) -> Result<Vec<SectionPlacement>> {
                 } else {
                     sections.push(SectionPlacement {
                         out_idx: BSS_IDX,
+                        name: ".bss".to_string(),
                         size: size,
                         align: section.align,
                         output_data: vec![(section, 0)],
@@ -83,6 +85,7 @@ pub fn link(object_files: Vec<ObjectFile>) -> Result<Vec<SectionPlacement>> {
                 } else {
                     sections.push(SectionPlacement {
                         out_idx: TEXT_IDX,
+                        name: ".text".to_string(),
                         size: size,
                         align: section.align,
                         output_data: vec![(section, 0)],
@@ -106,6 +109,7 @@ pub fn link(object_files: Vec<ObjectFile>) -> Result<Vec<SectionPlacement>> {
                 } else {
                     sections.push(SectionPlacement {
                         out_idx: DATA_IDX,
+                        name: ".data".to_string(),
                         size: size,
                         align: section.align,
                         output_data: vec![(section, 0)],
@@ -129,6 +133,7 @@ pub fn link(object_files: Vec<ObjectFile>) -> Result<Vec<SectionPlacement>> {
                 } else {
                     sections.push(SectionPlacement {
                         out_idx: RODATA_IDX,
+                        name: ".rodata".to_string(),
                         size: size,
                         align: section.align,
                         output_data: vec![(section, 0)],
