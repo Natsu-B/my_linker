@@ -131,15 +131,13 @@ impl Elf64SectionType {
     pub const SHT_HIUSER: Self = Self(0xFFFFFFFF);
 }
 
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, RawReg, PartialEq)]
-pub struct Elf64SectionFlags(Elf64Xword);
-
-impl Elf64SectionFlags {
-    pub const SHF_WRITE: Self = Self(0x1);
-    pub const SHF_ALLOC: Self = Self(0x2);
-    pub const SHF_EXECINSTR: Self = Self(0x4);
-    pub const SHF_MASKPROC: Self = Self(0xF000_0000);
+bitregs! {
+    pub struct Elf64SectionFlags: Elf64Xword {
+        pub SHF_WRITE@[0:0],
+        pub SHF_ALLOC@[1:1],
+        pub SHF_EXECINSTR@[2:2],
+        reserved@[63:3],
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
