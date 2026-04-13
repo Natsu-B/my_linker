@@ -6,8 +6,10 @@ use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIter
 
 #[macro_use]
 pub mod debug;
+mod link;
 mod open;
 mod parse;
+pub mod script;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -36,12 +38,6 @@ fn main() -> anyhow::Result<()> {
     }
 
     pr_debug!("Arguments: {:?}", args);
-
-    // TODO
-    anyhow::ensure!(
-        args.input.len() == 1,
-        "currently only one input file is supported"
-    );
 
     // open files and create memory maps in parallel
     let mmaps_result = args
@@ -74,8 +70,9 @@ fn main() -> anyhow::Result<()> {
         .zip(args.input)
         .map(|(mmap, file_name)| parse::parse(mmap, file_name))
         .collect::<Vec<Result<_>>>();
+    let mut parsed = Vec::with_capacity(parse_result.len());
 
-    for parse_result in parse_result.iter() {
+    for parse_result in parse_result {
         match parse_result {
             Ok(object_file) => {
                 pr_debug!(
@@ -83,6 +80,7 @@ fn main() -> anyhow::Result<()> {
                     object_file.file_name,
                     object_file
                 );
+                parsed.push(object_file);
             }
             Err(err) => {
                 debugs_or!(pr_err!("{:?}", err), pr_err!("{}", err));
@@ -92,6 +90,9 @@ fn main() -> anyhow::Result<()> {
     }
 
     anyhow::ensure!(has_err == 0, "{} file(s) failed to parse", has_err);
+
+    pr_debug!("Start linking files...");
+    link::link(parsed)?;
 
     Ok(())
 }
