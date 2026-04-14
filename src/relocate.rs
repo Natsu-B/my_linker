@@ -51,16 +51,14 @@ pub fn relocate(
             }
         }
         for symbol in &symbols {
-            if let Elf64SymbolSectionIdx::Index(symbol_idx) = symbol.idx {
-                if symbol.file_idx == relocation.file_idx && target_symbol_idx == symbol_idx {
-                    pr_debug!(
-                        "  Found target symbol: {} in file idx: {} at offset: {:#x}",
-                        symbol.name,
-                        symbol.file_idx,
-                        symbol.value
-                    );
-                    target_symbol = Some(symbol);
-                }
+            if symbol.file_idx == relocation.file_idx && target_symbol_idx == symbol.idx {
+                pr_debug!(
+                    "  Found target symbol: {} in file idx: {} at offset: {:#x}",
+                    symbol.name,
+                    symbol.file_idx,
+                    symbol.value
+                );
+                target_symbol = Some(symbol);
             }
         }
 
