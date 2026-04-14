@@ -9,12 +9,12 @@ use elf::{Elf64SectionFlags, Elf64SectionType};
 use num::integer::lcm;
 
 pub struct SectionPlacement<'a> {
-    out_idx: u16,
-    name: String,
-    size: u64,
-    align: u64,
-    va: OnceCell<u64>,
-    output_data: Vec<(ObjectSection<'a>, u64 /* offset */)>,
+    pub out_idx: u16,
+    pub name: String,
+    pub size: u64,
+    pub align: u64,
+    pub va: OnceCell<u64>,
+    pub output_data: Vec<(ObjectSection<'a>, u64 /* offset */)>,
 }
 
 pub fn link(
