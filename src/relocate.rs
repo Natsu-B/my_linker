@@ -1,6 +1,7 @@
 use crate::{
     link::SectionPlacement,
     parse::{ObjectRelocation, ObjectSymbol},
+    script,
 };
 
 use anyhow::{Context, Ok, Result, bail};
@@ -31,11 +32,11 @@ pub fn relocate(
             .sym
             .try_into()
             .context("Failed to convert symbol index")?;
-        let mut target = None;
-        let mut target_object_section = None;
+        let mut section_placement_info = None;
+        let mut target_offset = None;
         let mut target_symbol = None;
         for section_placement in &section_placements {
-            for (object_section, offset) in &section_placement.output_data {
+            for (object_section, offset) in &section_placement.sections_data {
                 if object_section.file_idx == relocation.file_idx
                     && object_section.idx == target_idx
                 {
@@ -45,8 +46,8 @@ pub fn relocate(
                         object_section.file_idx,
                         offset
                     );
-                    target_object_section = Some(object_section);
-                    target = Some(object_section);
+                    section_placement_info = Some(section_placement);
+                    target_offset = Some(offset);
                 }
             }
         }
@@ -62,15 +63,52 @@ pub fn relocate(
             }
         }
 
-        let target = target.context("Failed to find target section for relocation")?;
-        let target_object_section =
-            target_object_section.context("Failed to find target object section for relocation")?;
+        let section_placement_info = section_placement_info
+            .context("Failed to find section placement info for relocation")?;
         let target_symbol = target_symbol.context("Failed to find target symbol for relocation")?;
+        let target_offset = target_offset.context("Failed to find target offset for relocation")?;
+
+        // S
+        let symbol_addr = match target_symbol.section_idx {
+            Elf64SymbolSectionIdx::Undefined => bail!("Undefined Symbol: {}", target_symbol.name),
+            Elf64SymbolSectionIdx::AbsoluteSymbols => target_symbol.value,
+            Elf64SymbolSectionIdx::Common => todo!(),
+            Elf64SymbolSectionIdx::Index(sym_sec_idx) => {
+                let mut sym_section_placement = None;
+                let mut sym_section_offset = None;
+
+                for section_placement in &section_placements {
+                    for (object_section, offset) in &section_placement.sections_data {
+                        if object_section.file_idx == target_symbol.file_idx
+                            && object_section.idx == sym_sec_idx
+                        {
+                            sym_section_placement = Some(section_placement);
+                            sym_section_offset = Some(*offset);
+                        }
+                    }
+                }
+
+                let sym_section_placement =
+                    sym_section_placement.context("failed to find symbol section placement")?;
+                let sym_section_offset =
+                    sym_section_offset.context("failed to find symbol section offset")?;
+
+                sym_section_placement.va.get().unwrap() + sym_section_offset + target_symbol.value
+            }
+        };
+        // A
+        let addend = relocation.addend;
+        // P
+        let place_addr =
+            section_placement_info.va.get().unwrap() + *target_offset + relocation.offset;
+        // B
+        let base_addr = script::LINKER_DATA.read().unwrap().vart_addr;
 
         let reloc_type = X86_64RelocationType::try_from(relocation.info)?;
         pr_debug!("Relocation type: {:?}", reloc_type);
         match reloc_type {
             X86_64RelocationType::None => {}
+            X86_64RelocationType::Pc32 => {}
             x => {
                 bail!("Unsupported relocation type: {:?}", x);
             }
