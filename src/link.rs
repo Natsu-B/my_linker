@@ -14,7 +14,8 @@ pub struct SectionPlacement<'a> {
     pub size: u64,
     pub align: u64,
     pub va: OnceCell<u64>,
-    pub output_data: Vec<(ObjectSection<'a>, u64 /* offset */)>,
+    pub data: Option<Vec<u8>>,
+    pub sections_data: Vec<(ObjectSection<'a>, u64 /* offset */)>,
 }
 
 pub fn link(
@@ -66,15 +67,16 @@ pub fn link(
                     let bss_offset = bss_section.size.next_multiple_of(section.align);
                     bss_section.size = bss_offset + size;
                     bss_section.align = lcm(bss_section.align, section.align);
-                    bss_section.output_data.push((section, bss_offset));
+                    bss_section.sections_data.push((section, bss_offset));
                 } else {
                     sections.push(SectionPlacement {
                         out_idx: BSS_IDX,
                         name: ".bss".to_string(),
                         size: size,
                         align: section.align,
-                        output_data: vec![(section, 0)],
+                        sections_data: vec![(section, 0)],
                         va: OnceCell::new(),
+                        data: None,
                     });
                 }
             } else if section.flags.get(Elf64SectionFlags::SHF_EXECINSTR) != 0 {
@@ -90,14 +92,19 @@ pub fn link(
                     let text_offset = text_section.size.next_multiple_of(section.align);
                     text_section.size = text_offset + size;
                     text_section.align = lcm(text_section.align, section.align);
-                    text_section.output_data.push((section, text_offset));
+                    text_section
+                        .data
+                        .get_or_insert_with(Vec::new)
+                        .extend(section.data.unwrap());
+                    text_section.sections_data.push((section, text_offset));
                 } else {
                     sections.push(SectionPlacement {
                         out_idx: TEXT_IDX,
                         name: ".text".to_string(),
                         size: size,
                         align: section.align,
-                        output_data: vec![(section, 0)],
+                        data: Some(section.data.unwrap().to_vec()),
+                        sections_data: vec![(section, 0)],
                         va: OnceCell::new(),
                     });
                 }
@@ -114,14 +121,19 @@ pub fn link(
                     let data_offset = data_section.size.next_multiple_of(section.align);
                     data_section.size = data_offset + size;
                     data_section.align = lcm(data_section.align, section.align);
-                    data_section.output_data.push((section, data_offset));
+                    data_section
+                        .data
+                        .get_or_insert_with(Vec::new)
+                        .extend(section.data.unwrap());
+                    data_section.sections_data.push((section, data_offset));
                 } else {
                     sections.push(SectionPlacement {
                         out_idx: DATA_IDX,
                         name: ".data".to_string(),
                         size: size,
                         align: section.align,
-                        output_data: vec![(section, 0)],
+                        data: Some(section.data.unwrap().to_vec()),
+                        sections_data: vec![(section, 0)],
                         va: OnceCell::new(),
                     });
                 }
@@ -138,14 +150,19 @@ pub fn link(
                     let rodata_offset = rodata_section.size.next_multiple_of(section.align);
                     rodata_section.size = rodata_offset + size;
                     rodata_section.align = lcm(rodata_section.align, section.align);
-                    rodata_section.output_data.push((section, rodata_offset));
+                    rodata_section
+                        .data
+                        .get_or_insert_with(Vec::new)
+                        .extend(section.data.unwrap());
+                    rodata_section.sections_data.push((section, rodata_offset));
                 } else {
                     sections.push(SectionPlacement {
                         out_idx: RODATA_IDX,
                         name: ".rodata".to_string(),
                         size: size,
                         align: section.align,
-                        output_data: vec![(section, 0)],
+                        data: Some(section.data.unwrap().to_vec()),
+                        sections_data: vec![(section, 0)],
                         va: OnceCell::new(),
                     });
                 }
