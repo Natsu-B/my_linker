@@ -171,11 +171,11 @@ pub fn parse<'a>(mmap: &'a Mmap, file_name: String, file_idx: usize) -> Result<O
             }
             Elf64SectionType::SHT_SYMTAB => {
                 pr_debug!("  Type: SYMTAB");
-                for symbol in section.symbols()? {
+                for (i, symbol) in section.symbols()?.enumerate() {
                     pr_debug!("    Symbol: {}", symbol.name()?);
                     let symbol = ObjectSymbol {
                         file_idx,
-                        idx: section.idx(),
+                        idx: i as u16,
                         section_idx: symbol.section_idx(),
                         name: symbol.name()?,
                         info: symbol.info(),
