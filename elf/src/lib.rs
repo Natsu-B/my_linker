@@ -7,6 +7,8 @@ use std::ffi::{CStr, c_char};
 use typestate::{RawReg, bitregs};
 use typestate_macro::RawReg;
 
+pub mod x86_64;
+
 #[allow(clippy::assertions_on_constants)]
 const _: () = assert!(size_of::<Elf64Header>() == 64);
 const _: () = assert!(size_of::<Elf64ProgramHeader>() == 56);
