@@ -10,6 +10,7 @@ mod link;
 mod open;
 mod parse;
 mod relocate;
+mod resolve;
 pub mod script;
 
 #[derive(Parser, Debug)]
@@ -94,7 +95,8 @@ fn main() -> anyhow::Result<()> {
     anyhow::ensure!(has_err == 0, "{} file(s) failed to parse", has_err);
 
     pr_debug!("Start linking files...");
-    let linked = link::link(parsed)?;
+    let mut linked = link::link(parsed)?;
+    resolve::resolve(&linked.0, &mut linked.1, &linked.2)?;
     relocate::relocate(linked.0, linked.1, linked.2)?;
 
     Ok(())

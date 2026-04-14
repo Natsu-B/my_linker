@@ -1,3 +1,5 @@
+use std::cell::OnceCell;
+
 use anyhow::{Context, Result, ensure};
 use elf::{
     self, Elf64RelaInfo, Elf64SectionFlags, Elf64SectionType, Elf64SymbolInfo,
@@ -94,6 +96,9 @@ pub struct ObjectSymbol<'a> {
 
     /// Size of the symbol in bytes.
     pub size: u64,
+
+    /// Relative virtual address of the symbol after linking.
+    pub va_offset: OnceCell<u64>,
 }
 
 /// A relocation entry extracted from a relocation section.
@@ -181,6 +186,7 @@ pub fn parse<'a>(mmap: &'a Mmap, file_name: String, file_idx: usize) -> Result<O
                         info: symbol.info(),
                         value: symbol.value(),
                         size: symbol.size(),
+                        va_offset: OnceCell::new(),
                     };
                     object_file.symbols.push(symbol);
                 }
