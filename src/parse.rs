@@ -71,11 +71,14 @@ pub struct ObjectSymbol<'a> {
     /// file idx
     pub file_idx: usize,
 
+    /// Index of the symbol in the symbol table.
+    pub idx: u16,
+
     /// Section index associated with the symbol.
     ///
     /// This indicates where the symbol is defined, or whether it is undefined,
     /// absolute, common, and so on.
-    pub idx: Elf64SymbolSectionIdx,
+    pub section_idx: Elf64SymbolSectionIdx,
 
     /// Symbol name from the symbol string table.
     pub name: &'a str,
@@ -172,7 +175,8 @@ pub fn parse<'a>(mmap: &'a Mmap, file_name: String, file_idx: usize) -> Result<O
                     pr_debug!("    Symbol: {}", symbol.name()?);
                     let symbol = ObjectSymbol {
                         file_idx,
-                        idx: symbol.section_idx(),
+                        idx: section.idx(),
+                        section_idx: symbol.section_idx(),
                         name: symbol.name()?,
                         info: symbol.info(),
                         value: symbol.value(),
