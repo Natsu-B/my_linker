@@ -39,9 +39,9 @@ pub fn link(
     //   .rodata
 
     const TEXT_IDX: u16 = 0;
-    const BSS_IDX: u16 = 1;
-    const DATA_IDX: u16 = 2;
-    const RODATA_IDX: u16 = 3;
+    const DATA_IDX: u16 = 1;
+    const RODATA_IDX: u16 = 2;
+    const BSS_IDX: u16 = 3;
 
     let mut sections: Vec<SectionPlacement<'_>> = Vec::with_capacity(object_files.len());
     let mut symbols: Vec<ObjectSymbol> = Vec::new();
