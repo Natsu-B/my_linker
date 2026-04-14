@@ -92,10 +92,11 @@ pub fn link(
                     let text_offset = text_section.size.next_multiple_of(section.align);
                     text_section.size = text_offset + size;
                     text_section.align = lcm(text_section.align, section.align);
-                    text_section
-                        .data
-                        .get_or_insert_with(Vec::new)
-                        .extend(section.data.unwrap());
+                    let data = text_section.data.as_mut().unwrap();
+                    if data.len() < text_offset as usize {
+                        data.resize(text_offset as usize, 0);
+                    }
+                    data.extend(section.data.unwrap());
                     text_section.sections_data.push((section, text_offset));
                 } else {
                     sections.push(SectionPlacement {
@@ -121,10 +122,11 @@ pub fn link(
                     let data_offset = data_section.size.next_multiple_of(section.align);
                     data_section.size = data_offset + size;
                     data_section.align = lcm(data_section.align, section.align);
-                    data_section
-                        .data
-                        .get_or_insert_with(Vec::new)
-                        .extend(section.data.unwrap());
+                    let data = data_section.data.as_mut().unwrap();
+                    if data.len() < data_offset as usize {
+                        data.resize(data_offset as usize, 0);
+                    }
+                    data.extend(section.data.unwrap());
                     data_section.sections_data.push((section, data_offset));
                 } else {
                     sections.push(SectionPlacement {
@@ -150,10 +152,11 @@ pub fn link(
                     let rodata_offset = rodata_section.size.next_multiple_of(section.align);
                     rodata_section.size = rodata_offset + size;
                     rodata_section.align = lcm(rodata_section.align, section.align);
-                    rodata_section
-                        .data
-                        .get_or_insert_with(Vec::new)
-                        .extend(section.data.unwrap());
+                    let data = rodata_section.data.as_mut().unwrap();
+                    if data.len() < rodata_offset as usize {
+                        data.resize(rodata_offset as usize, 0);
+                    }
+                    data.extend(section.data.unwrap());
                     rodata_section.sections_data.push((section, rodata_offset));
                 } else {
                     sections.push(SectionPlacement {
