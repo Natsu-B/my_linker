@@ -16,9 +16,6 @@ pub fn resolve<'a>(
 
     let mut resolved_symbols = HashMap::new();
     for symbol_table in symbol_tables {
-        if symbol_table.name.is_empty() {
-            continue;
-        }
         if let Some(section_addr) = match symbol_table.section_idx {
             elf::Elf64SymbolSectionIdx::Common => todo!(),
             elf::Elf64SymbolSectionIdx::Index(idx) => {
@@ -51,8 +48,9 @@ pub fn resolve<'a>(
             elf::Elf64SymbolSectionIdx::Undefined => None,
         } {
             symbol_table.va.set(section_addr).unwrap();
-            if let Some(old_section) =
-                resolved_symbols.insert(symbol_table.name, (symbol_table, section_addr))
+            if !symbol_table.name.is_empty()
+                && let Some(old_section) =
+                    resolved_symbols.insert(symbol_table.name, (symbol_table, section_addr))
             {
                 if symbol_table.info.get_enum(Elf64SymbolInfo::st_bind)
                     == Some(Elf64SymbolBinding::STB_WEAK)
