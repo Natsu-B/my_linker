@@ -69,33 +69,8 @@ pub fn relocate(
         let target_offset = target_offset.context("Failed to find target offset for relocation")?;
 
         // S
-        let symbol_addr = match target_symbol.section_idx {
-            Elf64SymbolSectionIdx::Undefined => bail!("Undefined Symbol: {}", target_symbol.name),
-            Elf64SymbolSectionIdx::AbsoluteSymbols => target_symbol.value,
-            Elf64SymbolSectionIdx::Common => todo!(),
-            Elf64SymbolSectionIdx::Index(sym_sec_idx) => {
-                let mut sym_section_placement = None;
-                let mut sym_section_offset = None;
+        let symbol_addr = *target_symbol.va.get().unwrap();
 
-                for section_placement in &section_placements {
-                    for (object_section, offset) in &section_placement.sections_data {
-                        if object_section.file_idx == target_symbol.file_idx
-                            && object_section.idx == sym_sec_idx
-                        {
-                            sym_section_placement = Some(section_placement);
-                            sym_section_offset = Some(*offset);
-                        }
-                    }
-                }
-
-                let sym_section_placement =
-                    sym_section_placement.context("failed to find symbol section placement")?;
-                let sym_section_offset =
-                    sym_section_offset.context("failed to find symbol section offset")?;
-
-                sym_section_placement.va.get().unwrap() + sym_section_offset + target_symbol.value
-            }
-        };
         // A
         let addend = relocation.addend;
         // P
