@@ -5,7 +5,7 @@ use crate::{
     script,
 };
 use anyhow::{Result, ensure};
-use elf::{Elf64SectionFlags, Elf64SectionType};
+use elf::{Elf64SectionFlags, Elf64SectionType, ElfEndian};
 use num::integer::lcm;
 
 pub struct SectionPlacement<'a> {
@@ -18,12 +18,17 @@ pub struct SectionPlacement<'a> {
     pub sections_data: Vec<(ObjectSection<'a>, u64 /* offset */)>,
 }
 
+pub struct ElfData {
+    pub endianness: ElfEndian,
+}
+
 pub fn link(
     object_files: Vec<ObjectFile>,
 ) -> Result<(
     Vec<SectionPlacement>,
     Vec<ObjectSymbol>,
     Vec<ObjectRelocation>,
+    ElfData,
 )> {
     pr_debug!("Linking {} object files", object_files.len());
 
@@ -47,9 +52,16 @@ pub fn link(
     let mut sections: Vec<SectionPlacement<'_>> = Vec::with_capacity(object_files.len());
     let mut symbols: Vec<ObjectSymbol> = Vec::new();
     let mut relocations: Vec<ObjectRelocation> = Vec::new();
+    let mut endianness = None;
 
     for object_file in object_files {
         pr_debug!("Object file: {}", object_file.file_name);
+        ensure!(
+            endianness.is_none_or(|x| x == object_file.endian),
+            "Inconsistent endianness in file: {}",
+            object_file.file_name
+        );
+        endianness.get_or_insert(object_file.endian);
         for section in object_file.sections {
             pr_debug!("  Section: {}", section.name);
             if section.flags.get(Elf64SectionFlags::SHF_ALLOC) == 0 {
@@ -202,5 +214,12 @@ pub fn link(
         current_va += section.size;
     }
 
-    Ok((sections, symbols, relocations))
+    Ok((
+        sections,
+        symbols,
+        relocations,
+        ElfData {
+            endianness: endianness.unwrap(),
+        },
+    ))
 }
