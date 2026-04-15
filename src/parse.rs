@@ -97,8 +97,8 @@ pub struct ObjectSymbol<'a> {
     /// Size of the symbol in bytes.
     pub size: u64,
 
-    /// Relative virtual address of the symbol after linking.
-    pub va_offset: OnceCell<u64>,
+    /// Virtual address of the symbol after linking.
+    pub va: OnceCell<u64>,
 }
 
 /// A relocation entry extracted from a relocation section.
@@ -186,7 +186,7 @@ pub fn parse<'a>(mmap: &'a Mmap, file_name: String, file_idx: usize) -> Result<O
                         info: symbol.info(),
                         value: symbol.value(),
                         size: symbol.size(),
-                        va_offset: OnceCell::new(),
+                        va: OnceCell::new(),
                     };
                     object_file.symbols.push(symbol);
                 }

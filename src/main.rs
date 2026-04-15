@@ -96,7 +96,7 @@ fn main() -> anyhow::Result<()> {
 
     pr_debug!("Start linking files...");
     let mut linked = link::link(parsed)?;
-    resolve::resolve(&linked.0, &mut linked.1, &linked.2)?;
+    resolve::resolve(&linked.0, &mut linked.1)?;
     relocate::relocate(linked.0, linked.1, linked.2)?;
 
     Ok(())

@@ -11,7 +11,6 @@ use crate::{
 pub fn resolve<'a>(
     section_placements: &Vec<SectionPlacement>,
     symbol_tables: &Vec<ObjectSymbol<'a>>,
-    relocations: &Vec<ObjectRelocation>,
 ) -> Result<()> {
     pr_debug!("Resolving symbols...");
 
@@ -51,7 +50,7 @@ pub fn resolve<'a>(
             elf::Elf64SymbolSectionIdx::AbsoluteSymbols => Some(symbol_table.value),
             elf::Elf64SymbolSectionIdx::Undefined => None,
         } {
-            symbol_table.va_offset.set(section_addr).unwrap();
+            symbol_table.va.set(section_addr).unwrap();
             if let Some(old_section) =
                 resolved_symbols.insert(symbol_table.name, (symbol_table, section_addr))
             {
@@ -87,7 +86,7 @@ pub fn resolve<'a>(
                     symbol_table.name, symbol_table.file_idx
                 )
             })?;
-            symbol_table.va_offset.set(resolved.1).unwrap();
+            symbol_table.va.set(resolved.1).unwrap();
         }
     }
     Ok(())
