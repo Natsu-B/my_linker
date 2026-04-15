@@ -99,7 +99,12 @@ pub fn relocate(
                     .context("Relocation PC32 calculation failed")?;
                 pr_debug!("Relocation PC32: {:#x}", addr);
 
-                write_data(target_data, target_offset as usize, addr, endianness)?;
+                write_data(
+                    target_data,
+                    target_offset + relocation.offset,
+                    addr,
+                    endianness,
+                )?;
             }
             X86_64RelocationType::Rel64 => {
                 // S + A
@@ -108,7 +113,12 @@ pub fn relocate(
                     .context("Relocation REL64 calculation failed")?;
                 pr_debug!("Relocation REL64: {:#x}", addr);
 
-                write_data(target_data, target_offset as usize, addr, endianness)?;
+                write_data(
+                    target_data,
+                    target_offset + relocation.offset,
+                    addr,
+                    endianness,
+                )?;
             }
             X86_64RelocationType::Rel32S => {
                 // S + A
@@ -119,7 +129,12 @@ pub fn relocate(
                     .context("Relocation REL32S calculation failed")?;
                 pr_debug!("Relocation REL32S: {:#x}", addr);
 
-                write_data(target_data, target_offset as usize, addr, endianness)?;
+                write_data(
+                    target_data,
+                    target_offset + relocation.offset,
+                    addr,
+                    endianness,
+                )?;
             }
             x => {
                 bail!("Unsupported relocation type: {:?}", x);
@@ -130,12 +145,8 @@ pub fn relocate(
     Ok(())
 }
 
-fn write_data<T: ToBytes>(
-    data: &mut [u8],
-    offset: usize,
-    value: T,
-    endian: ElfEndian,
-) -> Result<()> {
+fn write_data<T: ToBytes>(data: &mut [u8], offset: u64, value: T, endian: ElfEndian) -> Result<()> {
+    let offset = offset as usize;
     let bytes = match endian {
         ElfEndian::Little => value.to_le_bytes(),
         ElfEndian::Big => value.to_be_bytes(),
