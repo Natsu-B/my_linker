@@ -1,16 +1,18 @@
 use crate::{
-    link::SectionPlacement,
+    link::{ElfData, SectionPlacement},
     parse::{ObjectRelocation, ObjectSymbol},
     script,
 };
 
 use anyhow::{Context, Ok, Result, bail};
-use elf::{Elf64SymbolSectionIdx, x86_64::X86_64RelocationType};
+use elf::{ElfEndian, x86_64::X86_64RelocationType};
+use num::traits::ToBytes;
 
 pub fn relocate(
-    section_placements: Vec<SectionPlacement>,
+    section_placements: &mut Vec<SectionPlacement>,
     symbols: Vec<ObjectSymbol>,
     relocations: Vec<ObjectRelocation>,
+    elf_data: &ElfData,
 ) -> Result<()> {
     pr_debug!("Relocating sections...");
 
@@ -32,11 +34,12 @@ pub fn relocate(
             .sym
             .try_into()
             .context("Failed to convert symbol index")?;
-        let mut section_placement_info = None;
+        let mut section_va = None;
         let mut target_offset = None;
         let mut target_symbol = None;
-        for section_placement in &section_placements {
-            for (object_section, offset) in &section_placement.sections_data {
+        let mut target_data = None;
+        for section_placement in section_placements.iter_mut() {
+            for (object_section, offset) in section_placement.sections_data.iter_mut() {
                 if object_section.file_idx == relocation.file_idx
                     && object_section.idx == target_idx
                 {
@@ -46,8 +49,9 @@ pub fn relocate(
                         object_section.file_idx,
                         offset
                     );
-                    section_placement_info = Some(section_placement);
-                    target_offset = Some(offset);
+                    section_va = Some(*section_placement.va.get().unwrap());
+                    target_offset = Some(*offset);
+                    target_data = section_placement.data.as_mut();
                 }
             }
         }
@@ -63,10 +67,12 @@ pub fn relocate(
             }
         }
 
-        let section_placement_info = section_placement_info
-            .context("Failed to find section placement info for relocation")?;
+        let section_va =
+            section_va.context("Failed to find section virtual address for relocation")?;
         let target_symbol = target_symbol.context("Failed to find target symbol for relocation")?;
         let target_offset = target_offset.context("Failed to find target offset for relocation")?;
+        let target_data = target_data.context("Failed to find target data for relocation")?;
+        let endianness = elf_data.endianness;
 
         // S
         let symbol_addr = *target_symbol.va.get().unwrap();
@@ -74,8 +80,7 @@ pub fn relocate(
         // A
         let addend = relocation.addend;
         // P
-        let place_addr =
-            section_placement_info.va.get().unwrap() + *target_offset + relocation.offset;
+        let place_addr = section_va + target_offset + relocation.offset;
         // B
         let base_addr = script::LINKER_DATA.read().unwrap().vart_addr;
 
@@ -83,12 +88,67 @@ pub fn relocate(
         pr_debug!("Relocation type: {:?}", reloc_type);
         match reloc_type {
             X86_64RelocationType::None => {}
-            X86_64RelocationType::Pc32 => {}
+            X86_64RelocationType::Pc32 | X86_64RelocationType::Plt32 => {
+                // S + A - P
+                let addr: i32 = symbol_addr
+                    .checked_add_signed(addend)
+                    .context("Relocation PC32 calculation failed")?
+                    .checked_sub(place_addr)
+                    .context("Relocation PC32 calculation failed")?
+                    .try_into()
+                    .context("Relocation PC32 calculation failed")?;
+                pr_debug!("Relocation PC32: {:#x}", addr);
+
+                write_data(target_data, target_offset as usize, addr, endianness)?;
+            }
+            X86_64RelocationType::Rel64 => {
+                // S + A
+                let addr: u64 = symbol_addr
+                    .checked_add_signed(addend)
+                    .context("Relocation REL64 calculation failed")?;
+                pr_debug!("Relocation REL64: {:#x}", addr);
+
+                write_data(target_data, target_offset as usize, addr, endianness)?;
+            }
+            X86_64RelocationType::Rel32S => {
+                // S + A
+                let addr: i32 = symbol_addr
+                    .checked_add_signed(addend)
+                    .context("Relocation REL32S calculation failed")?
+                    .try_into()
+                    .context("Relocation REL32S calculation failed")?;
+                pr_debug!("Relocation REL32S: {:#x}", addr);
+
+                write_data(target_data, target_offset as usize, addr, endianness)?;
+            }
             x => {
                 bail!("Unsupported relocation type: {:?}", x);
             }
         }
     }
 
+    Ok(())
+}
+
+fn write_data<T: ToBytes>(
+    data: &mut [u8],
+    offset: usize,
+    value: T,
+    endian: ElfEndian,
+) -> Result<()> {
+    let bytes = match endian {
+        ElfEndian::Little => value.to_le_bytes(),
+        ElfEndian::Big => value.to_be_bytes(),
+    };
+    let bytes = bytes.as_ref();
+    if offset + size_of::<T>() > data.len() {
+        bail!(
+            "Write out of bounds: offset {} + size {} > data length {}",
+            offset,
+            size_of::<T>(),
+            data.len()
+        );
+    }
+    data[offset..offset + size_of::<T>()].copy_from_slice(&bytes);
     Ok(())
 }
