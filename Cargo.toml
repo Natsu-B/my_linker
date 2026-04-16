@@ -11,3 +11,8 @@ memmap2 = "0.9.10"
 rayon = "1.11.0"
 elf = { path = "./elf" }
 num = "0.4.3"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
