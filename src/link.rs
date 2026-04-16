@@ -250,12 +250,16 @@ pub fn link(
 #[cfg(test)]
 mod tests {
     use super::{PAGE_SIZE, link};
-    use crate::parse::{ObjectFile, ObjectSection};
+    use crate::{
+        input_id::FileId,
+        parse::{ObjectFile, ObjectSection},
+    };
     use elf::{Elf64SectionFlags, Elf64SectionType, ElfEndian};
 
     fn object_file(sections: Vec<ObjectSection<'static>>) -> ObjectFile<'static> {
         ObjectFile {
             file_name: "test.o".to_string(),
+            file_id: FileId::Object(0),
             endian: ElfEndian::Little,
             sections,
             symbols: Vec::new(),
@@ -273,7 +277,7 @@ mod tests {
     #[test]
     fn link_page_aligns_separate_text_and_rodata_sections() {
         let text = ObjectSection {
-            file_idx: 0,
+            file_id: FileId::Object(0),
             idx: 1,
             name: ".text",
             ty: Elf64SectionType::SHT_PROGBITS,
@@ -283,7 +287,7 @@ mod tests {
             size: 2,
         };
         let rodata = ObjectSection {
-            file_idx: 0,
+            file_id: FileId::Object(0),
             idx: 2,
             name: ".rodata",
             ty: Elf64SectionType::SHT_PROGBITS,

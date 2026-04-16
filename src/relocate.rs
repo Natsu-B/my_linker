@@ -18,9 +18,9 @@ pub fn relocate(
 
     for relocation in relocations {
         pr_debug!(
-            "Relocating symbol idx: {} in file idx: {} at offset: {:#x} in section idx: {}",
+            "Relocating symbol idx: {} in file id: {} at offset: {:#x} in section idx: {}",
             relocation.target_idx,
-            relocation.file_idx,
+            relocation.file_id,
             relocation.offset,
             relocation.reloc_section_idx
         );
@@ -40,13 +40,12 @@ pub fn relocate(
         let mut target_data = None;
         for section_placement in section_placements.iter_mut() {
             for (object_section, offset) in section_placement.sections_data.iter_mut() {
-                if object_section.file_idx == relocation.file_idx
-                    && object_section.idx == target_idx
+                if object_section.file_id == relocation.file_id && object_section.idx == target_idx
                 {
                     pr_debug!(
-                        "  Found target section: {} in file idx: {} at offset: {:#x}",
+                        "  Found target section: {} in file id: {} at offset: {:#x}",
                         object_section.name,
-                        object_section.file_idx,
+                        object_section.file_id,
                         offset
                     );
                     section_va = Some(*section_placement.va.get().unwrap());
@@ -57,11 +56,11 @@ pub fn relocate(
             }
         }
         for symbol in &symbols {
-            if symbol.file_idx == relocation.file_idx && target_symbol_idx == symbol.idx {
+            if symbol.file_id == relocation.file_id && target_symbol_idx == symbol.idx {
                 pr_debug!(
-                    "  Found target symbol: {} in file idx: {} at offset: {:#x}",
+                    "  Found target symbol: {} in file id: {} at offset: {:#x}",
                     symbol.name,
-                    symbol.file_idx,
+                    symbol.file_id,
                     symbol.value
                 );
                 target_symbol = Some(symbol);

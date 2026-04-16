@@ -1,13 +1,16 @@
-use std::{cell::OnceCell, collections::HashMap, mem::size_of};
+use std::{cell::OnceCell, mem::size_of};
 
 use anyhow::{Context, Result, bail, ensure};
-use elf::{Elf64SymbolBinding, Elf64SymbolInfo, Elf64SymbolSectionIdx, Elf64SymbolType};
-
-use crate::parse;
 
 const AR_MAGIC: &[u8; 8] = b"!<arch>\n";
 const THIN_MAGIC: &[u8; 8] = b"!<thin>\n";
-const AR_FMAG: [u8; 2] = *b"`\n";
+pub(crate) const AR_FMAG: [u8; 2] = *b"`\n";
+const AR_NAME_OFFSET: usize = std::mem::offset_of!(archive_member, ar_name);
+const AR_NAME_LEN: usize = size_of::<[u8; 16]>();
+const AR_SIZE_OFFSET: usize = std::mem::offset_of!(archive_member, ar_size);
+const AR_SIZE_LEN: usize = size_of::<[u8; 10]>();
+const AR_FMAG_OFFSET: usize = std::mem::offset_of!(archive_member, ar_fmag);
+const AR_FMAG_LEN: usize = size_of::<[u8; 2]>();
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -37,6 +40,10 @@ struct MemberSlice {
     size: usize,
 }
 
+pub fn check_magic(data: &[u8]) -> bool {
+    data.starts_with(AR_MAGIC)
+}
+
 #[derive(Debug)]
 pub struct ArchiveReader<'a> {
     data: &'a [u8],
@@ -50,7 +57,7 @@ impl<'a> ArchiveReader<'a> {
             bail!("thin archives are unsupported");
         }
         ensure!(
-            data.starts_with(AR_MAGIC),
+            check_magic(data),
             "invalid archive format: missing magic header"
         );
 
@@ -78,31 +85,6 @@ impl<'a> ArchiveReader<'a> {
 
     pub fn symbol_table(&self) -> Result<Option<&'a [u8]>> {
         self.cached_special_member(&self.symbol_table, SpecialMemberKind::SymbolTable)
-    }
-
-    pub fn collect_member_infos(&self) -> Result<Vec<MemberInfo<'a>>> {
-        let long_names = self.long_name_table()?;
-        let mut infos = Vec::new();
-
-        for (file_idx, member) in self.object_members().enumerate() {
-            let member = member?;
-            let name = member.resolved_name(long_names)?;
-            let bytes = member.object_bytes().with_context(|| {
-                format!("failed to read object bytes for archive member {name}")
-            })?;
-            let object = parse::parse(bytes, name.clone(), file_idx)
-                .with_context(|| format!("failed to parse archive member {name}"))?;
-            let (defined, undefined) = collect_symbols(&object);
-
-            infos.push(MemberInfo {
-                name,
-                bytes,
-                defined,
-                undefined,
-            });
-        }
-
-        Ok(infos)
     }
 
     fn cached_special_member(
@@ -162,15 +144,15 @@ pub struct ArchiveMember<'a> {
 }
 
 impl<'a> ArchiveMember<'a> {
-    pub fn header(&'a self) -> &'a archive_member {
+    pub fn header(&self) -> archive_member {
         debug_assert!(self.offset + size_of::<archive_member>() <= self.data.len());
 
-        let bytes = &self.data[self.offset..self.offset + size_of::<archive_member>()];
-        unsafe { &*bytes.as_ptr().cast::<archive_member>() }
+        // Safety: the byte range is bounds-checked above and `archive_member` is `Copy`.
+        unsafe { std::ptr::read_unaligned(self.header_bytes().as_ptr().cast::<archive_member>()) }
     }
 
     pub fn size(&self) -> Result<usize> {
-        Ok(to_decimal(&self.header().ar_size)? as usize)
+        Ok(to_decimal(self.header_field(AR_SIZE_OFFSET, AR_SIZE_LEN))? as usize)
     }
 
     pub fn payload_offset(&self) -> usize {
@@ -189,11 +171,12 @@ impl<'a> ArchiveMember<'a> {
     }
 
     pub fn next_offset(&self) -> Result<usize> {
+        let size = self.size()?;
         let payload_end = self
             .payload_offset()
-            .checked_add(self.size()?)
+            .checked_add(size)
             .context("member next offset overflowed usize")?;
-        let padding = self.size()? % 2;
+        let padding = size % 2;
 
         payload_end
             .checked_add(padding)
@@ -201,7 +184,7 @@ impl<'a> ArchiveMember<'a> {
     }
 
     pub fn member_name(&'a self) -> Result<MemberName<'a>> {
-        let raw_name = std::str::from_utf8(&self.header().ar_name)
+        let raw_name = std::str::from_utf8(self.header_field(AR_NAME_OFFSET, AR_NAME_LEN))
             .context("archive member name is not valid UTF-8")?;
         let raw_name = raw_name.trim_end_matches(' ');
 
@@ -286,6 +269,15 @@ impl<'a> ArchiveMember<'a> {
             MemberName::SymbolTable | MemberName::SymbolTable64 | MemberName::LongNameTable
         ))
     }
+
+    fn header_bytes(&self) -> &'a [u8] {
+        &self.data[self.offset..self.offset + size_of::<archive_member>()]
+    }
+
+    fn header_field(&self, offset: usize, len: usize) -> &'a [u8] {
+        let start = self.offset + offset;
+        &self.data[start..start + len]
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -313,9 +305,8 @@ impl<'reader, 'data> Iterator for ArchiveIter<'reader, 'data> {
             data: self.reader.data,
             offset: self.offset,
         };
-        let header = member.header();
 
-        if header.ar_fmag != AR_FMAG {
+        if member.header_field(AR_FMAG_OFFSET, AR_FMAG_LEN) != AR_FMAG.as_slice() {
             self.offset = self.reader.data.len();
             return Some(Err(anyhow::anyhow!(
                 "invalid archive format: invalid member trailer"
@@ -357,67 +348,7 @@ impl<'reader, 'data> Iterator for ArchiveObjectIter<'reader, 'data> {
     }
 }
 
-#[derive(Debug)]
-pub struct MemberInfo<'a> {
-    pub name: String,
-    pub bytes: &'a [u8],
-    pub defined: Vec<&'a str>,
-    pub undefined: Vec<&'a str>,
-}
-
-pub fn build_symbol_index<'a>(
-    infos: Vec<MemberInfo<'a>>,
-) -> Result<(Vec<MemberInfo<'a>>, HashMap<&'a str, usize>)> {
-    let mut index = HashMap::new();
-
-    for (member_idx, info) in infos.iter().enumerate() {
-        for &symbol in &info.defined {
-            if let Some(existing_idx) = index.insert(symbol, member_idx) {
-                bail!(
-                    "duplicate defined symbol: {symbol} in members {} and {}",
-                    infos[existing_idx].name,
-                    info.name
-                );
-            }
-        }
-    }
-
-    Ok((infos, index))
-}
-
-fn collect_symbols<'a>(object: &parse::ObjectFile<'a>) -> (Vec<&'a str>, Vec<&'a str>) {
-    let mut defined = Vec::new();
-    let mut undefined = Vec::new();
-
-    for symbol in &object.symbols {
-        if symbol.name.is_empty() {
-            continue;
-        }
-
-        if matches!(
-            symbol.info.get_enum(Elf64SymbolInfo::st_type),
-            Some(Elf64SymbolType::STT_FILE | Elf64SymbolType::STT_SECTION)
-        ) {
-            continue;
-        }
-
-        match symbol.section_idx {
-            Elf64SymbolSectionIdx::Undefined => undefined.push(symbol.name),
-            _ => {
-                if matches!(
-                    symbol.info.get_enum(Elf64SymbolInfo::st_bind),
-                    Some(Elf64SymbolBinding::STB_GLOBAL | Elf64SymbolBinding::STB_WEAK)
-                ) {
-                    defined.push(symbol.name);
-                }
-            }
-        }
-    }
-
-    (defined, undefined)
-}
-
-fn resolve_long_name(long_names: &[u8], offset: usize) -> Result<String> {
+pub fn resolve_long_name(long_names: &[u8], offset: usize) -> Result<String> {
     ensure!(
         offset < long_names.len(),
         "long-name table offset out of bounds: {offset}"
@@ -444,169 +375,14 @@ fn to_decimal(bytes: &[u8]) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use elf::{Elf64SectionType, Elf64SymbolBinding, Elf64SymbolType, ElfFileType, ElfMachineType};
+    use crate::test_utils::{TestSymbol, build_archive, build_rel_object};
+    use elf::{Elf64SymbolBinding, Elf64SymbolType};
 
-    #[derive(Clone, Copy)]
-    struct TestSymbol<'a> {
-        name: &'a str,
-        binding: Elf64SymbolBinding,
-        ty: Elf64SymbolType,
-        section_idx: u16,
-        value: u64,
-        size: u64,
-    }
-
-    fn write_u16(out: &mut [u8], offset: usize, value: u16) {
-        out[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
-    }
-
-    fn write_u32(out: &mut [u8], offset: usize, value: u32) {
-        out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-    }
-
-    fn write_u64(out: &mut [u8], offset: usize, value: u64) {
-        out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-    }
-
-    fn build_rel_object(symbols: &[TestSymbol<'_>]) -> Vec<u8> {
-        const ELF_HEADER_SIZE: usize = 64;
-        const SECTION_HEADER_SIZE: usize = 64;
-        const SYMBOL_SIZE: usize = 24;
-
-        let shstrtab = b"\0.shstrtab\0.text\0.symtab\0.strtab\0";
-        let text = [0x90, 0x90, 0xC3];
-
-        let mut symbols = symbols.to_vec();
-        symbols.sort_by_key(|symbol| usize::from(symbol.binding != Elf64SymbolBinding::STB_LOCAL));
-
-        let mut strtab = vec![0];
-        let mut name_offsets = Vec::with_capacity(symbols.len());
-        for symbol in &symbols {
-            if symbol.name.is_empty() {
-                name_offsets.push(0);
-            } else {
-                let offset = strtab.len() as u32;
-                strtab.extend_from_slice(symbol.name.as_bytes());
-                strtab.push(0);
-                name_offsets.push(offset);
-            }
-        }
-
-        let local_count = symbols
-            .iter()
-            .take_while(|symbol| symbol.binding == Elf64SymbolBinding::STB_LOCAL)
-            .count();
-        let shstrtab_offset = ELF_HEADER_SIZE;
-        let text_offset = shstrtab_offset + shstrtab.len();
-        let symtab_offset = text_offset + text.len();
-        let symtab_size = SYMBOL_SIZE * (symbols.len() + 1);
-        let strtab_offset = symtab_offset + symtab_size;
-        let shoff = strtab_offset + strtab.len();
-        let file_size = shoff + SECTION_HEADER_SIZE * 5;
-
-        let mut out = vec![0u8; file_size];
-
-        out[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
-        out[4] = 2;
-        out[5] = 1;
-        out[6] = 1;
-
-        write_u16(&mut out, 16, ElfFileType::ET_REL.raw());
-        write_u16(&mut out, 18, ElfMachineType::EM_X86_64.raw());
-        write_u32(&mut out, 20, 1);
-        write_u64(&mut out, 24, 0);
-        write_u64(&mut out, 32, 0);
-        write_u64(&mut out, 40, shoff as u64);
-        write_u32(&mut out, 48, 0);
-        write_u16(&mut out, 52, ELF_HEADER_SIZE as u16);
-        write_u16(&mut out, 54, 0);
-        write_u16(&mut out, 56, 0);
-        write_u16(&mut out, 58, SECTION_HEADER_SIZE as u16);
-        write_u16(&mut out, 60, 5);
-        write_u16(&mut out, 62, 1);
-
-        out[shstrtab_offset..shstrtab_offset + shstrtab.len()].copy_from_slice(shstrtab);
-        out[text_offset..text_offset + text.len()].copy_from_slice(&text);
-        out[strtab_offset..strtab_offset + strtab.len()].copy_from_slice(&strtab);
-
-        for (i, symbol) in symbols.iter().enumerate() {
-            let entry = symtab_offset + SYMBOL_SIZE * (i + 1);
-            write_u32(&mut out, entry, name_offsets[i]);
-            out[entry + 4] = ((symbol.binding as u8) << 4) | (symbol.ty as u8);
-            out[entry + 5] = 0;
-            write_u16(&mut out, entry + 6, symbol.section_idx);
-            write_u64(&mut out, entry + 8, symbol.value);
-            write_u64(&mut out, entry + 16, symbol.size);
-        }
-
-        let mut sh = shoff;
-
-        sh += SECTION_HEADER_SIZE;
-
-        write_u32(&mut out, sh, 1);
-        write_u32(&mut out, sh + 4, Elf64SectionType::SHT_STRTAB.raw());
-        write_u64(&mut out, sh + 24, shstrtab_offset as u64);
-        write_u64(&mut out, sh + 32, shstrtab.len() as u64);
-        write_u64(&mut out, sh + 48, 1);
-        sh += SECTION_HEADER_SIZE;
-
-        write_u32(&mut out, sh, 11);
-        write_u32(&mut out, sh + 4, Elf64SectionType::SHT_PROGBITS.raw());
-        write_u64(&mut out, sh + 8, 0x6);
-        write_u64(&mut out, sh + 24, text_offset as u64);
-        write_u64(&mut out, sh + 32, text.len() as u64);
-        write_u64(&mut out, sh + 48, 16);
-        sh += SECTION_HEADER_SIZE;
-
-        write_u32(&mut out, sh, 17);
-        write_u32(&mut out, sh + 4, Elf64SectionType::SHT_SYMTAB.raw());
-        write_u64(&mut out, sh + 24, symtab_offset as u64);
-        write_u64(&mut out, sh + 32, symtab_size as u64);
-        write_u32(&mut out, sh + 40, 4);
-        write_u32(&mut out, sh + 44, (local_count + 1) as u32);
-        write_u64(&mut out, sh + 48, 8);
-        write_u64(&mut out, sh + 56, SYMBOL_SIZE as u64);
-        sh += SECTION_HEADER_SIZE;
-
-        write_u32(&mut out, sh, 25);
-        write_u32(&mut out, sh + 4, Elf64SectionType::SHT_STRTAB.raw());
-        write_u64(&mut out, sh + 24, strtab_offset as u64);
-        write_u64(&mut out, sh + 32, strtab.len() as u64);
-        write_u64(&mut out, sh + 48, 1);
-
-        out
-    }
-
-    fn push_field(out: &mut Vec<u8>, width: usize, value: &[u8]) {
-        assert!(value.len() <= width);
-        out.extend_from_slice(value);
-        out.resize(out.len() + (width - value.len()), b' ');
-    }
-
-    fn push_member(out: &mut Vec<u8>, name: &str, payload: &[u8]) {
-        push_member_with_trailer(out, name, payload, AR_FMAG);
-    }
-
-    fn push_member_with_trailer(out: &mut Vec<u8>, name: &str, payload: &[u8], trailer: [u8; 2]) {
-        push_field(out, 16, name.as_bytes());
-        push_field(out, 12, b"0");
-        push_field(out, 6, b"0");
-        push_field(out, 6, b"0");
-        push_field(out, 8, b"100644");
-        push_field(out, 10, payload.len().to_string().as_bytes());
-        out.extend_from_slice(&trailer);
-        out.extend_from_slice(payload);
-        if payload.len() % 2 != 0 {
-            out.push(b'\n');
-        }
-    }
-
-    fn build_archive(members: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut out = Vec::from(AR_MAGIC.as_slice());
-        for &(name, payload) in members {
-            push_member(&mut out, name, payload);
-        }
-        out
+    #[test]
+    fn check_magic_only_accepts_archive_magic() {
+        assert!(check_magic(AR_MAGIC));
+        assert!(!check_magic(THIN_MAGIC));
+        assert!(!check_magic(b"\x7FELF"));
     }
 
     #[test]
@@ -641,14 +417,17 @@ mod tests {
     #[test]
     fn long_name_table_resolves_offsets() {
         let long_names = b"very_long_member_name.o/\n";
-        let object = build_rel_object(&[TestSymbol {
-            name: "foo",
-            binding: Elf64SymbolBinding::STB_GLOBAL,
-            ty: Elf64SymbolType::STT_FUNC,
-            section_idx: 2,
-            value: 0,
-            size: 3,
-        }]);
+        let object = build_rel_object(
+            &[TestSymbol {
+                name: "foo",
+                binding: Elf64SymbolBinding::STB_GLOBAL,
+                ty: Elf64SymbolType::STT_FUNC,
+                section_idx: 2,
+                value: 0,
+                size: 5,
+            }],
+            &[],
+        );
         let archive = build_archive(&[("//", long_names), ("/0", &object)]);
         let reader = ArchiveReader::new(&archive).unwrap();
         let member = reader.object_members().next().unwrap().unwrap();
@@ -664,14 +443,17 @@ mod tests {
 
     #[test]
     fn bsd_extended_name_resolves() {
-        let object = build_rel_object(&[TestSymbol {
-            name: "foo",
-            binding: Elf64SymbolBinding::STB_GLOBAL,
-            ty: Elf64SymbolType::STT_FUNC,
-            section_idx: 2,
-            value: 0,
-            size: 3,
-        }]);
+        let object = build_rel_object(
+            &[TestSymbol {
+                name: "foo",
+                binding: Elf64SymbolBinding::STB_GLOBAL,
+                ty: Elf64SymbolType::STT_FUNC,
+                section_idx: 2,
+                value: 0,
+                size: 5,
+            }],
+            &[],
+        );
         let name = b"bsd_member_name.o";
         let mut payload = name.to_vec();
         payload.extend_from_slice(&object);
@@ -686,14 +468,17 @@ mod tests {
 
     #[test]
     fn special_members_are_skipped_from_object_iteration() {
-        let object = build_rel_object(&[TestSymbol {
-            name: "foo",
-            binding: Elf64SymbolBinding::STB_GLOBAL,
-            ty: Elf64SymbolType::STT_FUNC,
-            section_idx: 2,
-            value: 0,
-            size: 3,
-        }]);
+        let object = build_rel_object(
+            &[TestSymbol {
+                name: "foo",
+                binding: Elf64SymbolBinding::STB_GLOBAL,
+                ty: Elf64SymbolType::STT_FUNC,
+                section_idx: 2,
+                value: 0,
+                size: 5,
+            }],
+            &[],
+        );
         let archive = build_archive(&[
             ("/", b"symtab"),
             ("/SYM64/", b"symtab64"),
@@ -717,117 +502,43 @@ mod tests {
     }
 
     #[test]
-    fn build_symbol_map_reuses_undefined_list_contents() {
-        let object = build_rel_object(&[
-            TestSymbol {
-                name: "",
-                binding: Elf64SymbolBinding::STB_LOCAL,
-                ty: Elf64SymbolType::STT_SECTION,
-                section_idx: 2,
-                value: 0,
-                size: 0,
-            },
-            TestSymbol {
-                name: "member.c",
-                binding: Elf64SymbolBinding::STB_LOCAL,
-                ty: Elf64SymbolType::STT_FILE,
-                section_idx: 0xFFF1,
-                value: 0,
-                size: 0,
-            },
-            TestSymbol {
-                name: "local_only",
-                binding: Elf64SymbolBinding::STB_LOCAL,
-                ty: Elf64SymbolType::STT_FUNC,
-                section_idx: 2,
-                value: 1,
-                size: 1,
-            },
-            TestSymbol {
+    fn invalid_trailer_is_rejected() {
+        let object = build_rel_object(
+            &[TestSymbol {
                 name: "foo",
                 binding: Elf64SymbolBinding::STB_GLOBAL,
                 ty: Elf64SymbolType::STT_FUNC,
                 section_idx: 2,
                 value: 0,
-                size: 3,
-            },
-            TestSymbol {
-                name: "bar",
-                binding: Elf64SymbolBinding::STB_WEAK,
-                ty: Elf64SymbolType::STT_FUNC,
-                section_idx: 2,
-                value: 0,
-                size: 3,
-            },
-            TestSymbol {
-                name: "baz",
-                binding: Elf64SymbolBinding::STB_GLOBAL,
-                ty: Elf64SymbolType::STT_NOTYPE,
-                section_idx: 0,
-                value: 0,
-                size: 0,
-            },
-        ]);
-        let archive = build_archive(&[("multi.o/", &object)]);
-        let reader = ArchiveReader::new(&archive).unwrap();
-        let infos = reader.collect_member_infos().unwrap();
-        let map = build_symbol_map(&infos).unwrap();
-
-        assert_eq!(infos.len(), 1);
-        assert_eq!(infos[0].defined, vec!["foo", "bar"]);
-        assert_eq!(infos[0].undefined, vec!["baz"]);
-        assert_eq!(map.get("foo").unwrap().0, infos[0].bytes);
-        assert_eq!(map.get("foo").unwrap().1, vec!["baz"]);
-        assert_eq!(map.get("bar").unwrap().0, infos[0].bytes);
-        assert_eq!(map.get("bar").unwrap().1, vec!["baz"]);
-
-        let (infos, index) = build_symbol_index(infos).unwrap();
-        assert_eq!(index["foo"], 0);
-        assert_eq!(index["bar"], 0);
-        assert_eq!(infos[index["foo"]].undefined, vec!["baz"]);
-    }
-
-    #[test]
-    fn duplicate_symbol_is_an_error() {
-        let first = build_rel_object(&[TestSymbol {
-            name: "dup",
-            binding: Elf64SymbolBinding::STB_GLOBAL,
-            ty: Elf64SymbolType::STT_FUNC,
-            section_idx: 2,
-            value: 0,
-            size: 3,
-        }]);
-        let second = build_rel_object(&[TestSymbol {
-            name: "dup",
-            binding: Elf64SymbolBinding::STB_GLOBAL,
-            ty: Elf64SymbolType::STT_FUNC,
-            section_idx: 2,
-            value: 0,
-            size: 3,
-        }]);
-        let archive = build_archive(&[("one.o/", &first), ("two.o/", &second)]);
-        let reader = ArchiveReader::new(&archive).unwrap();
-        let infos = reader.collect_member_infos().unwrap();
-
-        assert!(build_symbol_map(&infos).is_err());
-        assert!(build_symbol_index(infos).is_err());
-    }
-
-    #[test]
-    fn invalid_trailer_is_rejected() {
-        let object = build_rel_object(&[TestSymbol {
-            name: "foo",
-            binding: Elf64SymbolBinding::STB_GLOBAL,
-            ty: Elf64SymbolType::STT_FUNC,
-            section_idx: 2,
-            value: 0,
-            size: 3,
-        }]);
+                size: 5,
+            }],
+            &[],
+        );
         let mut archive = Vec::from(AR_MAGIC.as_slice());
         push_member_with_trailer(&mut archive, "foo.o/", &object, *b"!!");
         let reader = ArchiveReader::new(&archive).unwrap();
         let err = reader.iter().next().unwrap().unwrap_err();
 
         assert!(err.to_string().contains("invalid member trailer"));
+    }
+
+    fn push_field(out: &mut Vec<u8>, width: usize, value: &[u8]) {
+        assert!(value.len() <= width);
+        out.extend_from_slice(value);
+        out.resize(out.len() + (width - value.len()), b' ');
+    }
+
+    fn push_member_with_trailer(out: &mut Vec<u8>, name: &str, payload: &[u8], trailer: [u8; 2]) {
+        push_field(out, 16, name.as_bytes());
+        push_field(out, 12, b"0");
+        push_field(out, 6, b"0");
+        push_field(out, 6, b"0");
+        push_field(out, 8, b"100644");
+        push_field(out, 10, payload.len().to_string().as_bytes());
+        out.extend_from_slice(&trailer);
+        out.extend_from_slice(payload);
+        if payload.len() % 2 != 0 {
+            out.push(b'\n');
+        }
     }
 }

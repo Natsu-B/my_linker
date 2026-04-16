@@ -21,7 +21,7 @@ pub fn resolve<'a>(
 
                 for section_placement in section_placements {
                     for (object_section, offset) in &section_placement.sections_data {
-                        if object_section.file_idx == symbol_table.file_idx
+                        if object_section.file_id == symbol_table.file_id
                             && object_section.idx == idx
                         {
                             sym_section_placement = Some(section_placement);
@@ -63,8 +63,8 @@ pub fn resolve<'a>(
                     bail!(
                         "multiple definition of symbol: {} in files: {} and {}",
                         symbol_table.name,
-                        symbol_table.file_idx,
-                        old_section.0.file_idx
+                        symbol_table.file_id,
+                        old_section.0.file_id
                     );
                 }
             }
@@ -82,7 +82,7 @@ pub fn resolve<'a>(
             let resolved = resolved_symbols.get(symbol_table.name).with_context(|| {
                 format!(
                     "undefined symbol: {} in file: {}",
-                    symbol_table.name, symbol_table.file_idx
+                    symbol_table.name, symbol_table.file_id
                 )
             })?;
             symbol_table.va.set(resolved.1).unwrap();

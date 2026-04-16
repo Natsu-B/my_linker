@@ -5,6 +5,8 @@ use elf::{
     self, Elf64RelaInfo, Elf64SectionFlags, Elf64SectionType, Elf64SymbolInfo,
     Elf64SymbolSectionIdx, ElfEndian, ElfFileType, ElfMachineType,
 };
+
+use crate::input_id::FileId;
 /// A parsed ELF relocatable object file (`ET_REL`).
 ///
 /// This struct contains the subset of information needed by the linker stage:
@@ -14,6 +16,9 @@ use elf::{
 pub struct ObjectFile<'a> {
     /// Original input file name.
     pub file_name: String,
+
+    /// Stable identity of the original input object.
+    pub file_id: FileId,
 
     /// Endianness of the ELF file.
     pub endian: ElfEndian,
@@ -34,8 +39,8 @@ pub struct ObjectFile<'a> {
 /// together with its metadata and optional raw contents.
 #[derive(Debug)]
 pub struct ObjectSection<'a> {
-    /// file idx
-    pub file_idx: usize,
+    /// Identity of the object file that owns this section.
+    pub file_id: FileId,
 
     /// Section index in the ELF section table.
     pub idx: u16,
@@ -68,8 +73,8 @@ pub struct ObjectSection<'a> {
 /// file symbols, or other linker-visible entities.
 #[derive(Debug)]
 pub struct ObjectSymbol<'a> {
-    /// file idx
-    pub file_idx: usize,
+    /// Identity of the object file that owns this symbol.
+    pub file_id: FileId,
 
     /// Index of the symbol in the symbol table.
     pub idx: u16,
@@ -105,8 +110,8 @@ pub struct ObjectSymbol<'a> {
 /// must be adjusted once symbol addresses are known.
 #[derive(Debug)]
 pub struct ObjectRelocation {
-    /// file idx
-    pub file_idx: usize,
+    /// Identity of the object file that owns this relocation.
+    pub file_id: FileId,
 
     /// Index of the relocation section that contains this entry.
     pub reloc_section_idx: u16,
@@ -124,7 +129,7 @@ pub struct ObjectRelocation {
     pub addend: i64,
 }
 
-pub fn parse<'a>(mmap: &'a [u8], file_name: String, file_idx: usize) -> Result<ObjectFile<'a>> {
+pub fn parse<'a>(mmap: &'a [u8], file_name: String, file_id: FileId) -> Result<ObjectFile<'a>> {
     let elf = elf::Elf64::new(mmap)
         .with_context(|| format!("failed to parse ELF file: {}", file_name))?;
 
@@ -143,7 +148,8 @@ pub fn parse<'a>(mmap: &'a [u8], file_name: String, file_idx: usize) -> Result<O
     );
 
     let mut object_file: ObjectFile<'a> = ObjectFile {
-        file_name: file_name,
+        file_name,
+        file_id,
         endian: elf.endian(),
         sections: Vec::new(),
         symbols: Vec::new(),
@@ -161,7 +167,7 @@ pub fn parse<'a>(mmap: &'a [u8], file_name: String, file_idx: usize) -> Result<O
                     pr_debug!("  Type: NOBITS");
                 }
                 let section = ObjectSection::<'a> {
-                    file_idx,
+                    file_id,
                     idx: section.idx(),
                     name: section.name()?,
                     ty: section.section_type(),
@@ -177,7 +183,7 @@ pub fn parse<'a>(mmap: &'a [u8], file_name: String, file_idx: usize) -> Result<O
                 for (i, symbol) in section.symbols()?.enumerate() {
                     pr_debug!("    Symbol: {}", symbol.name()?);
                     let symbol = ObjectSymbol {
-                        file_idx,
+                        file_id,
                         idx: i as u16,
                         section_idx: symbol.section_idx(),
                         name: symbol.name()?,
@@ -200,7 +206,7 @@ pub fn parse<'a>(mmap: &'a [u8], file_name: String, file_idx: usize) -> Result<O
                         relocation.addend()
                     );
                     let relocation = ObjectRelocation {
-                        file_idx,
+                        file_id,
                         target_idx: relocation.target_idx(),
                         reloc_section_idx: section.idx(),
                         offset: relocation.offset(),
@@ -220,4 +226,67 @@ pub fn parse<'a>(mmap: &'a [u8], file_name: String, file_idx: usize) -> Result<O
     }
 
     Ok(object_file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse;
+    use crate::{
+        input_id::FileId,
+        test_utils::{TestRelocation, TestSymbol, build_rel_object},
+    };
+    use elf::{Elf64SymbolBinding, Elf64SymbolType};
+
+    #[test]
+    fn parse_propagates_object_file_id_to_sections_symbols_and_relocations() {
+        let object = build_rel_object(
+            &[
+                TestSymbol {
+                    name: "",
+                    binding: Elf64SymbolBinding::STB_LOCAL,
+                    ty: Elf64SymbolType::STT_SECTION,
+                    section_idx: 2,
+                    value: 0,
+                    size: 0,
+                },
+                TestSymbol {
+                    name: "foo",
+                    binding: Elf64SymbolBinding::STB_GLOBAL,
+                    ty: Elf64SymbolType::STT_FUNC,
+                    section_idx: 2,
+                    value: 0,
+                    size: 5,
+                },
+            ],
+            &[TestRelocation {
+                offset: 0,
+                sym: 2,
+                ty: 2,
+                addend: -4,
+            }],
+        );
+        let file_id = FileId::Object(7);
+
+        let parsed = parse(&object, "plain.o".to_string(), file_id).unwrap();
+
+        assert_eq!(parsed.file_id, file_id);
+        assert!(
+            parsed
+                .sections
+                .iter()
+                .all(|section| section.file_id == file_id)
+        );
+        assert!(
+            parsed
+                .symbols
+                .iter()
+                .all(|symbol| symbol.file_id == file_id)
+        );
+        assert!(
+            parsed
+                .relocations
+                .iter()
+                .all(|relocation| relocation.file_id == file_id)
+        );
+    }
 }
