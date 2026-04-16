@@ -84,7 +84,7 @@ pub fn relocate(
         // P
         let place_addr = section_va + target_offset + relocation.offset;
         // B
-        let base_addr = script::LINKER_DATA.read().unwrap().vart_addr;
+        // let base_addr = script::LINKER_DATA.read().unwrap().vart_addr;
 
         let reloc_type = X86_64RelocationType::try_from(relocation.info)?;
         pr_debug!("Relocation type: {:?}", reloc_type);

@@ -12,4 +12,4 @@ pub use read::{
     Elf64, Elf64ProgramHeader, Elf64ProgramHeaderIter, Elf64Rela, Elf64RelaIter, Elf64Section,
     Elf64SectionIter, Elf64Symbol, Elf64SymbolIter,
 };
-pub use write::{ElfLayout, ExecElf64Writer, LoadSegment, SegmentLayout};
+pub use write::{Elf64ProgramHeaderFlags, ExecElf64Writer, LoadSegment};

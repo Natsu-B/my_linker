@@ -1,12 +1,9 @@
 use std::collections::HashMap;
 
-use anyhow::{Context, Ok, Result, bail, ensure};
+use anyhow::{Context, Ok, Result, bail};
 use elf::{Elf64SymbolBinding, Elf64SymbolInfo};
 
-use crate::{
-    link::SectionPlacement,
-    parse::{ObjectRelocation, ObjectSymbol},
-};
+use crate::{link::SectionPlacement, parse::ObjectSymbol};
 
 pub fn resolve<'a>(
     section_placements: &Vec<SectionPlacement>,

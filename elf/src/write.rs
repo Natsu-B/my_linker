@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, ensure};
+use typestate::{RawReg, bitregs};
 
 use crate::{
     PF_R, PF_W, PF_X,
@@ -19,7 +20,7 @@ pub struct ExecElf64Writer {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoadSegment {
-    pub flags: u32,
+    pub flags: Elf64ProgramHeaderFlags,
     pub vaddr: u64,
     pub paddr: u64,
     pub align: u64,
@@ -27,23 +28,32 @@ pub struct LoadSegment {
     pub mem_size: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ElfLayout {
-    pub file_size: u64,
-    pub phoff: u64,
-    pub phnum: u16,
-    pub segments: Vec<SegmentLayout>,
+bitregs! {
+    pub struct Elf64ProgramHeaderFlags: u32 {
+        pub executable@[0:0],
+        pub writable@[1:1],
+        pub readable@[2:2],
+        _reserved@[31:3],
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SegmentLayout {
-    pub offset: u64,
-    pub file_size: u64,
-    pub mem_size: u64,
-    pub vaddr: u64,
-    pub paddr: u64,
-    pub align: u64,
-    pub flags: u32,
+struct ElfLayout {
+    file_size: u64,
+    phoff: u64,
+    phnum: u16,
+    segments: Vec<SegmentLayout>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SegmentLayout {
+    offset: u64,
+    file_size: u64,
+    mem_size: u64,
+    vaddr: u64,
+    paddr: u64,
+    align: u64,
+    flags: Elf64ProgramHeaderFlags,
 }
 
 impl ExecElf64Writer {
@@ -60,7 +70,7 @@ impl ExecElf64Writer {
         self.segments.push(seg);
     }
 
-    pub fn layout(&self) -> Result<ElfLayout> {
+    fn layout(&self) -> Result<ElfLayout> {
         self.validate_writer()?;
         ensure!(
             !self.segments.is_empty(),
@@ -120,8 +130,9 @@ impl ExecElf64Writer {
         Ok(self.layout()?.file_size)
     }
 
-    pub fn write_into(&self, out: &mut [u8], layout: &ElfLayout) -> Result<()> {
+    pub fn write_into(&self, out: &mut [u8]) -> Result<()> {
         self.validate_writer()?;
+        let layout = self.layout()?;
         ensure!(
             usize::try_from(layout.file_size)
                 .ok()
@@ -187,7 +198,7 @@ impl ExecElf64Writer {
             let phoff = usize::try_from(phoff).context("program header offset too large")?;
 
             write_u32(out, phoff, ElfProgramHeaderType::PT_LOAD.raw(), self.endian)?;
-            write_u32(out, phoff + 4, seg_layout.flags, self.endian)?;
+            write_u32(out, phoff + 4, seg_layout.flags.to_raw(), self.endian)?;
             write_u64(out, phoff + 8, seg_layout.offset, self.endian)?;
             write_u64(out, phoff + 16, seg_layout.vaddr, self.endian)?;
             write_u64(out, phoff + 24, seg_layout.paddr, self.endian)?;
@@ -234,7 +245,7 @@ impl ExecElf64Writer {
             "segment alignment must be 0, 1, or a power of two"
         );
         ensure!(
-            segment.flags & !(PF_R | PF_W | PF_X) == 0,
+            segment.flags.to_raw() & !(PF_R | PF_W | PF_X) == 0,
             "segment flags contain unsupported bits"
         );
         Ok(())
@@ -308,10 +319,10 @@ mod tests {
     };
 
     #[test]
-    fn layout_preserves_offset_alignment_relation() {
+    fn write_into_preserves_offset_alignment_relation() {
         let mut writer = ExecElf64Writer::new_x86_64_executable(0x401123);
         writer.add_load_segment(LoadSegment {
-            flags: PF_R | PF_X,
+            flags: Elf64ProgramHeaderFlags::from_raw(PF_R | PF_X),
             vaddr: 0x401123,
             paddr: 0x401123,
             align: 0x1000,
@@ -319,21 +330,24 @@ mod tests {
             mem_size: 2,
         });
 
-        let layout = writer.layout().unwrap();
-        let segment = &layout.segments[0];
+        let file_size = writer.file_size().unwrap();
+        let mut storage = vec![0u8; file_size as usize + 1];
+        writer.write_into(&mut storage[1..]).unwrap();
+        let elf = Elf64::new(&storage[1..]).unwrap();
+        let segment = elf.program_headers().next().unwrap();
 
         assert_eq!(
-            segment.offset % segment.align,
-            segment.vaddr % segment.align
+            segment.offset() % segment.align(),
+            segment.vaddr() % segment.align()
         );
-        assert_eq!(writer.file_size().unwrap(), layout.file_size);
+        assert_eq!(file_size, storage.len() as u64 - 1);
     }
 
     #[test]
-    fn layout_supports_bss_tail_segments() {
+    fn write_into_supports_bss_tail_segments() {
         let mut writer = ExecElf64Writer::new_x86_64_executable(0x401000);
         writer.add_load_segment(LoadSegment {
-            flags: PF_R | PF_W,
+            flags: Elf64ProgramHeaderFlags::from_raw(PF_R | PF_W),
             vaddr: 0x402000,
             paddr: 0x402000,
             align: 0x1000,
@@ -341,19 +355,22 @@ mod tests {
             mem_size: 0x200,
         });
 
-        let layout = writer.layout().unwrap();
-        let segment = &layout.segments[0];
+        let file_size = writer.file_size().unwrap();
+        let mut storage = vec![0u8; file_size as usize];
+        writer.write_into(&mut storage).unwrap();
+        let elf = Elf64::new(&storage).unwrap();
+        let segment = elf.program_headers().next().unwrap();
 
-        assert_eq!(segment.file_size, 4);
-        assert_eq!(segment.mem_size, 0x200);
-        assert_eq!(layout.file_size, segment.offset + segment.file_size);
+        assert_eq!(segment.file_size(), 4);
+        assert_eq!(segment.mem_size(), 0x200);
+        assert_eq!(file_size, segment.offset() + segment.file_size());
     }
 
     #[test]
     fn write_into_round_trips_through_reader() {
         let mut writer = ExecElf64Writer::new_x86_64_executable(0x401000);
         writer.add_load_segment(LoadSegment {
-            flags: PF_R | PF_X,
+            flags: Elf64ProgramHeaderFlags::from_raw(PF_R | PF_X),
             vaddr: 0x401000,
             paddr: 0x401000,
             align: 0x1000,
@@ -361,7 +378,7 @@ mod tests {
             mem_size: 1,
         });
         writer.add_load_segment(LoadSegment {
-            flags: PF_R | PF_W,
+            flags: Elf64ProgramHeaderFlags::from_raw(PF_R | PF_W),
             vaddr: 0x402000,
             paddr: 0x402000,
             align: 0x1000,
@@ -369,9 +386,9 @@ mod tests {
             mem_size: 0x100,
         });
 
-        let layout = writer.layout().unwrap();
-        let mut storage = vec![0u8; layout.file_size as usize + 1];
-        writer.write_into(&mut storage[1..], &layout).unwrap();
+        let file_size = writer.file_size().unwrap();
+        let mut storage = vec![0u8; file_size as usize + 1];
+        writer.write_into(&mut storage[1..]).unwrap();
 
         let elf = Elf64::new(&storage[1..]).unwrap();
         assert_eq!(elf.elf_type(), ElfFileType::ET_EXEC);

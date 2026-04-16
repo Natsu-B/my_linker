@@ -5,12 +5,13 @@ use crate::{
     script,
 };
 use anyhow::{Result, ensure};
-use elf::{Elf64SectionFlags, Elf64SectionType, ElfEndian};
+use elf::{Elf64ProgramHeaderFlags, Elf64SectionFlags, Elf64SectionType, ElfEndian};
 use num::integer::lcm;
 
 pub struct SectionPlacement<'a> {
     pub out_idx: u16,
     pub name: String,
+    pub flags: Elf64ProgramHeaderFlags,
     pub size: u64,
     pub align: u64,
     pub va: OnceCell<u64>,
@@ -84,6 +85,9 @@ pub fn link(
                     sections.push(SectionPlacement {
                         out_idx: BSS_IDX,
                         name: ".bss".to_string(),
+                        flags: Elf64ProgramHeaderFlags::new()
+                            .set(Elf64ProgramHeaderFlags::readable, 1)
+                            .set(Elf64ProgramHeaderFlags::writable, 1),
                         size: size,
                         align: section.align,
                         sections_data: vec![(section, 0)],
@@ -119,6 +123,9 @@ pub fn link(
                         data: Some(section.data.unwrap().to_vec()),
                         sections_data: vec![(section, 0)],
                         va: OnceCell::new(),
+                        flags: Elf64ProgramHeaderFlags::new()
+                            .set(Elf64ProgramHeaderFlags::readable, 1)
+                            .set(Elf64ProgramHeaderFlags::executable, 1),
                     });
                 }
             } else if section.flags.get(Elf64SectionFlags::SHF_WRITE) != 0 {
@@ -149,6 +156,9 @@ pub fn link(
                         data: Some(section.data.unwrap().to_vec()),
                         sections_data: vec![(section, 0)],
                         va: OnceCell::new(),
+                        flags: Elf64ProgramHeaderFlags::new()
+                            .set(Elf64ProgramHeaderFlags::readable, 1)
+                            .set(Elf64ProgramHeaderFlags::writable, 1),
                     });
                 }
             } else {
@@ -179,6 +189,8 @@ pub fn link(
                         data: Some(section.data.unwrap().to_vec()),
                         sections_data: vec![(section, 0)],
                         va: OnceCell::new(),
+                        flags: Elf64ProgramHeaderFlags::new()
+                            .set(Elf64ProgramHeaderFlags::readable, 1),
                     });
                 }
             }

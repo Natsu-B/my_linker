@@ -1,5 +1,6 @@
 use anyhow::{Ok, Result};
-use elf::ExecElf64Writer;
+use elf::{ExecElf64Writer, LoadSegment};
+use memmap2::MmapMut;
 
 use crate::link::{ElfData, SectionPlacement};
 
@@ -10,10 +11,23 @@ pub fn output(
     entry: u64,
 ) -> Result<()> {
     pr_debug!("Write output file: {}", output_file);
-    let writer = ExecElf64Writer::new_x86_64_executable(entry);
+    let mut writer = ExecElf64Writer::new_x86_64_executable(entry);
     for section_placement in section_placements {
-        
+        let va = *section_placement.va.get().unwrap();
+        let segment = LoadSegment {
+            flags: section_placement.flags,
+            vaddr: va,
+            paddr: va,
+            align: section_placement.align,
+            data: section_placement.data.unwrap_or_else(|| Vec::new()),
+            mem_size: section_placement.size,
+        };
+        writer.add_load_segment(segment);
     }
+
+    let file_size = writer.file_size()?;
+    let mut mmap = MmapMut::map_anon(file_size as usize)?;
+    writer.write_into(&mut mmap)?;
 
     Ok(())
 }
