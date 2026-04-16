@@ -46,6 +46,10 @@ pub fn resolve<'a>(
         } {
             symbol_table.va.set(section_addr).unwrap();
             if !symbol_table.name.is_empty()
+                && !symbol_table
+                    .info
+                    .get_enum(Elf64SymbolInfo::st_bind)
+                    .is_none_or(|x: Elf64SymbolBinding| x == Elf64SymbolBinding::STB_LOCAL)
                 && let Some(old_section) =
                     resolved_symbols.insert(symbol_table.name, (symbol_table, section_addr))
             {
