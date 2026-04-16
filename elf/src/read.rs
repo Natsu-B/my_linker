@@ -15,10 +15,14 @@ pub struct Elf64<'a> {
 }
 
 impl<'a> Elf64<'a> {
+    pub fn check_elf_magic(elf: &[u8]) -> bool {
+        elf.get(0..4) == Some(&[0x7F, b'E', b'L', b'F'][..])
+    }
+
     pub fn new(elf: &'a [u8]) -> Result<Self> {
         ensure!(elf.len() >= size_of::<Elf64Header>(), "File too short");
         ensure!(
-            elf.get(0..4) == Some(&[0x7F, b'E', b'L', b'F'][..]),
+            Self::check_elf_magic(elf),
             "Invalid ELF magic: {:?}",
             elf.get(0..4)
         );
