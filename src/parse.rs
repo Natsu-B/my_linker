@@ -126,7 +126,7 @@ pub struct ObjectRelocation {
     pub addend: i64,
 }
 
-pub fn parse<'a>(mmap: &'a Mmap, file_name: String, file_idx: usize) -> Result<ObjectFile<'a>> {
+pub fn parse<'a>(mmap: &'a [u8], file_name: String, file_idx: usize) -> Result<ObjectFile<'a>> {
     let elf = elf::Elf64::new(mmap)
         .with_context(|| format!("failed to parse ELF file: {}", file_name))?;
 
