@@ -8,12 +8,15 @@ use anyhow::{Result, ensure};
 use elf::{Elf64ProgramHeaderFlags, Elf64SectionFlags, Elf64SectionType, ElfEndian};
 use num::integer::lcm;
 
+const PAGE_SIZE: u64 = 0x1000;
+
 pub struct SectionPlacement<'a> {
     pub out_idx: u16,
     pub name: String,
     pub flags: Elf64ProgramHeaderFlags,
     pub size: u64,
     pub align: u64,
+    pub segment_align: u64,
     pub va: OnceCell<u64>,
     pub data: Option<Vec<u8>>,
     pub sections_data: Vec<(ObjectSection<'a>, u64 /* offset */)>,
@@ -80,6 +83,7 @@ pub fn link(
                     let bss_offset = bss_section.size.next_multiple_of(section.align);
                     bss_section.size = bss_offset + size;
                     bss_section.align = lcm(bss_section.align, section.align);
+                    bss_section.segment_align = PAGE_SIZE.max(bss_section.align);
                     bss_section.sections_data.push((section, bss_offset));
                 } else {
                     sections.push(SectionPlacement {
@@ -90,6 +94,7 @@ pub fn link(
                             .set(Elf64ProgramHeaderFlags::writable, 1),
                         size: size,
                         align: section.align,
+                        segment_align: PAGE_SIZE.max(section.align),
                         sections_data: vec![(section, 0)],
                         va: OnceCell::new(),
                         data: None,
@@ -108,6 +113,7 @@ pub fn link(
                     let text_offset = text_section.size.next_multiple_of(section.align);
                     text_section.size = text_offset + size;
                     text_section.align = lcm(text_section.align, section.align);
+                    text_section.segment_align = PAGE_SIZE.max(text_section.align);
                     let data = text_section.data.as_mut().unwrap();
                     if data.len() < text_offset as usize {
                         data.resize(text_offset as usize, 0);
@@ -120,6 +126,7 @@ pub fn link(
                         name: ".text".to_string(),
                         size: size,
                         align: section.align,
+                        segment_align: PAGE_SIZE.max(section.align),
                         data: Some(section.data.unwrap().to_vec()),
                         sections_data: vec![(section, 0)],
                         va: OnceCell::new(),
@@ -141,6 +148,7 @@ pub fn link(
                     let data_offset = data_section.size.next_multiple_of(section.align);
                     data_section.size = data_offset + size;
                     data_section.align = lcm(data_section.align, section.align);
+                    data_section.segment_align = PAGE_SIZE.max(data_section.align);
                     let data = data_section.data.as_mut().unwrap();
                     if data.len() < data_offset as usize {
                         data.resize(data_offset as usize, 0);
@@ -153,6 +161,7 @@ pub fn link(
                         name: ".data".to_string(),
                         size: size,
                         align: section.align,
+                        segment_align: PAGE_SIZE.max(section.align),
                         data: Some(section.data.unwrap().to_vec()),
                         sections_data: vec![(section, 0)],
                         va: OnceCell::new(),
@@ -174,6 +183,7 @@ pub fn link(
                     let rodata_offset = rodata_section.size.next_multiple_of(section.align);
                     rodata_section.size = rodata_offset + size;
                     rodata_section.align = lcm(rodata_section.align, section.align);
+                    rodata_section.segment_align = PAGE_SIZE.max(rodata_section.align);
                     let data = rodata_section.data.as_mut().unwrap();
                     if data.len() < rodata_offset as usize {
                         data.resize(rodata_offset as usize, 0);
@@ -186,6 +196,7 @@ pub fn link(
                         name: ".rodata".to_string(),
                         size: size,
                         align: section.align,
+                        segment_align: PAGE_SIZE.max(section.align),
                         data: Some(section.data.unwrap().to_vec()),
                         sections_data: vec![(section, 0)],
                         va: OnceCell::new(),
@@ -220,7 +231,7 @@ pub fn link(
 
     // already sorted by out_idx
     for section in sections.iter_mut() {
-        current_va = current_va.next_multiple_of(section.align);
+        current_va = current_va.next_multiple_of(section.segment_align);
         section.va.set(current_va).unwrap();
         pr_debug!("  out_idx: {}, va: {:#x}", section.out_idx, current_va);
         current_va += section.size;
@@ -234,4 +245,70 @@ pub fn link(
             endianness: endianness.unwrap(),
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PAGE_SIZE, link};
+    use crate::parse::{ObjectFile, ObjectSection};
+    use elf::{Elf64SectionFlags, Elf64SectionType, ElfEndian};
+
+    fn object_file(sections: Vec<ObjectSection<'static>>) -> ObjectFile<'static> {
+        ObjectFile {
+            file_name: "test.o".to_string(),
+            endian: ElfEndian::Little,
+            sections,
+            symbols: Vec::new(),
+            relocations: Vec::new(),
+        }
+    }
+
+    fn alloc_flags(exec: bool, write: bool) -> Elf64SectionFlags {
+        Elf64SectionFlags::new()
+            .set(Elf64SectionFlags::SHF_ALLOC, 1)
+            .set(Elf64SectionFlags::SHF_EXECINSTR, u64::from(exec))
+            .set(Elf64SectionFlags::SHF_WRITE, u64::from(write))
+    }
+
+    #[test]
+    fn link_page_aligns_separate_text_and_rodata_sections() {
+        let text = ObjectSection {
+            file_idx: 0,
+            idx: 1,
+            name: ".text",
+            ty: Elf64SectionType::SHT_PROGBITS,
+            flags: alloc_flags(true, false),
+            align: 16,
+            data: Some(&[0x90, 0xC3]),
+            size: 2,
+        };
+        let rodata = ObjectSection {
+            file_idx: 0,
+            idx: 2,
+            name: ".rodata",
+            ty: Elf64SectionType::SHT_PROGBITS,
+            flags: alloc_flags(false, false),
+            align: 8,
+            data: Some(b"hi"),
+            size: 2,
+        };
+
+        let (sections, _, _, _) = link(vec![object_file(vec![text, rodata])]).unwrap();
+        let text = sections
+            .iter()
+            .find(|section| section.name == ".text")
+            .unwrap();
+        let rodata = sections
+            .iter()
+            .find(|section| section.name == ".rodata")
+            .unwrap();
+        let text_va = *text.va.get().unwrap();
+        let rodata_va = *rodata.va.get().unwrap();
+
+        assert_eq!(text.segment_align, PAGE_SIZE);
+        assert_eq!(rodata.segment_align, PAGE_SIZE);
+        assert_eq!(text_va % PAGE_SIZE, 0);
+        assert_eq!(rodata_va % PAGE_SIZE, 0);
+        assert_ne!(text_va / PAGE_SIZE, rodata_va / PAGE_SIZE);
+    }
 }

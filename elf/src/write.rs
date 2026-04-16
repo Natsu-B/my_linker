@@ -314,7 +314,7 @@ fn write_bytes(out: &mut [u8], offset: usize, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        Elf64, ElfFileType, PF_R, PF_W, PF_X,
+        Elf64, Elf64ProgramHeaderFlags, ElfFileType, PF_R, PF_W, PF_X,
         write::{ExecElf64Writer, LoadSegment},
     };
 
@@ -322,7 +322,7 @@ mod tests {
     fn write_into_preserves_offset_alignment_relation() {
         let mut writer = ExecElf64Writer::new_x86_64_executable(0x401123);
         writer.add_load_segment(LoadSegment {
-            flags: Elf64ProgramHeaderFlags::from_raw(PF_R | PF_X),
+            flags: Elf64ProgramHeaderFlags::from_bits(PF_R | PF_X),
             vaddr: 0x401123,
             paddr: 0x401123,
             align: 0x1000,
@@ -347,7 +347,7 @@ mod tests {
     fn write_into_supports_bss_tail_segments() {
         let mut writer = ExecElf64Writer::new_x86_64_executable(0x401000);
         writer.add_load_segment(LoadSegment {
-            flags: Elf64ProgramHeaderFlags::from_raw(PF_R | PF_W),
+            flags: Elf64ProgramHeaderFlags::from_bits(PF_R | PF_W),
             vaddr: 0x402000,
             paddr: 0x402000,
             align: 0x1000,
@@ -367,10 +367,47 @@ mod tests {
     }
 
     #[test]
+    fn write_into_preserves_offset_alignment_relation_for_multiple_page_aligned_segments() {
+        let mut writer = ExecElf64Writer::new_x86_64_executable(0x401000);
+        writer.add_load_segment(LoadSegment {
+            flags: Elf64ProgramHeaderFlags::from_bits(PF_R | PF_X),
+            vaddr: 0x401000,
+            paddr: 0x401000,
+            align: 0x1000,
+            data: vec![0x90; 0x120],
+            mem_size: 0x120,
+        });
+        writer.add_load_segment(LoadSegment {
+            flags: Elf64ProgramHeaderFlags::from_bits(PF_R),
+            vaddr: 0x402000,
+            paddr: 0x402000,
+            align: 0x1000,
+            data: b"page-aligned-rodata".to_vec(),
+            mem_size: 0x100,
+        });
+
+        let file_size = writer.file_size().unwrap();
+        let mut storage = vec![0u8; file_size as usize];
+        writer.write_into(&mut storage).unwrap();
+        let elf = Elf64::new(&storage).unwrap();
+        let segments = elf.program_headers().collect::<Vec<_>>();
+
+        assert_eq!(segments.len(), 2);
+        for segment in &segments {
+            assert_eq!(segment.align(), 0x1000);
+            assert_eq!(
+                segment.offset() % segment.align(),
+                segment.vaddr() % segment.align()
+            );
+        }
+        assert!(segments[1].offset() >= segments[0].offset() + segments[0].file_size());
+    }
+
+    #[test]
     fn write_into_round_trips_through_reader() {
         let mut writer = ExecElf64Writer::new_x86_64_executable(0x401000);
         writer.add_load_segment(LoadSegment {
-            flags: Elf64ProgramHeaderFlags::from_raw(PF_R | PF_X),
+            flags: Elf64ProgramHeaderFlags::from_bits(PF_R | PF_X),
             vaddr: 0x401000,
             paddr: 0x401000,
             align: 0x1000,
@@ -378,7 +415,7 @@ mod tests {
             mem_size: 1,
         });
         writer.add_load_segment(LoadSegment {
-            flags: Elf64ProgramHeaderFlags::from_raw(PF_R | PF_W),
+            flags: Elf64ProgramHeaderFlags::from_bits(PF_R | PF_W),
             vaddr: 0x402000,
             paddr: 0x402000,
             align: 0x1000,
