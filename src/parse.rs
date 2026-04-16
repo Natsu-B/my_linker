@@ -5,8 +5,6 @@ use elf::{
     self, Elf64RelaInfo, Elf64SectionFlags, Elf64SectionType, Elf64SymbolInfo,
     Elf64SymbolSectionIdx, ElfEndian, ElfFileType, ElfMachineType,
 };
-use memmap2::Mmap;
-
 /// A parsed ELF relocatable object file (`ET_REL`).
 ///
 /// This struct contains the subset of information needed by the linker stage:

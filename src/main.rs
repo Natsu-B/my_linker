@@ -6,6 +6,7 @@ use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIter
 
 #[macro_use]
 pub mod debug;
+mod archive;
 mod link;
 mod open;
 mod parse;
