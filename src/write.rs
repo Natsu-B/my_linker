@@ -1,3 +1,5 @@
+use std::fs::OpenOptions;
+
 use anyhow::{Ok, Result};
 use elf::{ExecElf64Writer, LoadSegment};
 use memmap2::MmapMut;
@@ -26,8 +28,17 @@ pub fn output(
     }
 
     let file_size = writer.file_size()?;
-    let mut mmap = MmapMut::map_anon(file_size as usize)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&output_file)?;
+
+    file.set_len(file_size)?;
+    let mut mmap = unsafe { MmapMut::map_mut(&file) }?;
     writer.write_into(&mut mmap)?;
+    mmap.flush()?;
 
     Ok(())
 }
