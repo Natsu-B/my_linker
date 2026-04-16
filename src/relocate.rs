@@ -13,7 +13,7 @@ pub fn relocate(
     symbols: Vec<ObjectSymbol>,
     relocations: Vec<ObjectRelocation>,
     elf_data: &ElfData,
-) -> Result<()> {
+) -> Result<u64 /* start address */> {
     pr_debug!("Relocating sections...");
 
     for relocation in relocations {
@@ -52,6 +52,7 @@ pub fn relocate(
                     section_va = Some(*section_placement.va.get().unwrap());
                     target_offset = Some(*offset);
                     target_data = section_placement.data.as_mut();
+                    break;
                 }
             }
         }
@@ -64,6 +65,7 @@ pub fn relocate(
                     symbol.value
                 );
                 target_symbol = Some(symbol);
+                break;
             }
         }
 
@@ -142,7 +144,22 @@ pub fn relocate(
         }
     }
 
-    Ok(())
+    let start_name = script::LINKER_DATA.read().unwrap();
+    let start_name = start_name
+        ._start_name
+        .get()
+        .context("Failed to get _start symbol name from script data")?;
+    let entry = symbols
+        .iter()
+        .find_map(|x| {
+            if x.name == *start_name {
+                Some(x.va.get().unwrap())
+            } else {
+                None
+            }
+        })
+        .context("Failed to find entry point")?;
+    Ok(*entry)
 }
 
 fn write_data<T: ToBytes>(data: &mut [u8], offset: u64, value: T, endian: ElfEndian) -> Result<()> {

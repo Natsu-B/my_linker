@@ -12,6 +12,7 @@ mod parse;
 mod relocate;
 mod resolve;
 pub mod script;
+mod write;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -40,6 +41,8 @@ fn main() -> anyhow::Result<()> {
     }
 
     pr_debug!("Arguments: {:?}", args);
+
+    script::parse_script()?;
 
     // open files and create memory maps in parallel
     let mmaps_result = args
@@ -97,7 +100,8 @@ fn main() -> anyhow::Result<()> {
     pr_debug!("Start linking files...");
     let mut linked = link::link(parsed)?;
     resolve::resolve(&linked.0, &mut linked.1)?;
-    relocate::relocate(&mut linked.0, linked.1, linked.2, &linked.3)?;
+    let entry = relocate::relocate(&mut linked.0, linked.1, linked.2, &linked.3)?;
+    write::output(linked.0, linked.3, args.output, entry)?;
 
     Ok(())
 }
