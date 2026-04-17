@@ -1,0 +1,3 @@
+[submodule "runtime/newlib"]
+	path = runtime/newlib
+	url = https://sourceware.org/git/newlib-cygwin.git
