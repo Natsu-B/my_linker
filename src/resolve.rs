@@ -79,13 +79,19 @@ pub fn resolve<'a>(
             symbol_table.section_idx,
             elf::Elf64SymbolSectionIdx::Undefined
         ) {
-            let resolved = resolved_symbols.get(symbol_table.name).with_context(|| {
-                format!(
+            if let Some(resolved) = resolved_symbols.get(symbol_table.name) {
+                symbol_table.va.set(resolved.1).unwrap();
+            } else if symbol_table.info.get_enum(Elf64SymbolInfo::st_bind)
+                == Some(Elf64SymbolBinding::STB_WEAK)
+            {
+                symbol_table.va.set(0).unwrap();
+            } else {
+                bail!(
                     "undefined symbol: {} in file: {}",
-                    symbol_table.name, symbol_table.file_id
-                )
-            })?;
-            symbol_table.va.set(resolved.1).unwrap();
+                    symbol_table.name,
+                    symbol_table.file_id
+                );
+            }
         }
     }
     Ok(())
