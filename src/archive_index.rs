@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use elf::{Elf64SymbolBinding, Elf64SymbolInfo, Elf64SymbolSectionIdx, Elf64SymbolType};
 
 use crate::{archive::ArchiveReader, input_id::FileId, parse};
@@ -45,13 +45,7 @@ pub fn index_archive<'a>(
         let (defined, undefined) = collect_symbols(&object);
 
         for &symbol in &defined {
-            if let Some(existing_idx) = by_symbol.insert(symbol, member_idx) {
-                bail!(
-                    "duplicate defined symbol: {symbol} in members {} and {}",
-                    members[existing_idx].name,
-                    name
-                );
-            }
+            by_symbol.entry(symbol).or_insert(member_idx);
         }
 
         members.push(MemberInfo {
@@ -190,7 +184,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_defined_symbol_across_members_is_an_error() {
+    fn duplicate_defined_symbol_across_members_keeps_first_member() {
         let first = build_rel_object(
             &[TestSymbol {
                 name: "dup",
@@ -215,7 +209,10 @@ mod tests {
         );
         let archive = build_archive(&[("one.o/", &first), ("two.o/", &second)]);
 
-        assert!(index_archive(&archive, "libdup.a".to_string(), 0).is_err());
+        let state = index_archive(&archive, "libdup.a".to_string(), 0).unwrap();
+
+        assert_eq!(state.members.len(), 2);
+        assert_eq!(state.by_symbol["dup"], 0);
     }
 
     #[test]
