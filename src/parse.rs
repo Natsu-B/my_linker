@@ -232,8 +232,9 @@ pub fn parse<'a>(mmap: &'a [u8], file_name: String, file_id: FileId) -> Result<O
 mod tests {
     use super::parse;
     use crate::{
+        archive::ArchiveReader,
         input_id::FileId,
-        test_utils::{TestRelocation, TestSymbol, build_rel_object},
+        test_utils::{TestRelocation, TestSymbol, build_archive, build_rel_object},
     };
     use elf::{Elf64SymbolBinding, Elf64SymbolType};
 
@@ -288,5 +289,34 @@ mod tests {
                 .iter()
                 .all(|relocation| relocation.file_id == file_id)
         );
+    }
+
+    #[test]
+    fn parse_accepts_archive_member_that_is_not_eight_byte_aligned() {
+        let object = build_rel_object(
+            &[TestSymbol {
+                name: "foo",
+                binding: Elf64SymbolBinding::STB_GLOBAL,
+                ty: Elf64SymbolType::STT_FUNC,
+                section_idx: 2,
+                value: 0,
+                size: 5,
+            }],
+            &[],
+        );
+        let archive = build_archive(&[("foo.o/", &object)]);
+        let reader = ArchiveReader::new(&archive).unwrap();
+        let member = reader.object_members().next().unwrap().unwrap();
+        let file_id = FileId::ArchiveMember {
+            archive_idx: 0,
+            member_idx: 0,
+        };
+
+        assert_ne!(member.payload_offset() % std::mem::align_of::<u64>(), 0);
+
+        let parsed = parse(member.object_bytes().unwrap(), "foo.o".to_string(), file_id).unwrap();
+
+        assert_eq!(parsed.file_id, file_id);
+        assert!(parsed.symbols.iter().any(|symbol| symbol.name == "foo"));
     }
 }
