@@ -68,8 +68,9 @@ pub fn relocate(
             }
         }
 
-        let section_va =
-            section_va.context("Failed to find section virtual address for relocation")?;
+        let Some(section_va) = section_va else {
+            continue;
+        };
         let target_symbol = target_symbol.context("Failed to find target symbol for relocation")?;
         let target_offset = target_offset.context("Failed to find target offset for relocation")?;
         let target_data = target_data.context("Failed to find target data for relocation")?;
@@ -91,14 +92,29 @@ pub fn relocate(
             X86_64RelocationType::None => {}
             X86_64RelocationType::Pc32 | X86_64RelocationType::Plt32 => {
                 // S + A - P
-                let addr: i32 = symbol_addr
-                    .checked_add_signed(addend)
-                    .context("Relocation PC32 calculation failed")?
-                    .checked_sub(place_addr)
-                    .context("Relocation PC32 calculation failed")?
+                let value = (symbol_addr as i128) + (addend as i128) - (place_addr as i128);
+                let addr: i32 = value
                     .try_into()
-                    .context("Relocation PC32 calculation failed")?;
+                    .with_context(|| format!("Relocation PC32 calculation failed: symbol_addr={:#x}, addend={:#x}, place_addr={:#x}", symbol_addr, addend, place_addr))?;
                 pr_debug!("Relocation PC32: {:#x}", addr);
+
+                write_data(
+                    target_data,
+                    target_offset + relocation.offset,
+                    addr,
+                    endianness,
+                )?;
+            }
+            X86_64RelocationType::Rel32 => {
+                // S + A
+                let value = (symbol_addr as i128) + (addend as i128);
+                let addr: u32 = value.try_into().with_context(|| {
+                    format!(
+                        "Relocation REL32 calculation failed: symbol_addr={:#x}, addend={:#x}",
+                        symbol_addr, addend
+                    )
+                })?;
+                pr_debug!("Relocation REL32: {:#x}", addr);
 
                 write_data(
                     target_data,
@@ -109,9 +125,13 @@ pub fn relocate(
             }
             X86_64RelocationType::Rel64 => {
                 // S + A
-                let addr: u64 = symbol_addr
-                    .checked_add_signed(addend)
-                    .context("Relocation REL64 calculation failed")?;
+                let value = (symbol_addr as i128) + (addend as i128);
+                let addr: u64 = value.try_into().with_context(|| {
+                    format!(
+                        "Relocation REL64 calculation failed: symbol_addr={:#x}, addend={:#x}",
+                        symbol_addr, addend
+                    )
+                })?;
                 pr_debug!("Relocation REL64: {:#x}", addr);
 
                 write_data(
@@ -123,11 +143,13 @@ pub fn relocate(
             }
             X86_64RelocationType::Rel32S => {
                 // S + A
-                let addr: i32 = symbol_addr
-                    .checked_add_signed(addend)
-                    .context("Relocation REL32S calculation failed")?
-                    .try_into()
-                    .context("Relocation REL32S calculation failed")?;
+                let value = (symbol_addr as i128) + (addend as i128);
+                let addr: i32 = value.try_into().with_context(|| {
+                    format!(
+                        "Relocation REL32S calculation failed: symbol_addr={:#x}, addend={:#x}",
+                        symbol_addr, addend
+                    )
+                })?;
                 pr_debug!("Relocation REL32S: {:#x}", addr);
 
                 write_data(

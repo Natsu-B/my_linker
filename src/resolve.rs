@@ -30,16 +30,17 @@ pub fn resolve<'a>(
                     }
                 }
 
-                let sym_section_placement =
-                    sym_section_placement.context("failed to find symbol section placement")?;
-                let sym_section_offset =
-                    sym_section_offset.context("failed to find symbol section offset")?;
+                if let Some(sym_section_placement) = sym_section_placement {
+                    let sym_section_offset = sym_section_offset.unwrap();
 
-                Some(
-                    sym_section_placement.va.get().unwrap()
-                        + sym_section_offset
-                        + symbol_table.value,
-                )
+                    Some(
+                        sym_section_placement.va.get().unwrap()
+                            + sym_section_offset
+                            + symbol_table.value,
+                    )
+                } else {
+                    None
+                }
             }
             elf::Elf64SymbolSectionIdx::AbsoluteSymbols => Some(symbol_table.value),
             elf::Elf64SymbolSectionIdx::Undefined => None,
