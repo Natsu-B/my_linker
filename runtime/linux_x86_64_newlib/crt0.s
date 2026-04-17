@@ -11,19 +11,13 @@
 _start:
     xorl    %ebp, %ebp
 
-    # Linux/x86_64 initial stack:
-    #   (%rsp)      = argc
-    #   8(%rsp)     = argv[0]
-    #   ...
-    #   8*argc(%rsp)= NULL
-    #   then envp[]
     mov     (%rsp), %r12
     lea     8(%rsp), %r13
     lea     16(%rsp,%r12,8), %r14
 
-    and     $-16, %rsp
+    andq    $-16, %rsp
 
-    lea     __libc_fini_array(%rip), %rdi
+    leaq    __libc_fini_array(%rip), %rdi
     call    atexit
 
     call    __libc_init_array
@@ -47,3 +41,5 @@ _init:
     .type _fini, @function
 _fini:
     ret
+
+    .section .note.GNU-stack,"",@progbits
