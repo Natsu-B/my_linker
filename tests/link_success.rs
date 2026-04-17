@@ -2,7 +2,9 @@
 
 mod common;
 
-use common::toolchain::{assemble_object, cargo_linker_with_debug, parse_elf64, read_output_bytes};
+use common::toolchain::{
+    assemble_object, cargo_linker_with_debug, create_archive, parse_elf64, read_output_bytes,
+};
 use elf::{ElfFileType, ElfMachineType, ElfProgramHeaderType, PF_R, PF_W, PF_X};
 use tempfile::tempdir;
 
@@ -84,6 +86,76 @@ foo:
         .arg(&output)
         .arg(&start)
         .arg(&callee)
+        .assert()
+        .success();
+
+    let bytes = read_output_bytes(&output);
+    let elf = parse_elf64(&bytes);
+    let headers = elf.program_headers().collect::<Vec<_>>();
+    let text_segment = headers
+        .iter()
+        .find(|header| {
+            header.segment_type() == ElfProgramHeaderType::PT_LOAD
+                && header.flags() == (PF_R | PF_X)
+                && header.data().is_some_and(|data| !data.is_empty())
+        })
+        .expect("expected a readable and executable load segment");
+    let data = text_segment.data().unwrap();
+
+    assert_eq!(data.first().copied(), Some(0xE8), "expected a call rel32");
+
+    let displacement = i32::from_le_bytes(data[1..5].try_into().unwrap());
+    let target = (text_segment.vaddr() + 5)
+        .checked_add_signed(i64::from(displacement))
+        .expect("call target address overflowed");
+    let target_offset = usize::try_from(
+        target
+            .checked_sub(text_segment.vaddr())
+            .expect("call target before text segment"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        data.get(target_offset),
+        Some(&0xC3),
+        "call target {target:#x} should land on foo's ret instruction",
+    );
+}
+
+#[test]
+fn links_object_from_archive_input() {
+    let temp = tempdir().unwrap();
+    let start = assemble_object(
+        &temp,
+        "start",
+        r#"
+.global _start
+.text
+_start:
+    call foo
+    mov $60, %rax
+    xor %rdi, %rdi
+    syscall
+"#,
+    );
+    let callee = assemble_object(
+        &temp,
+        "callee",
+        r#"
+.global foo
+.text
+foo:
+    ret
+"#,
+    );
+    let archive = create_archive(&temp, "libcallee", &[callee.as_path()]);
+    let output = temp.path().join("archive_exec");
+
+    cargo_linker_with_debug(0)
+        .arg("-o")
+        .arg(&output)
+        .arg(&start)
+        .arg(&archive)
         .assert()
         .success();
 

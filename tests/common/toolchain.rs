@@ -41,6 +41,21 @@ pub fn assemble_object(dir: &TempDir, stem: &str, source: &str) -> PathBuf {
     object_path
 }
 
+pub fn create_archive(dir: &TempDir, stem: &str, members: &[&Path]) -> PathBuf {
+    assert_linux_host();
+
+    let archive_path = dir.path().join(format!("{stem}.a"));
+
+    let mut command = StdCommand::new("ar");
+    command.arg("crs").arg(&archive_path);
+    for member in members {
+        command.arg(member);
+    }
+    run_tool(command, &format!("archive {}", archive_path.display()));
+
+    archive_path
+}
+
 #[allow(dead_code)]
 pub fn link_executable_input(dir: &TempDir, output_name: &str, inputs: &[&Path]) -> PathBuf {
     assert_linux_host();
