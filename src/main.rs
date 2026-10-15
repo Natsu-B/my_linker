@@ -1,12 +1,10 @@
-use std::{collections::HashSet, mem::MaybeUninit, ptr};
+use std::{mem::MaybeUninit, ptr};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
-use crate::{
-    archive_index::ArchiveState, input_id::FileId, input_symbol::FileType, parse::ObjectFile,
-};
+use crate::{input_id::FileId, input_symbol::FileType};
 
 #[macro_use]
 pub mod debug;
@@ -43,7 +41,7 @@ struct Args {
     debug: u8,
 }
 
-static mut DEBUG_LEVEL: MaybeUninit<u8> = MaybeUninit::uninit();
+static mut DEBUG_LEVEL: MaybeUninit<u8> = MaybeUninit::new(0);
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -57,7 +55,6 @@ fn main() -> anyhow::Result<()> {
     pr_debug!("Arguments: {:?}", args);
 
     let script = script::parse_script(args.script.as_deref())?;
-    let base_address = script.initial_address()?;
 
     let mmaps_result = args
         .input
@@ -102,8 +99,8 @@ fn main() -> anyhow::Result<()> {
     let parsed = input_symbol::resolve_symbols(parse_result, script.entry_name())?;
 
     pr_debug!("Start linking files...");
-    let mut linked = link::link(parsed, base_address)?;
-    resolve::resolve(&linked.0, &mut linked.1)?;
+    let mut linked = link::link(parsed, &script)?;
+    resolve::resolve(&linked.0, &linked.1, &linked.3.script_symbols)?;
     let entry = relocate::relocate(
         &mut linked.0,
         linked.1,

@@ -5,8 +5,8 @@ mod common;
 use std::{fs, os::unix::fs::PermissionsExt};
 
 use common::toolchain::{
-    assemble_object, cargo_linker_with_debug, create_archive, parse_elf64, read_output_bytes,
-    run_executable,
+    assemble_object, cargo_linker_with_debug, create_archive, link_executable_input, parse_elf64,
+    read_output_bytes, readelf_program_headers, run_executable,
 };
 use elf::{ElfFileType, ElfMachineType, ElfProgramHeaderType, PF_R, PF_W, PF_X};
 use tempfile::tempdir;
@@ -250,22 +250,14 @@ zero_slot:
 
     assert_eq!(
         load_segments.len(),
-        5,
-        "expected distinct PT_LOAD segments for headers, text, data, rodata, and bss",
+        4,
+        "expected PT_LOAD groups for headers, text, rodata, and combined data/bss",
     );
     assert!(
         load_segments
             .iter()
             .any(|header| header.flags() == (PF_R | PF_X) && header.file_size() > 0),
         "expected a readable and executable text segment",
-    );
-    assert!(
-        load_segments.iter().any(|header| {
-            header.flags() == (PF_R | PF_W)
-                && header.file_size() > 0
-                && header.mem_size() == header.file_size()
-        }),
-        "expected a readable and writable data segment",
     );
     assert!(
         load_segments.iter().any(|header| {
@@ -279,6 +271,36 @@ zero_slot:
             .any(|header| header.flags() == (PF_R | PF_W) && header.mem_size() > header.file_size()),
         "expected a bss-like segment with mem_size > file_size",
     );
+    let reference = link_executable_input(&temp, "gnu_segmented_exec", &[&input]);
+    let structure = |path: &std::path::Path| {
+        readelf_program_headers(path)
+            .lines()
+            .filter_map(|line| {
+                let fields = line.split_whitespace().collect::<Vec<_>>();
+                (fields.first() == Some(&"LOAD")).then(|| {
+                    (
+                        fields[6..fields.len() - 1].join(" "),
+                        fields.last().unwrap().to_string(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(structure(&output), structure(&reference));
+    assert_eq!(
+        structure(&output),
+        vec![
+            ("R".to_string(), "0x1000".to_string()),
+            ("R E".to_string(), "0x1000".to_string()),
+            ("R".to_string(), "0x1000".to_string()),
+            ("RW".to_string(), "0x1000".to_string()),
+        ]
+    );
+    for pair in load_segments.windows(2) {
+        assert!(
+            pair[1].vaddr() / 0x1000 >= (pair[0].vaddr() + pair[0].mem_size()).div_ceil(0x1000)
+        );
+    }
     run_executable(&output).success();
 }
 

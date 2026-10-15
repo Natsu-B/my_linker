@@ -3,13 +3,74 @@ use std::{
     os::unix::fs::PermissionsExt,
 };
 
-use anyhow::{Ok, Result};
+use anyhow::{Context, Result, ensure};
 use elf::{
-    Elf64ProgramHeaderFlags, ElfProgramHeaderType, ExecElf64Writer, LoadSegment, ProgramHeader,
+    Elf64ProgramHeaderFlags, ElfProgramHeaderType, ExecElf64Writer, LoadSegment, PF_R, PF_W,
+    ProgramHeader,
+    write::{ELF_HEADER_SIZE, PROGRAM_HEADER_SIZE},
 };
 use memmap2::MmapMut;
 
 use crate::link::{ElfData, PAGE_SIZE, SectionPlacement};
+
+// Output-section data remains separate until relocations have been applied.
+// Consecutive output sections with the same permissions share one PT_LOAD.
+fn load_segments(sections: Vec<SectionPlacement>, elf_data: &ElfData) -> Result<Vec<LoadSegment>> {
+    let mut segments = vec![LoadSegment {
+        flags: Elf64ProgramHeaderFlags::from_bits(PF_R),
+        vaddr: elf_data.header_vaddr,
+        paddr: elf_data.header_vaddr,
+        align: PAGE_SIZE,
+        data: vec![0; usize::try_from(elf_data.sizeof_headers).context("headers too large")?],
+        mem_size: elf_data.sizeof_headers,
+    }];
+    for section in sections.into_iter().filter(|section| section.size != 0) {
+        let va = *section.va.get().context("output section has no address")?;
+        let previous = segments.last().unwrap();
+        let previous_end = previous
+            .vaddr
+            .checked_add(previous.mem_size)
+            .context("segment address exceeds u64")?;
+        ensure!(va >= previous_end, "output sections overlap");
+        if section.flags != previous.flags {
+            ensure!(
+                va / PAGE_SIZE >= previous_end.div_ceil(PAGE_SIZE),
+                "load segments with different permissions share a virtual page"
+            );
+            segments.push(LoadSegment {
+                flags: section.flags,
+                vaddr: va,
+                paddr: va,
+                align: PAGE_SIZE.max(section.align),
+                data: Vec::new(),
+                mem_size: 0,
+            });
+        }
+        let segment = segments.last_mut().unwrap();
+        // For the header load p_offset is fixed at zero; PAGE_SIZE is its
+        // alignment even if an input section happens to be more aligned.
+        if segment.vaddr != elf_data.header_vaddr {
+            segment.align = segment.align.max(section.align);
+        }
+        let offset = va - segment.vaddr;
+        if let Some(data) = section.data {
+            ensure!(
+                data.len() as u64 <= section.size,
+                "output section file size exceeds memory size"
+            );
+            if !data.is_empty() {
+                segment
+                    .data
+                    .resize(usize::try_from(offset).context("segment too large")?, 0);
+                segment.data.extend(data);
+            }
+        }
+        segment.mem_size = offset
+            .checked_add(section.size)
+            .context("segment size exceeds u64")?;
+    }
+    Ok(segments)
+}
 
 pub fn output(
     section_placements: Vec<SectionPlacement>,
@@ -20,32 +81,14 @@ pub fn output(
     pr_debug!("Write output file: {}", output_file);
     let mut writer = ExecElf64Writer::new_x86_64_executable(entry);
     writer.endian = elf_data.endianness;
-    writer.map_headers(elf_data.header_vaddr, PAGE_SIZE);
-    for section_placement in section_placements {
-        if section_placement.size == 0
-            && section_placement
-                .data
-                .as_ref()
-                .is_none_or(|data| data.is_empty())
-        {
-            continue;
-        }
-        let va = *section_placement.va.get().unwrap();
-        let segment = LoadSegment {
-            flags: section_placement.flags,
-            vaddr: va,
-            paddr: va,
-            align: section_placement.segment_align,
-            data: section_placement.data.unwrap_or_else(|| Vec::new()),
-            mem_size: section_placement.size,
-        };
+    let mut segments = load_segments(section_placements, &elf_data)?.into_iter();
+    writer.header_segment = segments.next();
+    for segment in segments {
         writer.add_load_segment(segment);
     }
     writer.add_program_header(ProgramHeader {
         segment_type: ElfProgramHeaderType::PT_GNU_STACK,
-        flags: Elf64ProgramHeaderFlags::new()
-            .set(Elf64ProgramHeaderFlags::readable, 1)
-            .set(Elf64ProgramHeaderFlags::writable, 1),
+        flags: Elf64ProgramHeaderFlags::from_bits(PF_R | PF_W),
         offset: 0,
         vaddr: 0,
         paddr: 0,
@@ -53,6 +96,14 @@ pub fn output(
         mem_size: 0,
         align: 16,
     });
+    // Layout reserved SIZEOF_HEADERS bytes before the first section; the
+    // headers written here must fit exactly in that space.
+    let phnum = 1 + writer.segments.len() + writer.program_headers.len();
+    ensure!(
+        ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE * phnum as u64 == elf_data.sizeof_headers,
+        "program header count {phnum} does not match SIZEOF_HEADERS {:#x}",
+        elf_data.sizeof_headers
+    );
 
     let file_size = writer.file_size()?;
     let file = OpenOptions::new()
@@ -61,154 +112,57 @@ pub fn output(
         .create(true)
         .truncate(true)
         .open(&output_file)?;
-
     file.set_len(file_size)?;
     let mut mmap = unsafe { MmapMut::map_mut(&file) }?;
     writer.write_into(&mut mmap)?;
     mmap.flush()?;
     file.set_permissions(Permissions::from_mode(0o755))?;
-
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        cell::OnceCell,
-        fs,
-        os::unix::fs::PermissionsExt,
-        path::{Path, PathBuf},
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::{cell::OnceCell, collections::HashMap};
 
-    use elf::{Elf64, Elf64ProgramHeaderFlags, ElfEndian, ElfProgramHeaderType, PF_R, PF_W, PF_X};
+    use super::*;
 
-    use super::output;
-    use crate::link::{ElfData, SectionPlacement};
-
-    struct TempOutputPath(PathBuf);
-
-    impl TempOutputPath {
-        fn new() -> Self {
-            let unique = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            Self(std::env::temp_dir().join(format!(
-                "my_linker-write-test-{}-{}.elf",
-                std::process::id(),
-                unique
-            )))
-        }
-
-        fn as_path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempOutputPath {
-        fn drop(&mut self) {
-            let _ = fs::remove_file(&self.0);
-        }
-    }
-
-    fn placed_section(
-        out_idx: u16,
-        name: &str,
-        flags: u32,
-        size: u64,
-        align: u64,
-        segment_align: u64,
-        va: u64,
-        data: Option<Vec<u8>>,
-    ) -> SectionPlacement<'static> {
-        let placement_va = {
-            let cell = OnceCell::new();
-            cell.set(va).unwrap();
-            cell
-        };
-
+    fn section(name: &str, va: u64, size: u64, data: Option<Vec<u8>>) -> SectionPlacement<'static> {
         SectionPlacement {
-            out_idx,
             name: name.to_string(),
-            flags: Elf64ProgramHeaderFlags::from_bits(flags),
+            flags: Elf64ProgramHeaderFlags::from_bits(PF_R | PF_W),
             size,
-            align,
-            segment_align,
-            va: placement_va,
+            align: 16,
+            va: OnceCell::from(va),
             data,
             sections_data: Vec::new(),
         }
     }
 
     #[test]
-    fn output_skips_empty_sections_and_uses_segment_alignment() {
-        let path = TempOutputPath::new();
-        let sections = vec![
-            placed_section(
-                0,
-                ".text",
-                PF_R | PF_X,
-                2,
-                16,
-                0x1000,
-                0x401000,
-                Some(vec![0x90, 0xC3]),
-            ),
-            placed_section(
-                1,
-                ".rodata",
-                PF_R,
-                5,
-                8,
-                0x1000,
-                0x402000,
-                Some(b"hello".to_vec()),
-            ),
-            placed_section(
-                2,
-                ".data",
-                PF_R | PF_W,
-                0,
-                8,
-                0x1000,
-                0x403000,
-                Some(Vec::new()),
-            ),
-            placed_section(3, ".bss", PF_R | PF_W, 0, 8, 0x1000, 0x404000, None),
-        ];
-
-        fs::write(path.as_path(), b"old output").unwrap();
-        fs::set_permissions(path.as_path(), fs::Permissions::from_mode(0o600)).unwrap();
-        output(
-            sections,
-            ElfData {
-                endianness: ElfEndian::Little,
-                header_vaddr: 0x400000,
-            },
-            path.as_path().display().to_string(),
-            0x401000,
+    fn grouping_keeps_bss_tails_and_materializes_internal_zero_fill() {
+        let elf_data = ElfData {
+            endianness: elf::ElfEndian::Little,
+            header_vaddr: 0x400000,
+            sizeof_headers: 232,
+            script_symbols: HashMap::new(),
+        };
+        let segments = load_segments(
+            vec![
+                section(".data", 0x401000, 2, Some(vec![1, 2])),
+                section(".zero", 0x401002, 14, None),
+                section(".more", 0x401010, 1, Some(vec![3])),
+                section(".bss", 0x401020, 32, None),
+                section(".empty", 0x402000, 0, Some(Vec::new())),
+            ],
+            &elf_data,
         )
         .unwrap();
-
-        let bytes = fs::read(path.as_path()).unwrap();
-        let elf = Elf64::new(&bytes).unwrap();
-        let headers = elf
-            .program_headers()
-            .filter(|header| header.segment_type() == ElfProgramHeaderType::PT_LOAD)
-            .collect::<Vec<_>>();
-
-        assert_eq!(elf.program_header_count(), 4);
-        assert_eq!(headers.len(), 3);
-        assert!(headers.iter().all(|header| header.align() == 0x1000));
-        assert!(
-            headers
-                .iter()
-                .all(|header| header.file_size() != 0 || header.mem_size() != 0)
-        );
-        assert_eq!(
-            fs::metadata(path.as_path()).unwrap().permissions().mode() & 0o7777,
-            0o755
-        );
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[1].vaddr, 0x401000);
+        assert_eq!(segments[1].mem_size, 64);
+        assert_eq!(segments[1].data.len(), 17);
+        assert_eq!(&segments[1].data[..2], &[1, 2]);
+        assert_eq!(&segments[1].data[2..16], &[0; 14]);
+        assert_eq!(segments[1].data[16], 3);
     }
 }

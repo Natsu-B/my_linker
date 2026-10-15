@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::{Context, Ok, Result, bail};
+use anyhow::{Ok, Result, bail};
 use elf::{Elf64SymbolBinding, Elf64SymbolInfo};
 
 use crate::{link::SectionPlacement, parse::ObjectSymbol};
@@ -8,6 +8,7 @@ use crate::{link::SectionPlacement, parse::ObjectSymbol};
 pub fn resolve<'a>(
     section_placements: &Vec<SectionPlacement>,
     symbol_tables: &Vec<ObjectSymbol<'a>>,
+    script_symbols: &HashMap<String, u64>,
 ) -> Result<()> {
     pr_debug!("Resolving symbols...");
 
@@ -82,6 +83,8 @@ pub fn resolve<'a>(
         ) {
             if let Some(resolved) = resolved_symbols.get(symbol_table.name) {
                 symbol_table.va.set(resolved.1).unwrap();
+            } else if let Some(value) = script_symbols.get(symbol_table.name) {
+                symbol_table.va.set(*value).unwrap();
             } else if symbol_table.info.get_enum(Elf64SymbolInfo::st_bind)
                 == Some(Elf64SymbolBinding::STB_WEAK)
             {

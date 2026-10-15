@@ -205,7 +205,7 @@ pub fn parse_elf64<'a>(bytes: &'a [u8]) -> Elf64<'a> {
     })
 }
 
-fn run_tool(mut command: StdCommand, action: &str) {
+fn run_tool(mut command: StdCommand, action: &str) -> std::process::Output {
     let rendered = format!("{command:?}");
     let output = command.output().unwrap_or_else(|err| {
         panic!("failed to spawn {action} with {rendered}: {err}");
@@ -219,4 +219,16 @@ fn run_tool(mut command: StdCommand, action: &str) {
             String::from_utf8_lossy(&output.stderr),
         );
     }
+    output
+}
+
+#[allow(dead_code)]
+pub fn readelf_program_headers(path: &Path) -> String {
+    let mut command = StdCommand::new("readelf");
+    command.arg("-lW").arg(path);
+    let output = run_tool(
+        command,
+        &format!("read program headers of {}", path.display()),
+    );
+    String::from_utf8(output.stdout).unwrap()
 }

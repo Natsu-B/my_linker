@@ -162,17 +162,17 @@ pub fn relocate(
         }
     }
 
-    let entry = symbols
+    symbols
         .iter()
-        .find_map(|x| {
-            if x.name == entry_name {
-                Some(x.va.get().unwrap())
+        .find_map(|symbol| {
+            if symbol.name == entry_name {
+                symbol.va.get().copied()
             } else {
                 None
             }
         })
-        .context("Failed to find entry point")?;
-    Ok(*entry)
+        .or_else(|| elf_data.script_symbols.get(entry_name).copied())
+        .context("Failed to find entry point")
 }
 
 fn write_data<T: ToBytes>(data: &mut [u8], offset: u64, value: T, endian: ElfEndian) -> Result<()> {

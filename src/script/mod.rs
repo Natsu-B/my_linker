@@ -2,10 +2,11 @@ pub mod ast;
 pub mod eval;
 mod lexer;
 pub mod parser;
+pub mod pattern;
 
 use anyhow::{Context, Result};
 
-use ast::{Script, SectionStatement, Statement};
+use ast::{Script, Statement};
 
 pub const DEFAULT_SCRIPT: &str = include_str!("elf_x86_64_static.ld");
 
@@ -39,56 +40,5 @@ impl ast::Script {
                 }
             })
             .unwrap_or("_start")
-    }
-
-    // M2 bridge to the existing four-way layout. SIZEOF_HEADERS is zero here
-    // because link.rs still reserves the header page itself. M3 will evaluate
-    // the complete script with the actual headers and input sections.
-    pub fn initial_address(&self) -> Result<u64> {
-        let mut context = eval::Context {
-            dot: 0x400000,
-            ..Default::default()
-        };
-        for statement in &self.statements {
-            match statement {
-                Statement::Assignment(assignment) => {
-                    if apply_initial_assignment(assignment, &mut context)? {
-                        return Ok(context.dot);
-                    }
-                }
-                Statement::Sections(statements) => {
-                    for statement in statements {
-                        match statement {
-                            SectionStatement::Assignment(assignment) => {
-                                if apply_initial_assignment(assignment, &mut context)? {
-                                    return Ok(context.dot);
-                                }
-                            }
-                            SectionStatement::Output(section) => {
-                                return section.address.as_ref().map_or(Ok(context.dot), |expr| {
-                                    eval::evaluate(expr, &context)
-                                });
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(context.dot)
-    }
-}
-
-fn apply_initial_assignment(
-    assignment: &ast::Assignment,
-    context: &mut eval::Context,
-) -> Result<bool> {
-    let value = eval::evaluate(&assignment.value, context)?;
-    if assignment.name == "." {
-        context.dot = value;
-        Ok(true)
-    } else {
-        context.symbols.insert(assignment.name.clone(), value);
-        Ok(false)
     }
 }

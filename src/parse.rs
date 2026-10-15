@@ -1,6 +1,6 @@
 use std::cell::OnceCell;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use elf::{
     self, Elf64RelaInfo, Elf64SectionFlags, Elf64SectionType, Elf64SymbolInfo,
     Elf64SymbolSectionIdx, ElfEndian, ElfFileType, ElfMachineType,
@@ -37,7 +37,7 @@ pub struct ObjectFile<'a> {
 ///
 /// This represents one section such as `.text`, `.data`, or `.bss`,
 /// together with its metadata and optional raw contents.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ObjectSection<'a> {
     /// Identity of the object file that owns this section.
     pub file_id: FileId,
@@ -160,12 +160,13 @@ pub fn parse<'a>(mmap: &'a [u8], file_name: String, file_id: FileId) -> Result<O
         pr_debug!("Section: {}", section.name()?);
         match section.section_type() {
             Elf64SectionType::SHT_NULL => pr_debug!("  Type: NULL"),
-            Elf64SectionType::SHT_PROGBITS | Elf64SectionType::SHT_NOBITS => {
-                if section.section_type() == Elf64SectionType::SHT_PROGBITS {
-                    pr_debug!("  Type: PROGBITS");
-                } else {
-                    pr_debug!("  Type: NOBITS");
-                }
+            Elf64SectionType::SHT_PROGBITS
+            | Elf64SectionType::SHT_NOBITS
+            | Elf64SectionType::SHT_INIT_ARRAY
+            | Elf64SectionType::SHT_FINI_ARRAY
+            | Elf64SectionType::SHT_PREINIT_ARRAY
+            | Elf64SectionType::SHT_NOTE => {
+                pr_debug!("  Type: {:?}", section.section_type());
                 let section = ObjectSection::<'a> {
                     file_id,
                     idx: section.idx(),
@@ -218,9 +219,12 @@ pub fn parse<'a>(mmap: &'a [u8], file_name: String, file_id: FileId) -> Result<O
             }
             Elf64SectionType::SHT_REL => {
                 pr_debug!("  Type: REL");
-                todo!()
+                bail!(
+                    "unsupported relocation format SHT_REL in section {} in file: {} (expected SHT_RELA)",
+                    section.name()?,
+                    object_file.file_name
+                )
             }
-            Elf64SectionType::SHT_NOTE => pr_debug!("  Type: NOTE"),
             _ => pr_debug!("  Type: Other({:?})", section.section_type()),
         }
     }
@@ -289,6 +293,51 @@ mod tests {
                 .iter()
                 .all(|relocation| relocation.file_id == file_id)
         );
+    }
+
+    #[test]
+    fn rejects_rel_relocations_with_an_unsupported_format_error() {
+        let mut object = build_rel_object(
+            &[],
+            &[TestRelocation {
+                offset: 0,
+                sym: 0,
+                ty: 0,
+                addend: 0,
+            }],
+        );
+        let shoff = u64::from_le_bytes(object[40..48].try_into().unwrap()) as usize;
+        let section_type = shoff + 3 * 64 + 4;
+        object[section_type..section_type + 4]
+            .copy_from_slice(&elf::Elf64SectionType::SHT_REL.raw().to_le_bytes());
+        let error = parse(&object, "rel.o".to_string(), FileId::Object(0)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported relocation format SHT_REL")
+        );
+        assert!(error.to_string().contains("rel.o"));
+    }
+
+    #[test]
+    fn collects_all_three_array_section_types_with_their_data() {
+        for ty in [
+            elf::Elf64SectionType::SHT_PREINIT_ARRAY,
+            elf::Elf64SectionType::SHT_INIT_ARRAY,
+            elf::Elf64SectionType::SHT_FINI_ARRAY,
+        ] {
+            let mut object = build_rel_object(&[], &[]);
+            let shoff = u64::from_le_bytes(object[40..48].try_into().unwrap()) as usize;
+            let section_type = shoff + 2 * 64 + 4;
+            object[section_type..section_type + 4].copy_from_slice(&ty.raw().to_le_bytes());
+            let parsed = parse(&object, "array.o".to_string(), FileId::Object(0)).unwrap();
+            assert_eq!(parsed.sections.len(), 1);
+            assert_eq!(parsed.sections[0].ty, ty);
+            assert_eq!(
+                parsed.sections[0].data.unwrap(),
+                &[0x90, 0x90, 0x90, 0x90, 0xc3]
+            );
+        }
     }
 
     #[test]

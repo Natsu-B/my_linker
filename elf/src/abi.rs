@@ -88,6 +88,7 @@ impl ElfProgramHeaderType {
     pub const PT_NOTE: Self = Self(4);
     pub const PT_SHLIB: Self = Self(5);
     pub const PT_PHDR: Self = Self(6);
+    pub const PT_TLS: Self = Self(7);
     pub const PT_GNU_STACK: Self = Self(0x6474_e551);
 
     pub const fn raw(self) -> u32 {
@@ -144,6 +145,9 @@ impl Elf64SectionType {
     pub const SHT_REL: Self = Self(9);
     pub const SHT_SHLIB: Self = Self(10);
     pub const SHT_DYNSYM: Self = Self(11);
+    pub const SHT_INIT_ARRAY: Self = Self(14);
+    pub const SHT_FINI_ARRAY: Self = Self(15);
+    pub const SHT_PREINIT_ARRAY: Self = Self(16);
     pub const SHT_LOPROC: Self = Self(0x7000_0000);
     pub const SHT_HIPROC: Self = Self(0x7FFF_FFFF);
     pub const SHT_LOUSER: Self = Self(0x8000_0000);
@@ -159,7 +163,16 @@ bitregs! {
         pub SHF_WRITE@[0:0],
         pub SHF_ALLOC@[1:1],
         pub SHF_EXECINSTR@[2:2],
-        reserved@[63:3],
+        reserved_low@[9:3],
+        pub SHF_TLS@[10:10],
+        reserved@[63:11],
+    }
+}
+
+impl Elf64SectionFlags {
+    /// Raw `sh_flags` bits for crates that do not depend on `typestate::RawReg`.
+    pub fn raw(self) -> u64 {
+        self.to_raw()
     }
 }
 
@@ -182,7 +195,8 @@ bitregs! {
             STT_FUNC = 2,
             STT_SECTION = 3,
             STT_FILE = 4,
-            STT_LOOS = 10,
+            STT_TLS = 6,
+            STT_GNU_IFUNC = 10,
             STT_HIOS = 12,
             STT_LOPROC = 13,
             STT_HIPROC = 15,
@@ -197,6 +211,10 @@ bitregs! {
             STB_HIPROC = 15,
         },
     }
+}
+
+impl Elf64SymbolType {
+    pub const STT_LOOS: Self = Self::STT_GNU_IFUNC;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

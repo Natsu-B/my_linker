@@ -627,7 +627,6 @@ mod tests {
         let gnu = parse(include_str!("../../tests/fixtures/gnu_ld_static.ld")).unwrap();
         for script in [builtin, gnu] {
             assert_eq!(script.entry_name(), "_start");
-            assert_eq!(script.initial_address().unwrap(), 0x400000);
         }
     }
 
@@ -654,7 +653,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(script.entry_name(), "boot");
-        assert_eq!(script.initial_address().unwrap(), 0x600000);
         let Statement::Assignment(base) = &script.statements[4] else {
             panic!("expected base assignment")
         };

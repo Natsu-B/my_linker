@@ -24,6 +24,8 @@ SECTIONS
   .rodata : { *(.rodata .rodata.*) }
   .eh_frame : { KEEP(*(.eh_frame)) *(.eh_frame.*) }
   .gcc_except_table : { *(.gcc_except_table .gcc_except_table.*) }
+  .note.gnu.property : { *(.note.gnu.property) }
+  .note.ABI-tag : { *(.note.ABI-tag) }
   . = DATA_SEGMENT_ALIGN(CONSTANT(MAXPAGESIZE), CONSTANT(COMMONPAGESIZE));
   .tdata : { *(.tdata .tdata.*) }
   .tbss : { *(.tbss .tbss.*) *(.tcommon) }
@@ -49,7 +51,7 @@ SECTIONS
     PROVIDE_HIDDEN(_GLOBAL_OFFSET_TABLE_ = .);
     *(.got.plt) *(.igot.plt) *(.got) *(.igot)
   }
-  .data : { *(.data .data.*) }
+  .data : { *(.data .data.*) *(.tm_clone_table) }
   _edata = .;
   PROVIDE(edata = .);
   __bss_start = .;
