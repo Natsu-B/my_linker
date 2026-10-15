@@ -88,6 +88,7 @@ impl ElfProgramHeaderType {
     pub const PT_NOTE: Self = Self(4);
     pub const PT_SHLIB: Self = Self(5);
     pub const PT_PHDR: Self = Self(6);
+    pub const PT_GNU_STACK: Self = Self(0x6474_e551);
 
     pub const fn raw(self) -> u32 {
         self.0

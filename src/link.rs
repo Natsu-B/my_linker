@@ -4,11 +4,11 @@ use crate::{
     parse::{ObjectFile, ObjectRelocation, ObjectSection, ObjectSymbol},
     script,
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use elf::{Elf64ProgramHeaderFlags, Elf64SectionFlags, Elf64SectionType, ElfEndian};
 use num::integer::lcm;
 
-const PAGE_SIZE: u64 = 0x1000;
+pub(crate) const PAGE_SIZE: u64 = 0x1000;
 
 pub struct SectionPlacement<'a> {
     pub out_idx: u16,
@@ -24,6 +24,7 @@ pub struct SectionPlacement<'a> {
 
 pub struct ElfData {
     pub endianness: ElfEndian,
+    pub header_vaddr: u64,
 }
 
 pub fn link(
@@ -227,7 +228,12 @@ pub fn link(
 
     pr_debug!("Section virtual addresses:");
     let va_guard = script::LINKER_DATA.read().unwrap();
-    let mut current_va = va_guard.vart_addr;
+    let header_vaddr = va_guard.vart_addr;
+    // One page holds the ELF header and all six possible program headers:
+    // the header PT_LOAD, four section PT_LOADs, and PT_GNU_STACK.
+    let mut current_va = header_vaddr
+        .checked_add(PAGE_SIZE)
+        .context("header virtual address range exceeds u64")?;
 
     // already sorted by out_idx
     for section in sections.iter_mut() {
@@ -243,6 +249,7 @@ pub fn link(
         relocations,
         ElfData {
             endianness: endianness.unwrap(),
+            header_vaddr,
         },
     ))
 }
@@ -297,7 +304,7 @@ mod tests {
             size: 2,
         };
 
-        let (sections, _, _, _) = link(vec![object_file(vec![text, rodata])]).unwrap();
+        let (sections, _, _, elf_data) = link(vec![object_file(vec![text, rodata])]).unwrap();
         let text = sections
             .iter()
             .find(|section| section.name == ".text")
@@ -312,6 +319,7 @@ mod tests {
         assert_eq!(text.segment_align, PAGE_SIZE);
         assert_eq!(rodata.segment_align, PAGE_SIZE);
         assert_eq!(text_va % PAGE_SIZE, 0);
+        assert_eq!(text_va, elf_data.header_vaddr + PAGE_SIZE);
         assert_eq!(rodata_va % PAGE_SIZE, 0);
         assert_ne!(text_va / PAGE_SIZE, rodata_va / PAGE_SIZE);
     }

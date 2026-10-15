@@ -1,10 +1,13 @@
-use std::fs::OpenOptions;
+use std::{
+    fs::{OpenOptions, Permissions},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+};
 
 use anyhow::{Ok, Result};
 use elf::{ExecElf64Writer, LoadSegment};
 use memmap2::MmapMut;
 
-use crate::link::{ElfData, SectionPlacement};
+use crate::link::{ElfData, PAGE_SIZE, SectionPlacement};
 
 pub fn output(
     section_placements: Vec<SectionPlacement>,
@@ -14,6 +17,8 @@ pub fn output(
 ) -> Result<()> {
     pr_debug!("Write output file: {}", output_file);
     let mut writer = ExecElf64Writer::new_x86_64_executable(entry);
+    writer.endian = elf_data.endianness;
+    writer.map_headers(elf_data.header_vaddr, PAGE_SIZE);
     for section_placement in section_placements {
         if section_placement.size == 0
             && section_placement
@@ -41,12 +46,14 @@ pub fn output(
         .write(true)
         .create(true)
         .truncate(true)
+        .mode(0o755)
         .open(&output_file)?;
 
     file.set_len(file_size)?;
     let mut mmap = unsafe { MmapMut::map_mut(&file) }?;
     writer.write_into(&mut mmap)?;
     mmap.flush()?;
+    file.set_permissions(Permissions::from_mode(0o755))?;
 
     Ok(())
 }
@@ -56,11 +63,12 @@ mod tests {
     use std::{
         cell::OnceCell,
         fs,
+        os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use elf::{Elf64, Elf64ProgramHeaderFlags, ElfEndian, PF_R, PF_W, PF_X};
+    use elf::{Elf64, Elf64ProgramHeaderFlags, ElfEndian, ElfProgramHeaderType, PF_R, PF_W, PF_X};
 
     use super::output;
     use crate::link::{ElfData, SectionPlacement};
@@ -131,7 +139,7 @@ mod tests {
                 2,
                 16,
                 0x1000,
-                0x400000,
+                0x401000,
                 Some(vec![0x90, 0xC3]),
             ),
             placed_section(
@@ -141,7 +149,7 @@ mod tests {
                 5,
                 8,
                 0x1000,
-                0x401000,
+                0x402000,
                 Some(b"hello".to_vec()),
             ),
             placed_section(
@@ -151,32 +159,43 @@ mod tests {
                 0,
                 8,
                 0x1000,
-                0x402000,
+                0x403000,
                 Some(Vec::new()),
             ),
-            placed_section(3, ".bss", PF_R | PF_W, 0, 8, 0x1000, 0x403000, None),
+            placed_section(3, ".bss", PF_R | PF_W, 0, 8, 0x1000, 0x404000, None),
         ];
 
+        fs::write(path.as_path(), b"old output").unwrap();
+        fs::set_permissions(path.as_path(), fs::Permissions::from_mode(0o600)).unwrap();
         output(
             sections,
             ElfData {
                 endianness: ElfEndian::Little,
+                header_vaddr: 0x400000,
             },
             path.as_path().display().to_string(),
-            0x400000,
+            0x401000,
         )
         .unwrap();
 
         let bytes = fs::read(path.as_path()).unwrap();
         let elf = Elf64::new(&bytes).unwrap();
-        let headers = elf.program_headers().collect::<Vec<_>>();
+        let headers = elf
+            .program_headers()
+            .filter(|header| header.segment_type() == ElfProgramHeaderType::PT_LOAD)
+            .collect::<Vec<_>>();
 
-        assert_eq!(headers.len(), 2);
+        assert_eq!(elf.program_header_count(), 4);
+        assert_eq!(headers.len(), 3);
         assert!(headers.iter().all(|header| header.align() == 0x1000));
         assert!(
             headers
                 .iter()
                 .all(|header| header.file_size() != 0 || header.mem_size() != 0)
+        );
+        assert_eq!(
+            fs::metadata(path.as_path()).unwrap().permissions().mode() & 0o7777,
+            0o755
         );
     }
 }

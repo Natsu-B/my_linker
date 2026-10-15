@@ -16,6 +16,8 @@ pub struct ExecElf64Writer {
     pub machine: ElfMachineType,
     pub entry: u64,
     pub segments: Vec<LoadSegment>,
+    pub program_headers: Vec<ProgramHeader>,
+    header_segment: Option<ProgramHeader>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,18 +44,21 @@ struct ElfLayout {
     file_size: u64,
     phoff: u64,
     phnum: u16,
-    segments: Vec<SegmentLayout>,
+    header_segment: Option<ProgramHeader>,
+    segments: Vec<ProgramHeader>,
 }
 
+/// A program header describing an existing file range, without adding payload bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct SegmentLayout {
-    offset: u64,
-    file_size: u64,
-    mem_size: u64,
-    vaddr: u64,
-    paddr: u64,
-    align: u64,
-    flags: Elf64ProgramHeaderFlags,
+pub struct ProgramHeader {
+    pub segment_type: ElfProgramHeaderType,
+    pub flags: Elf64ProgramHeaderFlags,
+    pub offset: u64,
+    pub vaddr: u64,
+    pub paddr: u64,
+    pub file_size: u64,
+    pub mem_size: u64,
+    pub align: u64,
 }
 
 impl ExecElf64Writer {
@@ -63,11 +68,41 @@ impl ExecElf64Writer {
             machine: ElfMachineType::EM_X86_64,
             entry,
             segments: Vec::new(),
+            program_headers: vec![ProgramHeader {
+                segment_type: ElfProgramHeaderType::PT_GNU_STACK,
+                flags: Elf64ProgramHeaderFlags::from_bits(PF_R | PF_W),
+                offset: 0,
+                vaddr: 0,
+                paddr: 0,
+                file_size: 0,
+                mem_size: 0,
+                align: 16,
+            }],
+            header_segment: None,
         }
     }
 
     pub fn add_load_segment(&mut self, seg: LoadSegment) {
         self.segments.push(seg);
+    }
+
+    pub fn add_program_header(&mut self, header: ProgramHeader) {
+        self.program_headers.push(header);
+    }
+
+    /// Map the ELF header and complete program header table in a read-only PT_LOAD.
+    /// The caller must reserve this virtual address range before other load segments.
+    pub fn map_headers(&mut self, vaddr: u64, align: u64) {
+        self.header_segment = Some(ProgramHeader {
+            segment_type: ElfProgramHeaderType::PT_LOAD,
+            flags: Elf64ProgramHeaderFlags::from_bits(PF_R),
+            offset: 0,
+            vaddr,
+            paddr: vaddr,
+            file_size: 0,
+            mem_size: 0,
+            align,
+        });
     }
 
     fn layout(&self) -> Result<ElfLayout> {
@@ -80,17 +115,26 @@ impl ExecElf64Writer {
         let phnum: u16 = self
             .segments
             .len()
+            .checked_add(self.program_headers.len())
+            .and_then(|count| count.checked_add(usize::from(self.header_segment.is_some())))
+            .context("too many program headers")?
             .try_into()
             .context("too many program headers")?;
         let phoff = ELF_HEADER_SIZE;
         let mut cursor = phoff
             .checked_add(u64::from(phnum) * PROGRAM_HEADER_SIZE)
             .context("program header table exceeds u64")?;
+        let header_segment = self.header_segment.clone().map(|mut header| {
+            header.file_size = cursor;
+            header.mem_size = cursor;
+            header
+        });
+        if let Some(header) = &header_segment {
+            validate_program_header(header)?;
+        }
         let mut layouts = Vec::with_capacity(self.segments.len());
 
         for segment in &self.segments {
-            self.validate_segment(segment)?;
-
             let file_size: u64 = segment
                 .data
                 .len()
@@ -107,7 +151,8 @@ impl ExecElf64Writer {
                 .context("segment file range exceeds u64")?;
             cursor = cursor.max(end);
 
-            layouts.push(SegmentLayout {
+            let header = ProgramHeader {
+                segment_type: ElfProgramHeaderType::PT_LOAD,
                 offset,
                 file_size,
                 mem_size: segment.mem_size,
@@ -115,13 +160,28 @@ impl ExecElf64Writer {
                 paddr: segment.paddr,
                 align: segment.align,
                 flags: segment.flags,
-            });
+            };
+            validate_program_header(&header)?;
+            layouts.push(header);
+        }
+
+        for header in &self.program_headers {
+            validate_program_header(header)?;
+            ensure!(
+                header.file_size == 0
+                    || header
+                        .offset
+                        .checked_add(header.file_size)
+                        .is_some_and(|end| end <= cursor),
+                "program header file range exceeds output file"
+            );
         }
 
         Ok(ElfLayout {
             file_size: cursor,
             phoff,
             phnum,
+            header_segment,
             segments: layouts,
         })
     }
@@ -140,8 +200,11 @@ impl ExecElf64Writer {
             "output buffer is too small"
         );
         ensure!(
-            layout.phnum as usize == self.segments.len(),
-            "layout/program header count does not match segment count"
+            layout.phnum as usize
+                == self.segments.len()
+                    + self.program_headers.len()
+                    + usize::from(layout.header_segment.is_some()),
+            "layout/program header count does not match writer"
         );
         ensure!(
             layout.segments.len() == self.segments.len(),
@@ -173,39 +236,30 @@ impl ExecElf64Writer {
         write_u16(out, 60, 0, self.endian)?;
         write_u16(out, 62, 0, self.endian)?;
 
-        for (idx, (segment, seg_layout)) in self.segments.iter().zip(&layout.segments).enumerate() {
-            self.validate_segment(segment)?;
-            ensure!(
-                seg_layout.file_size
-                    == u64::try_from(segment.data.len()).context("segment data too large")?,
-                "layout file size does not match segment data"
-            );
-            ensure!(
-                seg_layout.mem_size >= seg_layout.file_size,
-                "layout mem size is smaller than file size"
-            );
-            if seg_layout.align != 0 {
-                ensure!(
-                    seg_layout.offset % seg_layout.align == seg_layout.vaddr % seg_layout.align,
-                    "segment alignment relation is invalid"
-                );
-            }
-
+        for (idx, header) in layout
+            .header_segment
+            .iter()
+            .chain(&layout.segments)
+            .chain(&self.program_headers)
+            .enumerate()
+        {
             let phoff = layout
                 .phoff
                 .checked_add(u64::try_from(idx).unwrap() * PROGRAM_HEADER_SIZE)
                 .context("program header offset exceeds u64")?;
             let phoff = usize::try_from(phoff).context("program header offset too large")?;
 
-            write_u32(out, phoff, ElfProgramHeaderType::PT_LOAD.raw(), self.endian)?;
-            write_u32(out, phoff + 4, seg_layout.flags.to_raw(), self.endian)?;
-            write_u64(out, phoff + 8, seg_layout.offset, self.endian)?;
-            write_u64(out, phoff + 16, seg_layout.vaddr, self.endian)?;
-            write_u64(out, phoff + 24, seg_layout.paddr, self.endian)?;
-            write_u64(out, phoff + 32, seg_layout.file_size, self.endian)?;
-            write_u64(out, phoff + 40, seg_layout.mem_size, self.endian)?;
-            write_u64(out, phoff + 48, seg_layout.align, self.endian)?;
+            write_u32(out, phoff, header.segment_type.raw(), self.endian)?;
+            write_u32(out, phoff + 4, header.flags.to_raw(), self.endian)?;
+            write_u64(out, phoff + 8, header.offset, self.endian)?;
+            write_u64(out, phoff + 16, header.vaddr, self.endian)?;
+            write_u64(out, phoff + 24, header.paddr, self.endian)?;
+            write_u64(out, phoff + 32, header.file_size, self.endian)?;
+            write_u64(out, phoff + 40, header.mem_size, self.endian)?;
+            write_u64(out, phoff + 48, header.align, self.endian)?;
+        }
 
+        for (segment, seg_layout) in self.segments.iter().zip(&layout.segments) {
             let data_offset =
                 usize::try_from(seg_layout.offset).context("segment offset too large")?;
             let data_end = data_offset
@@ -229,27 +283,28 @@ impl ExecElf64Writer {
         );
         Ok(())
     }
+}
 
-    fn validate_segment(&self, segment: &LoadSegment) -> Result<()> {
-        let file_size: u64 = segment
-            .data
-            .len()
-            .try_into()
-            .context("segment data length does not fit in u64")?;
+fn validate_program_header(header: &ProgramHeader) -> Result<()> {
+    ensure!(
+        header.file_size <= header.mem_size,
+        "segment file size exceeds memory size"
+    );
+    ensure!(
+        header.align == 0 || header.align.is_power_of_two(),
+        "segment alignment must be 0, 1, or a power of two"
+    );
+    ensure!(
+        header.flags.to_raw() & !(PF_R | PF_W | PF_X) == 0,
+        "segment flags contain unsupported bits"
+    );
+    if header.segment_type == ElfProgramHeaderType::PT_LOAD && header.align != 0 {
         ensure!(
-            file_size <= segment.mem_size,
-            "segment file size exceeds memory size"
+            header.offset % header.align == header.vaddr % header.align,
+            "segment alignment relation is invalid"
         );
-        ensure!(
-            segment.align == 0 || segment.align == 1 || segment.align.is_power_of_two(),
-            "segment alignment must be 0, 1, or a power of two"
-        );
-        ensure!(
-            segment.flags.to_raw() & !(PF_R | PF_W | PF_X) == 0,
-            "segment flags contain unsupported bits"
-        );
-        Ok(())
     }
+    Ok(())
 }
 
 fn next_congruent_offset(cursor: u64, align: u64, remainder: u64) -> Result<u64> {
@@ -314,8 +369,8 @@ fn write_bytes(out: &mut [u8], offset: usize, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        Elf64, Elf64ProgramHeaderFlags, ElfFileType, PF_R, PF_W, PF_X,
-        write::{ExecElf64Writer, LoadSegment},
+        Elf64, Elf64ProgramHeaderFlags, ElfFileType, ElfProgramHeaderType, PF_R, PF_W, PF_X,
+        write::{ExecElf64Writer, LoadSegment, ProgramHeader},
     };
 
     #[test]
@@ -390,7 +445,10 @@ mod tests {
         let mut storage = vec![0u8; file_size as usize];
         writer.write_into(&mut storage).unwrap();
         let elf = Elf64::new(&storage).unwrap();
-        let segments = elf.program_headers().collect::<Vec<_>>();
+        let segments = elf
+            .program_headers()
+            .filter(|header| header.segment_type() == ElfProgramHeaderType::PT_LOAD)
+            .collect::<Vec<_>>();
 
         assert_eq!(segments.len(), 2);
         for segment in &segments {
@@ -430,15 +488,89 @@ mod tests {
         let elf = Elf64::new(&storage[1..]).unwrap();
         assert_eq!(elf.elf_type(), ElfFileType::ET_EXEC);
         assert_eq!(elf.entry(), 0x401000);
-        assert_eq!(elf.program_header_count(), 2);
+        assert_eq!(elf.program_header_count(), 3);
 
         let phdrs = elf.program_headers().collect::<Vec<_>>();
-        assert_eq!(phdrs.len(), 2);
+        assert_eq!(phdrs.len(), 3);
         assert_eq!(phdrs[0].flags(), PF_R | PF_X);
         assert_eq!(phdrs[0].data().unwrap(), &[0xC3]);
         assert_eq!(phdrs[1].flags(), PF_R | PF_W);
         assert_eq!(phdrs[1].file_size(), 3);
         assert_eq!(phdrs[1].mem_size(), 0x100);
         assert_eq!(phdrs[1].data().unwrap(), &[0x11, 0x22, 0x33]);
+        assert_eq!(phdrs[2].segment_type(), ElfProgramHeaderType::PT_GNU_STACK);
+        assert_eq!(phdrs[2].flags(), PF_R | PF_W);
+        assert_eq!(phdrs[2].file_size(), 0);
+        assert_eq!(phdrs[2].mem_size(), 0);
+    }
+
+    #[test]
+    fn write_into_maps_headers_and_emits_additional_program_headers() {
+        let mut writer = ExecElf64Writer::new_x86_64_executable(0x401000);
+        writer.map_headers(0x400000, 0x1000);
+        writer.add_load_segment(LoadSegment {
+            flags: Elf64ProgramHeaderFlags::from_bits(PF_R | PF_X),
+            vaddr: 0x401000,
+            paddr: 0x401000,
+            align: 0x1000,
+            data: vec![0x90, 0x90, 0x90, 0xC3],
+            mem_size: 4,
+        });
+        writer.add_program_header(ProgramHeader {
+            segment_type: ElfProgramHeaderType::PT_NOTE,
+            flags: Elf64ProgramHeaderFlags::from_bits(PF_R),
+            offset: 0x1000,
+            vaddr: 0x401000,
+            paddr: 0x501000,
+            file_size: 4,
+            mem_size: 4,
+            align: 4,
+        });
+
+        let mut storage = vec![0u8; writer.file_size().unwrap() as usize];
+        writer.write_into(&mut storage).unwrap();
+        let elf = Elf64::new(&storage).unwrap();
+        let headers = elf.program_headers().collect::<Vec<_>>();
+        let header_segment = &headers[0];
+
+        assert_eq!(elf.program_header_count(), 4);
+        assert_eq!(header_segment.segment_type(), ElfProgramHeaderType::PT_LOAD);
+        assert_eq!(header_segment.flags(), PF_R);
+        assert_eq!(header_segment.offset(), 0);
+        assert_eq!(header_segment.vaddr(), 0x400000);
+        assert_eq!(header_segment.paddr(), 0x400000);
+        assert_eq!(header_segment.align(), 0x1000);
+        assert_eq!(header_segment.file_size(), 64 + 56 * 4);
+        assert_eq!(header_segment.mem_size(), header_segment.file_size());
+        assert_eq!(header_segment.data().unwrap(), &storage[..64 + 56 * 4]);
+        assert_eq!(headers[1].data().unwrap(), &[0x90, 0x90, 0x90, 0xC3]);
+
+        let note = &headers[3];
+        assert_eq!(note.segment_type(), ElfProgramHeaderType::PT_NOTE);
+        assert_eq!(note.flags(), PF_R);
+        assert_eq!(note.offset(), 0x1000);
+        assert_eq!(note.vaddr(), 0x401000);
+        assert_eq!(note.paddr(), 0x501000);
+        assert_eq!(note.file_size(), 4);
+        assert_eq!(note.mem_size(), 4);
+        assert_eq!(note.align(), 4);
+        assert_eq!(note.data().unwrap(), headers[1].data().unwrap());
+    }
+
+    #[test]
+    fn map_headers_rejects_misaligned_virtual_address() {
+        let mut writer = ExecElf64Writer::new_x86_64_executable(0x401000);
+        writer.map_headers(0x400001, 0x1000);
+        writer.add_load_segment(LoadSegment {
+            flags: Elf64ProgramHeaderFlags::from_bits(PF_R | PF_X),
+            vaddr: 0x401000,
+            paddr: 0x401000,
+            align: 0x1000,
+            data: vec![0xC3],
+            mem_size: 1,
+        });
+
+        let error = writer.file_size().unwrap_err();
+        assert!(error.to_string().contains("alignment relation is invalid"));
     }
 }
