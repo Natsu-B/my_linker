@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use elf::{ElfEndian, x86_64::X86_64RelocationType};
+use elf::x86_64::X86_64RelocationType;
 
 use crate::{
     got::{Got, GotEntry},
@@ -62,7 +62,6 @@ impl Iplt {
         index: &SectionIndex,
         got: &Got,
         symbols: &SymbolTable,
-        endian: ElfEndian,
     ) -> Result<()> {
         if self.entries.is_empty() {
             return Ok(());
@@ -93,7 +92,7 @@ impl Iplt {
                 sections,
                 index,
                 entry as u64 * RELA_SIZE,
-                &Self::irelative(slot, resolver, endian),
+                &Self::irelative(slot, resolver),
             )?;
         }
         Ok(())
@@ -109,7 +108,7 @@ impl Iplt {
         Ok(bytes)
     }
 
-    fn irelative(slot: u64, resolver: u64, endian: ElfEndian) -> [u8; RELA_SIZE as usize] {
+    fn irelative(slot: u64, resolver: u64) -> [u8; RELA_SIZE as usize] {
         let mut bytes = [0; RELA_SIZE as usize];
         // Elf64_Rela: r_offset, r_info (symbol 0), r_addend (resolver).
         for (field, value) in
@@ -117,10 +116,7 @@ impl Iplt {
                 .chunks_exact_mut(8)
                 .zip([slot, X86_64RelocationType::IRelative as u64, resolver])
         {
-            field.copy_from_slice(&match endian {
-                ElfEndian::Little => value.to_le_bytes(),
-                ElfEndian::Big => value.to_be_bytes(),
-            });
+            field.copy_from_slice(&value.to_le_bytes());
         }
         bytes
     }
@@ -152,7 +148,7 @@ mod tests {
 
     #[test]
     fn irelative_encodes_slot_type_and_resolver_without_a_symbol() {
-        let bytes = Iplt::irelative(0x403008, 0x401234, ElfEndian::Little);
+        let bytes = Iplt::irelative(0x403008, 0x401234);
         assert_eq!(u64::from_le_bytes(bytes[..8].try_into().unwrap()), 0x403008);
         assert_eq!(u64::from_le_bytes(bytes[8..16].try_into().unwrap()), 37);
         assert_eq!(

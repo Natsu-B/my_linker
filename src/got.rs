@@ -257,7 +257,6 @@ mod tests {
         assert_eq!(stubs.flags.get(Elf64SectionFlags::SHF_EXECINSTR), 1);
         assert_eq!(relas.size, 24);
         assert_eq!(relas.align, 8);
-        assert_eq!(relas.ty, elf::Elf64SectionType::SHT_RELA);
         assert_eq!(relas.flags.get(Elf64SectionFlags::SHF_ALLOC), 1);
     }
 }

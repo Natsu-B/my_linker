@@ -20,9 +20,6 @@ pub struct ObjectFile<'a> {
     /// Stable identity of the original input object.
     pub file_id: FileId,
 
-    /// Endianness of the ELF file.
-    pub endian: ElfEndian,
-
     /// Loadable and allocatable sections collected from the object file.
     pub sections: Vec<ObjectSection<'a>>,
 
@@ -47,9 +44,6 @@ pub struct ObjectSection<'a> {
 
     /// Section name from the section string table.
     pub name: &'a str,
-
-    /// ELF section type.
-    pub ty: Elf64SectionType,
 
     /// ELF section flags such as alloc, write, or execute.
     pub flags: Elf64SectionFlags,
@@ -97,9 +91,6 @@ pub struct ObjectSymbol<'a> {
     /// For relocatable objects, this is usually an offset within the defining
     /// section rather than a final virtual address.
     pub value: u64,
-
-    /// Size of the symbol in bytes.
-    pub size: u64,
 }
 
 /// A relocation entry extracted from a relocation section.
@@ -131,7 +122,14 @@ pub fn parse<'a>(mmap: &'a [u8], file_name: String, file_id: FileId) -> Result<O
     let elf = elf::Elf64::new(mmap)
         .with_context(|| format!("failed to parse ELF file: {}", file_name))?;
 
-    // check if the file is an ELF64 x86_64 relocatable file
+    // Validate the target here so later stages can use x86-64 little-endian
+    // encodings for both ordinary objects and archive members.
+    ensure!(
+        elf.endian() == ElfEndian::Little,
+        "unsupported endianness: {:?} in file: {} (expected little-endian)",
+        elf.endian(),
+        file_name
+    );
     ensure!(
         elf.arch() == ElfMachineType::EM_X86_64,
         "unsupported architecture: {:?} in file: {}",
@@ -148,7 +146,6 @@ pub fn parse<'a>(mmap: &'a [u8], file_name: String, file_id: FileId) -> Result<O
     let mut object_file: ObjectFile<'a> = ObjectFile {
         file_name,
         file_id,
-        endian: elf.endian(),
         sections: Vec::new(),
         symbols: Vec::new(),
         relocations: Vec::new(),
@@ -169,7 +166,6 @@ pub fn parse<'a>(mmap: &'a [u8], file_name: String, file_id: FileId) -> Result<O
                     file_id,
                     idx: section.idx(),
                     name: section.name()?,
-                    ty: section.section_type(),
                     flags: section.flags(),
                     align: section.align(),
                     data: section.data().map(Cow::Borrowed),
@@ -188,7 +184,6 @@ pub fn parse<'a>(mmap: &'a [u8], file_name: String, file_id: FileId) -> Result<O
                         name: symbol.name()?,
                         info: symbol.info(),
                         value: symbol.value(),
-                        size: symbol.size(),
                     };
                     object_file.symbols.push(symbol);
                 }
@@ -238,6 +233,39 @@ mod tests {
         test_utils::{TestRelocation, TestSymbol, build_archive, build_rel_object},
     };
     use elf::{Elf64SymbolBinding, Elf64SymbolType};
+
+    #[test]
+    fn rejects_big_endian_objects_at_the_input_boundary() {
+        // A complete ELF64 header followed by a single SHT_NULL header.
+        // Keep the multi-byte fields valid so the generic reader accepts it.
+        let mut object = vec![0; 128];
+        object[..7].copy_from_slice(b"\x7fELF\x02\x02\x01");
+        object[16..18].copy_from_slice(&elf::ElfFileType::ET_REL.raw().to_be_bytes());
+        object[18..20].copy_from_slice(&elf::ElfMachineType::EM_X86_64.raw().to_be_bytes());
+        object[20..24].copy_from_slice(&1u32.to_be_bytes());
+        object[40..48].copy_from_slice(&64u64.to_be_bytes());
+        object[52..54].copy_from_slice(&64u16.to_be_bytes());
+        object[58..60].copy_from_slice(&64u16.to_be_bytes());
+        object[60..62].copy_from_slice(&1u16.to_be_bytes());
+        assert!(elf::Elf64::new(&object).is_ok());
+
+        let error = parse(&object, "big-endian.o".to_string(), FileId::Object(0)).unwrap_err();
+
+        assert!(error.to_string().contains("unsupported endianness"));
+        assert!(error.to_string().contains("big-endian.o"));
+    }
+
+    #[test]
+    fn rejects_other_machines_accepted_by_the_generic_reader() {
+        let mut object = build_rel_object(&[], &[]);
+        object[18..20].copy_from_slice(&elf::ElfMachineType::EM_AARCH64.raw().to_le_bytes());
+        assert!(elf::Elf64::new(&object).is_ok());
+
+        let error = parse(&object, "aarch64.o".to_string(), FileId::Object(0)).unwrap_err();
+
+        assert!(error.to_string().contains("unsupported architecture"));
+        assert!(error.to_string().contains("aarch64.o"));
+    }
 
     #[test]
     fn parse_propagates_object_file_id_to_sections_symbols_and_relocations() {
@@ -329,7 +357,6 @@ mod tests {
             object[section_type..section_type + 4].copy_from_slice(&ty.raw().to_le_bytes());
             let parsed = parse(&object, "array.o".to_string(), FileId::Object(0)).unwrap();
             assert_eq!(parsed.sections.len(), 1);
-            assert_eq!(parsed.sections[0].ty, ty);
             assert_eq!(
                 parsed.sections[0].data.as_deref().unwrap(),
                 &[0x90, 0x90, 0x90, 0x90, 0xc3]

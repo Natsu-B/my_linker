@@ -1,7 +1,7 @@
 use crate::{got::GotEntry, input_id::FileId, link::Linked, synthetic::SyntheticSection};
 
 use anyhow::{Context, Result, bail};
-use elf::{ElfEndian, x86_64::X86_64RelocationType};
+use elf::x86_64::X86_64RelocationType;
 use num::traits::ToBytes;
 
 pub fn relocate(linked: &mut Linked, entry_name: &str) -> Result<u64 /* start address */> {
@@ -15,7 +15,6 @@ pub fn relocate(linked: &mut Linked, entry_name: &str) -> Result<u64 /* start ad
         iplt,
         elf_data,
     } = linked;
-    let endianness = elf_data.endianness;
     let got_location = section_index.get(&(FileId::Synthetic, SyntheticSection::Got as u16));
     let got_va = got_location
         .map(|location| sections[location.output_idx].va.get().unwrap() + location.offset);
@@ -31,7 +30,7 @@ pub fn relocate(linked: &mut Linked, entry_name: &str) -> Result<u64 /* start ad
             .context("GOT output section has no data")?;
         match entry {
             GotEntry::Address(_) => {
-                write_data(data, location.offset + offset, address, endianness)?;
+                write_data(data, location.offset + offset, address)?;
             }
             GotEntry::TpOff(_) => {
                 let tpoff = elf_data
@@ -44,14 +43,14 @@ pub fn relocate(linked: &mut Linked, entry_name: &str) -> Result<u64 /* start ad
                             symbols.get(id).name
                         )
                     })?;
-                write_data(data, location.offset + offset, tpoff, endianness)?;
+                write_data(data, location.offset + offset, tpoff)?;
             }
             // Startup applies IRELATIVE before any IFUNC calls. Leave the
             // reserved slot zero until it stores the resolver's result.
             GotEntry::Ifunc(_) => {}
         }
     }
-    iplt.write(sections, section_index, got, symbols, endianness)?;
+    iplt.write(sections, section_index, got, symbols)?;
 
     for relocation in relocations {
         pr_debug!(
@@ -79,9 +78,9 @@ pub fn relocate(linked: &mut Linked, entry_name: &str) -> Result<u64 /* start ad
                 reloc_type,
                 X86_64RelocationType::Pc32
                     | X86_64RelocationType::Plt32
-                    | X86_64RelocationType::Rel64
-                    | X86_64RelocationType::Rel32
-                    | X86_64RelocationType::Rel32S
+                    | X86_64RelocationType::R64
+                    | X86_64RelocationType::R32
+                    | X86_64RelocationType::R32S
             ) {
             Some(iplt.address(symbol_id, sections, section_index)?)
         } else {
@@ -123,12 +122,7 @@ pub fn relocate(linked: &mut Linked, entry_name: &str) -> Result<u64 /* start ad
                     .with_context(|| format!("Relocation PC32 calculation failed: symbol_addr={:#x}, addend={:#x}, place_addr={:#x}", symbol_addr, addend, place_addr))?;
                 pr_debug!("Relocation PC32: {:#x}", addr);
 
-                write_data(
-                    target_data,
-                    target_offset + relocation.offset,
-                    addr,
-                    endianness,
-                )?;
+                write_data(target_data, target_offset + relocation.offset, addr)?;
             }
             X86_64RelocationType::GotPcRel
             | X86_64RelocationType::GotPcRelX
@@ -149,12 +143,7 @@ pub fn relocate(linked: &mut Linked, entry_name: &str) -> Result<u64 /* start ad
                         "Relocation {reloc_type:?} calculation failed: slot_addr={slot_addr:#x}, addend={addend:#x}, place_addr={place_addr:#x}"
                     )
                 })?;
-                write_data(
-                    target_data,
-                    target_offset + relocation.offset,
-                    addr,
-                    endianness,
-                )?;
+                write_data(target_data, target_offset + relocation.offset, addr)?;
             }
             X86_64RelocationType::TpOff32 | X86_64RelocationType::TpOff64 => {
                 let tpoff = elf_data
@@ -175,17 +164,17 @@ pub fn relocate(linked: &mut Linked, entry_name: &str) -> Result<u64 /* start ad
                             "Relocation TPOFF32 calculation failed: tpoff={tpoff}, addend={addend}"
                         )
                     })?;
-                    write_data(target_data, offset, value, endianness)?;
+                    write_data(target_data, offset, value)?;
                 } else {
                     let value = i64::try_from(value).with_context(|| {
                         format!(
                             "Relocation TPOFF64 calculation failed: tpoff={tpoff}, addend={addend}"
                         )
                     })?;
-                    write_data(target_data, offset, value, endianness)?;
+                    write_data(target_data, offset, value)?;
                 }
             }
-            X86_64RelocationType::Rel32 => {
+            X86_64RelocationType::R32 => {
                 // S + A
                 let value = (symbol_addr as i128) + (addend as i128);
                 let addr: u32 = value.try_into().with_context(|| {
@@ -196,14 +185,9 @@ pub fn relocate(linked: &mut Linked, entry_name: &str) -> Result<u64 /* start ad
                 })?;
                 pr_debug!("Relocation REL32: {:#x}", addr);
 
-                write_data(
-                    target_data,
-                    target_offset + relocation.offset,
-                    addr,
-                    endianness,
-                )?;
+                write_data(target_data, target_offset + relocation.offset, addr)?;
             }
-            X86_64RelocationType::Rel64 => {
+            X86_64RelocationType::R64 => {
                 // S + A
                 let value = (symbol_addr as i128) + (addend as i128);
                 let addr: u64 = value.try_into().with_context(|| {
@@ -214,14 +198,9 @@ pub fn relocate(linked: &mut Linked, entry_name: &str) -> Result<u64 /* start ad
                 })?;
                 pr_debug!("Relocation REL64: {:#x}", addr);
 
-                write_data(
-                    target_data,
-                    target_offset + relocation.offset,
-                    addr,
-                    endianness,
-                )?;
+                write_data(target_data, target_offset + relocation.offset, addr)?;
             }
-            X86_64RelocationType::Rel32S => {
+            X86_64RelocationType::R32S => {
                 // S + A
                 let value = (symbol_addr as i128) + (addend as i128);
                 let addr: i32 = value.try_into().with_context(|| {
@@ -232,12 +211,7 @@ pub fn relocate(linked: &mut Linked, entry_name: &str) -> Result<u64 /* start ad
                 })?;
                 pr_debug!("Relocation REL32S: {:#x}", addr);
 
-                write_data(
-                    target_data,
-                    target_offset + relocation.offset,
-                    addr,
-                    endianness,
-                )?;
+                write_data(target_data, target_offset + relocation.offset, addr)?;
             }
             x => {
                 bail!("Unsupported relocation type: {:?}", x);
@@ -251,12 +225,9 @@ pub fn relocate(linked: &mut Linked, entry_name: &str) -> Result<u64 /* start ad
         .context("Failed to find entry point")
 }
 
-fn write_data<T: ToBytes>(data: &mut [u8], offset: u64, value: T, endian: ElfEndian) -> Result<()> {
+fn write_data<T: ToBytes>(data: &mut [u8], offset: u64, value: T) -> Result<()> {
     let offset = offset as usize;
-    let bytes = match endian {
-        ElfEndian::Little => value.to_le_bytes(),
-        ElfEndian::Big => value.to_be_bytes(),
-    };
+    let bytes = value.to_le_bytes();
     let bytes = bytes.as_ref();
     if offset + size_of::<T>() > data.len() {
         bail!(

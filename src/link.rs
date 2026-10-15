@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use elf::{
     Elf64ProgramHeaderFlags, Elf64SectionFlags, Elf64SymbolInfo, Elf64SymbolSectionIdx,
-    Elf64SymbolType, ElfEndian, PF_R, PF_W, PF_X, RawReg,
+    Elf64SymbolType, PF_R, PF_W, PF_X, RawReg,
     write::{ELF_HEADER_SIZE, PROGRAM_HEADER_SIZE},
 };
 
@@ -35,7 +35,6 @@ pub struct SectionPlacement<'a> {
 }
 
 pub struct ElfData {
-    pub endianness: ElfEndian,
     pub header_vaddr: u64,
     pub sizeof_headers: u64,
     pub script_symbols: HashMap<String, u64>,
@@ -141,13 +140,8 @@ pub fn link<'a>(object_files: Vec<ObjectFile<'a>>, script: &Script) -> Result<Li
     let mut inputs = Vec::new();
     let mut symbols = Vec::new();
     let mut relocations = Vec::new();
-    let mut endianness = None;
+    ensure!(!object_files.is_empty(), "no object files to link");
     for object in object_files {
-        ensure!(
-            endianness.is_none_or(|endian| endian == object.endian),
-            "input files have different endianness"
-        );
-        endianness = Some(object.endian);
         for section in object.sections {
             ensure!(
                 section.align == 0 || section.align.is_power_of_two(),
@@ -225,7 +219,6 @@ pub fn link<'a>(object_files: Vec<ObjectFile<'a>>, script: &Script) -> Result<Li
         let actual_phnum = load_segment_count(&sections) + 1 + u64::from(tls.is_some());
         if actual_phnum == phnum {
             let elf_data = ElfData {
-                endianness: endianness.context("no object files to link")?,
                 header_vaddr: layout
                     .header_vaddr
                     .context("script places no allocatable output sections")?,
@@ -747,7 +740,6 @@ pub(crate) fn load_segment_count(sections: &[SectionPlacement]) -> u64 {
 mod tests {
     use super::*;
     use crate::{input_id::FileId, script::parser};
-    use elf::Elf64SectionType;
 
     fn input(file: &str, name: &'static str, flags: u64, align: u64) -> Input<'static> {
         Input {
@@ -767,7 +759,6 @@ mod tests {
                 file_id: FileId::Object(0),
                 idx: 1,
                 name,
-                ty: Elf64SectionType::SHT_PROGBITS,
                 flags: Elf64SectionFlags::from_bits(flags),
                 align,
                 data: Some(std::borrow::Cow::Borrowed(&[1])),
@@ -1005,7 +996,6 @@ mod tests {
             input("a.o", ".tbss", 0x403, 32),
             input("a.o", ".data", 3, 8),
         ];
-        inputs[2].section.ty = Elf64SectionType::SHT_NOBITS;
         inputs[2].section.data = None;
         let script = parser::parse(
             "SECTIONS { . = 0x401000; .prefix : { *(.prefix) . = ALIGN(16); } .tdata : { *(.tdata) } .tbss : { *(.tbss) } .data : { *(.data) } }",

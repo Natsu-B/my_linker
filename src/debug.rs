@@ -1,15 +1,3 @@
-#[macro_use]
-macro_rules! debugs {
-    ($expr:expr) => {{
-        #[allow(unused_unsafe)]
-        unsafe {
-            if crate::DEBUG_LEVEL.assume_init() >= 4 {
-                $expr
-            }
-        }
-    }};
-}
-
 #[macro_export]
 macro_rules! debugs_or {
     ($debug:expr, $normal:expr) => {{

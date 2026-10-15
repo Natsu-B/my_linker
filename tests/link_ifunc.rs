@@ -153,9 +153,9 @@ fn applies_irelative_and_uses_canonical_ifunc_addresses() {
     for ty in [
         X86_64RelocationType::Plt32,
         X86_64RelocationType::Pc32,
-        X86_64RelocationType::Rel64,
-        X86_64RelocationType::Rel32,
-        X86_64RelocationType::Rel32S,
+        X86_64RelocationType::R64,
+        X86_64RelocationType::R32,
+        X86_64RelocationType::R32S,
         X86_64RelocationType::GotPcRel,
         X86_64RelocationType::GotPcRelX,
         X86_64RelocationType::RexGotPcRelX,

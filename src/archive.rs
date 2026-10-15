@@ -48,7 +48,6 @@ pub fn check_magic(data: &[u8]) -> bool {
 pub struct ArchiveReader<'a> {
     data: &'a [u8],
     long_name_table: OnceCell<Option<MemberSlice>>,
-    symbol_table: OnceCell<Option<MemberSlice>>,
 }
 
 impl<'a> ArchiveReader<'a> {
@@ -64,7 +63,6 @@ impl<'a> ArchiveReader<'a> {
         Ok(Self {
             data,
             long_name_table: OnceCell::new(),
-            symbol_table: OnceCell::new(),
         })
     }
 
@@ -80,31 +78,19 @@ impl<'a> ArchiveReader<'a> {
     }
 
     pub fn long_name_table(&self) -> Result<Option<&'a [u8]>> {
-        self.cached_special_member(&self.long_name_table, SpecialMemberKind::LongNameTable)
-    }
-
-    pub fn symbol_table(&self) -> Result<Option<&'a [u8]>> {
-        self.cached_special_member(&self.symbol_table, SpecialMemberKind::SymbolTable)
-    }
-
-    fn cached_special_member(
-        &self,
-        cache: &OnceCell<Option<MemberSlice>>,
-        kind: SpecialMemberKind,
-    ) -> Result<Option<&'a [u8]>> {
-        if let Some(cached) = cache.get() {
+        if let Some(cached) = self.long_name_table.get() {
             return Ok((*cached).map(|slice| self.slice(slice)));
         }
 
-        let found = self.find_special_member(kind)?;
-        let _ = cache.set(found);
+        let found = self.find_long_name_table()?;
+        let _ = self.long_name_table.set(found);
         Ok(found.map(|slice| self.slice(slice)))
     }
 
-    fn find_special_member(&self, kind: SpecialMemberKind) -> Result<Option<MemberSlice>> {
+    fn find_long_name_table(&self) -> Result<Option<MemberSlice>> {
         for member in self.iter() {
             let member = member?;
-            if kind.matches(member.member_name()?) {
+            if matches!(member.member_name()?, MemberName::LongNameTable) {
                 return Ok(Some(MemberSlice {
                     offset: member.payload_offset(),
                     size: member.size()?,
@@ -120,23 +106,6 @@ impl<'a> ArchiveReader<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum SpecialMemberKind {
-    LongNameTable,
-    SymbolTable,
-}
-
-impl SpecialMemberKind {
-    fn matches(self, name: MemberName<'_>) -> bool {
-        match self {
-            Self::LongNameTable => matches!(name, MemberName::LongNameTable),
-            Self::SymbolTable => {
-                matches!(name, MemberName::SymbolTable | MemberName::SymbolTable64)
-            }
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct ArchiveMember<'a> {
     data: &'a [u8],
@@ -144,13 +113,6 @@ pub struct ArchiveMember<'a> {
 }
 
 impl<'a> ArchiveMember<'a> {
-    pub fn header(&self) -> archive_member {
-        debug_assert!(self.offset + size_of::<archive_member>() <= self.data.len());
-
-        // Safety: the byte range is bounds-checked above and `archive_member` is `Copy`.
-        unsafe { std::ptr::read_unaligned(self.header_bytes().as_ptr().cast::<archive_member>()) }
-    }
-
     pub fn size(&self) -> Result<usize> {
         Ok(to_decimal(self.header_field(AR_SIZE_OFFSET, AR_SIZE_LEN))? as usize)
     }
@@ -268,10 +230,6 @@ impl<'a> ArchiveMember<'a> {
             self.member_name()?,
             MemberName::SymbolTable | MemberName::SymbolTable64 | MemberName::LongNameTable
         ))
-    }
-
-    fn header_bytes(&self) -> &'a [u8] {
-        &self.data[self.offset..self.offset + size_of::<archive_member>()]
     }
 
     fn header_field(&self, offset: usize, len: usize) -> &'a [u8] {
@@ -497,7 +455,6 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(members, vec!["foo.o".to_string()]);
-        assert_eq!(reader.symbol_table().unwrap().unwrap(), b"symtab");
         assert_eq!(reader.long_name_table().unwrap().unwrap(), b"foo.o/\n");
     }
 

@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use anyhow::{Context, Result};
-use elf::{Elf64SectionFlags, Elf64SectionType};
+use elf::Elf64SectionFlags;
 
 use crate::{
     input_id::FileId,
@@ -20,16 +20,15 @@ impl SyntheticSection {
     pub const ALL: [Self; 3] = [Self::Got, Self::Iplt, Self::RelaIplt];
 
     pub fn section(self, size: u64) -> ObjectSection<'static> {
-        let (name, ty, align) = match self {
-            Self::Got => (".got", Elf64SectionType::SHT_PROGBITS, 8),
-            Self::Iplt => (".iplt", Elf64SectionType::SHT_PROGBITS, 16),
-            Self::RelaIplt => (".rela.iplt", Elf64SectionType::SHT_RELA, 8),
+        let (name, align) = match self {
+            Self::Got => (".got", 8),
+            Self::Iplt => (".iplt", 16),
+            Self::RelaIplt => (".rela.iplt", 8),
         };
         ObjectSection {
             file_id: FileId::Synthetic,
             idx: self as u16,
             name,
-            ty,
             flags: Elf64SectionFlags::new()
                 .set(Elf64SectionFlags::SHF_ALLOC, 1)
                 .set(Elf64SectionFlags::SHF_WRITE, u64::from(self == Self::Got))

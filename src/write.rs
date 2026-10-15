@@ -97,7 +97,6 @@ fn executable_writer(
     entry: u64,
 ) -> Result<ExecElf64Writer> {
     let mut writer = ExecElf64Writer::new_x86_64_executable(entry);
-    writer.endian = elf_data.endianness;
     let mut segments = load_segments(section_placements, elf_data)?.into_iter();
     writer.header_segment = segments.next();
     for segment in segments {
@@ -175,7 +174,7 @@ mod tests {
 
     use super::*;
     use crate::{input_id::FileId, parse::ObjectSection, tls::TlsSegment};
-    use elf::{Elf64, Elf64SectionFlags, Elf64SectionType};
+    use elf::{Elf64, Elf64SectionFlags};
 
     fn section(name: &str, va: u64, size: u64, data: Option<Vec<u8>>) -> SectionPlacement<'static> {
         SectionPlacement {
@@ -192,7 +191,6 @@ mod tests {
     #[test]
     fn grouping_keeps_bss_tails_and_materializes_internal_zero_fill() {
         let elf_data = ElfData {
-            endianness: elf::ElfEndian::Little,
             header_vaddr: 0x400000,
             sizeof_headers: 232,
             script_symbols: HashMap::new(),
@@ -229,11 +227,6 @@ mod tests {
             file_id: FileId::Object(0),
             idx: 1,
             name,
-            ty: if data.is_some() {
-                Elf64SectionType::SHT_PROGBITS
-            } else {
-                Elf64SectionType::SHT_NOBITS
-            },
             flags: Elf64SectionFlags::from_bits(0x403),
             align,
             size,
@@ -288,7 +281,6 @@ mod tests {
                     sections.push(section(".data", 0x401080, 1, Some(vec![0x42])));
                 }
                 let elf_data = ElfData {
-                    endianness: elf::ElfEndian::Little,
                     header_vaddr: 0x400000,
                     sizeof_headers: ELF_HEADER_SIZE + 4 * PROGRAM_HEADER_SIZE,
                     script_symbols: HashMap::new(),
@@ -343,7 +335,6 @@ mod tests {
         assert_eq!(tls.file_size, 32);
         assert_eq!(tls.mem_size, 32);
         let elf_data = ElfData {
-            endianness: elf::ElfEndian::Little,
             header_vaddr: 0x400000,
             sizeof_headers: ELF_HEADER_SIZE + 4 * PROGRAM_HEADER_SIZE,
             script_symbols: HashMap::new(),

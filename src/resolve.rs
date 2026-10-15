@@ -82,14 +82,7 @@ impl ResolvedSymbol {
             !self.is_ifunc()
                 || matches!(
                     ty,
-                    None | Pc32
-                        | Plt32
-                        | Rel64
-                        | Rel32
-                        | Rel32S
-                        | GotPcRel
-                        | GotPcRelX
-                        | RexGotPcRelX
+                    None | Pc32 | Plt32 | R64 | R32 | R32S | GotPcRel | GotPcRelX | RexGotPcRelX
                 ),
             "unsupported IFUNC relocation {ty:?} for symbol: {}",
             self.name
@@ -361,7 +354,6 @@ mod tests {
             info: Elf64SymbolInfo::from_bits(((binding as u8) << 4) | ty as u8),
             section_idx,
             value: 42,
-            size: 0,
         }
     }
 

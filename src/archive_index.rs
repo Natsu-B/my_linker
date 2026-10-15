@@ -8,8 +8,6 @@ use crate::{archive::ArchiveReader, input_id::FileId, parse};
 pub struct MemberInfo<'a> {
     pub name: String,
     pub bytes: &'a [u8],
-    pub defined: Vec<&'a str>,
-    pub undefined: Vec<&'a str>,
 }
 
 pub struct ArchiveState<'a> {
@@ -42,17 +40,13 @@ pub fn index_archive<'a>(
             .with_context(|| format!("failed to read object bytes for {file_name}({name})"))?;
         let object = parse_member_object(member_bytes, &name, archive_idx, member_idx)
             .with_context(|| format!("failed to parse archive member {name}"))?;
-        let (defined, undefined) = collect_symbols(&object);
-
-        for &symbol in &defined {
+        for symbol in collect_defined_symbols(&object) {
             by_symbol.entry(symbol).or_insert(member_idx);
         }
 
         members.push(MemberInfo {
             name,
             bytes: member_bytes,
-            defined,
-            undefined,
         });
     }
 
@@ -83,12 +77,11 @@ fn parse_member_object<'a>(
     )
 }
 
-fn collect_symbols<'a>(object: &parse::ObjectFile<'a>) -> (Vec<&'a str>, Vec<&'a str>) {
+fn collect_defined_symbols<'a>(object: &parse::ObjectFile<'a>) -> Vec<&'a str> {
     let mut defined = Vec::new();
-    let mut undefined = Vec::new();
 
     for symbol in &object.symbols {
-        if symbol.name.is_empty() {
+        if symbol.name.is_empty() || symbol.section_idx == Elf64SymbolSectionIdx::Undefined {
             continue;
         }
 
@@ -99,20 +92,15 @@ fn collect_symbols<'a>(object: &parse::ObjectFile<'a>) -> (Vec<&'a str>, Vec<&'a
             continue;
         }
 
-        match symbol.section_idx {
-            Elf64SymbolSectionIdx::Undefined => undefined.push(symbol.name),
-            _ => {
-                if matches!(
-                    symbol.info.get_enum(Elf64SymbolInfo::st_bind),
-                    Some(Elf64SymbolBinding::STB_GLOBAL | Elf64SymbolBinding::STB_WEAK)
-                ) {
-                    defined.push(symbol.name);
-                }
-            }
+        if matches!(
+            symbol.info.get_enum(Elf64SymbolInfo::st_bind),
+            Some(Elf64SymbolBinding::STB_GLOBAL | Elf64SymbolBinding::STB_WEAK)
+        ) {
+            defined.push(symbol.name);
         }
     }
 
-    (defined, undefined)
+    defined
 }
 
 #[cfg(test)]
@@ -145,8 +133,6 @@ mod tests {
         assert_eq!(state.archive_idx, 3);
         assert_eq!(state.members.len(), 1);
         assert_eq!(state.members[0].name, "foo.o");
-        assert_eq!(state.members[0].defined, vec!["foo"]);
-        assert!(state.members[0].undefined.is_empty());
         assert_eq!(state.by_symbol["foo"], 0);
         assert_eq!(state.extracted, vec![false]);
     }
@@ -178,7 +164,6 @@ mod tests {
 
         let state = index_archive(&archive, "libmulti.a".to_string(), 1).unwrap();
 
-        assert_eq!(state.members[0].defined, vec!["foo", "bar"]);
         assert_eq!(state.by_symbol["foo"], 0);
         assert_eq!(state.by_symbol["bar"], 0);
     }
@@ -216,7 +201,7 @@ mod tests {
     }
 
     #[test]
-    fn defined_and_undefined_lists_ignore_file_and_section_symbols() {
+    fn index_excludes_undefined_local_file_and_section_symbols() {
         let object = build_rel_object(
             &[
                 TestSymbol {
@@ -274,8 +259,10 @@ mod tests {
 
         let state = index_archive(&archive, "libmulti.a".to_string(), 2).unwrap();
 
-        assert_eq!(state.members[0].defined, vec!["foo", "bar"]);
-        assert_eq!(state.members[0].undefined, vec!["baz"]);
+        assert_eq!(
+            state.by_symbol,
+            std::collections::HashMap::from([("foo", 0), ("bar", 0)])
+        );
     }
 
     #[test]
