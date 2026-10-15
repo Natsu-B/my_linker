@@ -173,6 +173,22 @@ pub fn link_executable_input(dir: &TempDir, output_name: &str, inputs: &[&Path])
     output_path
 }
 
+#[allow(dead_code)]
+pub fn link_static_executable_input(dir: &TempDir, output_name: &str, inputs: &[&Path]) -> PathBuf {
+    assert_linux_host();
+
+    let output_path = dir.path().join(output_name);
+    let mut command = StdCommand::new("ld");
+    command
+        .arg("-static")
+        .arg("-o")
+        .arg(&output_path)
+        .args(inputs);
+    run_tool(command, &format!("link {}", output_path.display()));
+
+    output_path
+}
+
 pub fn cargo_linker() -> Command {
     let mut command = Command::cargo_bin("my_linker").unwrap_or_else(|err| {
         panic!("failed to locate my_linker test binary: {err}");
