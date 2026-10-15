@@ -1,17 +1,37 @@
+//! Find the TLS bytes each thread needs and compute offsets from its thread pointer.
+//!
+//! [`TlsSegment::from_sections`] takes placed TLS sections and returns optional
+//! PT_TLS bounds. TLS gives each thread its own copy of a variable. The template
+//! contains initial bytes from .tdata and a zero-filled tail from .tbss.
+//!
+//! On x86-64 the thread pointer follows the aligned TLS block (variant II), so
+//! [`TlsSegment::tpoff`] subtracts both the template start and its aligned size.
+//! A variable inside the block thus has a negative offset. Like GNU ld/glibc,
+//! we require one block with initialized bytes before zero fill.
+//!
+//! References: ELF gABI "Thread-Local Storage" and "Program Header";
+//! AMD64 psABI §4.4.1; [ELF Handling For Thread-Local Storage](https://www.akkadia.org/drepper/tls.pdf).
+
 use anyhow::{Context, Result, ensure};
 use elf::Elf64SectionFlags;
 
 use crate::layout::OutputSection;
 
+/// Describe the initial bytes and zero fill copied into each thread's TLS block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TlsSegment {
+    /// Start of the template in the executable's virtual memory.
     pub(crate) vaddr: u64,
+    /// Initial bytes to copy for each thread.
     pub(crate) file_size: u64,
+    /// Total per-thread size, including zero fill.
     pub(crate) mem_size: u64,
+    /// Largest TLS input alignment, including .tbss.
     pub(crate) align: u64,
 }
 
 impl TlsSegment {
+    /// Find one TLS block, checking that initial bytes come before zero fill.
     pub(crate) fn from_sections(sections: &[OutputSection]) -> Result<Option<Self>> {
         let mut tls: Option<Self> = None;
         let mut finished = false;
@@ -60,15 +80,15 @@ impl TlsSegment {
                     zero_fill = true;
                 }
             }
-            // .tbss reserves VMA just like other NOBITS sections. The load
-            // writer materializes zeros if initialized RW data follows it.
+            // .tbss still takes address space. If writable data follows it in
+            // the same load, output must store zeros for the gap.
             segment.mem_size = address
                 .checked_add(section.size)
                 .and_then(|end| end.checked_sub(segment.vaddr))
                 .context("TLS memory range exceeds u64")?;
             if !zero_fill {
-                // Include script padding at the end of initialized TLS output
-                // sections. The file image must contain these zeros as well.
+                // Startup copies file_size bytes for each thread. Include any
+                // trailing .tdata padding so those bytes also start at zero.
                 segment.file_size = segment.mem_size;
             }
         }
@@ -81,13 +101,18 @@ impl TlsSegment {
         Ok(tls)
     }
 
+    /// Use x86-64 variant II: TP follows the block rounded up to its alignment.
+    ///
+    /// The offset is `address - vaddr - aligned_mem_size`, so an address inside
+    /// the block gives a negative value. A missing weak symbol keeps address zero
+    /// in this formula.
     pub(crate) fn tpoff(&self, address: u64) -> Result<i64> {
         let size = self
             .mem_size
             .checked_next_multiple_of(self.align)
             .context("aligned TLS size exceeds u64")?;
-        // x86-64 TLS variant II: TP follows the aligned static TLS block.
-        // An undefined weak TLS symbol keeps S = 0 in this calculation.
+        // TP sits after the aligned block, so symbols inside it have negative
+        // offsets. A missing weak symbol uses address zero in the same formula.
         i64::try_from(i128::from(address) - i128::from(self.vaddr) - i128::from(size))
             .context("TLS TP offset exceeds i64")
     }
@@ -95,6 +120,8 @@ impl TlsSegment {
 
 #[cfg(test)]
 mod tests {
+    //! Check negative TP offsets, block alignment, and signed range errors.
+
     use super::*;
 
     #[test]

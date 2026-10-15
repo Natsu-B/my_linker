@@ -1,5 +1,15 @@
-//! Stable text views of stage results. Rows follow input order, except symbol
-//! tables, which use name order so HashMap iteration cannot affect reports.
+//! Turn each stage's result into a stable text view.
+//!
+//! [`Phase`] chooses which views to show. Functions take stage results and
+//! [`Reporter`] file names and return text. Rows follow input or section order;
+//! named symbols sort by name so hash-map order cannot change the output.
+//!
+//! Relocation rows show the symbol address S, addend A, patch address P, and
+//! result, plus GOT, TLS, or stub values when needed. The views use our own
+//! format; GNU ld's trace option serves the same need to show input choices.
+//!
+//! References: ELF gABI "Sections", "Symbol Table", and "Program Header";
+//! AMD64 psABI §4.4.1; [GNU ld trace](https://sourceware.org/binutils/docs/ld/Options.html).
 
 use std::{fmt::Write, str::FromStr};
 
@@ -16,6 +26,7 @@ use crate::{
     synthetic::{GotEntry, SyntheticSections},
 };
 
+/// Choose a stage view separately from the log level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Phase {
     Inputs,
@@ -111,7 +122,6 @@ pub(super) fn mapping(mapping: &SectionMapping, report: &Reporter) -> String {
     let mut text = String::from("[mapping]\nOUTPUT <- FILE(SECTION)\n");
     for item in &mapping.items {
         if let MappedItem::Output(output) = item {
-            // Empty rules are absent from the placed image too.
             if output.statements.is_empty() {
                 continue;
             }
@@ -140,8 +150,8 @@ pub(super) fn mapping(mapping: &SectionMapping, report: &Reporter) -> String {
 }
 
 pub(super) fn got(synthetic: &SyntheticSections, symbols: &SymbolTable) -> Result<String> {
-    // At this stage the script has not assigned addresses. Name each input
-    // and its offset, making the reserved GOT/IPLT relationship explicit.
+    // Addresses wait for layout. Input names and offsets still let the reader
+    // follow each stub to its GOT slot and startup record.
     let mut text = String::from("[got]\nINPUT+OFFSET KIND SYMBOL CONTENTS\n");
     for (entry, offset) in synthetic.got.entries() {
         let (GotEntry::Address(id) | GotEntry::TpOff(id) | GotEntry::Ifunc(id)) = entry;
@@ -221,35 +231,6 @@ pub(super) fn layout(image: &LinkedImage) -> Result<String> {
     Ok(text)
 }
 
-/// Show signed quantities (addends, PC-relative and TP offsets) in hex like
-/// readelf does, e.g. `-0x4` rather than a huge two's-complement value.
-fn signed_hex(value: i128) -> String {
-    if value < 0 {
-        format!("-{:#x}", value.unsigned_abs())
-    } else {
-        format!("{value:#x}")
-    }
-}
-
-fn relocation_name(ty: X86_64RelocationType) -> &'static str {
-    use X86_64RelocationType::*;
-    match ty {
-        None => "R_X86_64_NONE",
-        R64 => "R_X86_64_64",
-        R32 => "R_X86_64_32",
-        R32S => "R_X86_64_32S",
-        Pc32 => "R_X86_64_PC32",
-        Plt32 => "R_X86_64_PLT32",
-        GotPcRel => "R_X86_64_GOTPCREL",
-        GotPcRelX => "R_X86_64_GOTPCRELX",
-        RexGotPcRelX => "R_X86_64_REX_GOTPCRELX",
-        GotTpOff => "R_X86_64_GOTTPOFF",
-        TpOff32 => "R_X86_64_TPOFF32",
-        TpOff64 => "R_X86_64_TPOFF64",
-        _ => unreachable!("only supported relocation types reach reporting"),
-    }
-}
-
 pub(super) fn relocations(
     image: &LinkedImage,
     relocations: &[AppliedRelocation],
@@ -285,4 +266,32 @@ pub(super) fn relocations(
         text.push('\n');
     }
     text
+}
+
+/// Show a negative addend or displacement as `-0x4`, not an unsigned bit pattern.
+fn signed_hex(value: i128) -> String {
+    if value < 0 {
+        format!("-{:#x}", value.unsigned_abs())
+    } else {
+        format!("{value:#x}")
+    }
+}
+
+fn relocation_name(ty: X86_64RelocationType) -> &'static str {
+    use X86_64RelocationType::*;
+    match ty {
+        None => "R_X86_64_NONE",
+        R64 => "R_X86_64_64",
+        R32 => "R_X86_64_32",
+        R32S => "R_X86_64_32S",
+        Pc32 => "R_X86_64_PC32",
+        Plt32 => "R_X86_64_PLT32",
+        GotPcRel => "R_X86_64_GOTPCREL",
+        GotPcRelX => "R_X86_64_GOTPCRELX",
+        RexGotPcRelX => "R_X86_64_REX_GOTPCRELX",
+        GotTpOff => "R_X86_64_GOTTPOFF",
+        TpOff32 => "R_X86_64_TPOFF32",
+        TpOff64 => "R_X86_64_TPOFF64",
+        _ => unreachable!("only supported relocation types reach reporting"),
+    }
 }

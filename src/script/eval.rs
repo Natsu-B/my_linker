@@ -1,25 +1,45 @@
+//! Compute script expressions from the layout facts known so far.
+//!
+//! [`evaluate`] takes an [`Expr`] and [`EvalContext`], then returns a 64-bit
+//! unsigned value or an error with its line and column. [`Context`] holds `.`,
+//! known symbol values, header size, and alignments. Like GNU ld, arithmetic
+//! wraps at 64 bits, and a conditional evaluates only the chosen branch.
+//!
+//! SIZEOF_HEADERS includes the ELF and program headers. The supported static
+//! subset uses 4 KiB page constants, the default SEGMENT_START address, and no
+//! RELRO padding. Layout checks address ranges after expression math.
+//!
+//! References: [GNU ld expressions](https://sourceware.org/binutils/docs/ld/Expressions.html)
+//! and [built-ins](https://sourceware.org/binutils/docs/ld/Builtin-Functions.html);
+//! ELF gABI "Program Header".
+
 use std::collections::HashMap;
 
 use anyhow::{Result, bail, ensure};
 
 use super::ast::*;
 
+/// Values known in one layout pass; only earlier script values are available.
+#[derive(Debug)]
+pub(crate) struct Context {
+    /// The location counter: the virtual address where the next bytes go.
+    pub(crate) dot: u64,
+    pub(crate) symbols: HashMap<String, u64>,
+    /// ELF header plus the current guess at program-header bytes.
+    pub(crate) sizeof_headers: u64,
+    pub(crate) max_page_size: u64,
+    pub(crate) common_page_size: u64,
+    /// Alignment of the next output section with contents.
+    pub(crate) next_section_alignment: u64,
+}
+
+/// Supply layout facts to expressions without making evaluation depend on the placer.
 pub(crate) trait EvalContext {
     fn dot(&self) -> u64;
     fn symbol(&self, name: &str) -> Option<u64>;
     fn sizeof_headers(&self) -> u64;
     fn constant(&self, constant: Constant) -> u64;
     fn next_section_alignment(&self) -> u64;
-}
-
-#[derive(Debug)]
-pub(crate) struct Context {
-    pub(crate) dot: u64,
-    pub(crate) symbols: HashMap<String, u64>,
-    pub(crate) sizeof_headers: u64,
-    pub(crate) max_page_size: u64,
-    pub(crate) common_page_size: u64,
-    pub(crate) next_section_alignment: u64,
 }
 
 impl Default for Context {
@@ -56,6 +76,10 @@ impl EvalContext for Context {
     }
 }
 
+/// Use 64-bit unsigned math, as GNU ld does, and report errors at the expression.
+///
+/// Only evaluate the chosen branch of a conditional. A missing symbol, zero
+/// divisor, or bad alignment causes an error instead of a guessed value.
 pub(crate) fn evaluate(expr: &Expr, context: &impl EvalContext) -> Result<u64> {
     let location = expr.location;
     let eval = |value: &Expr| evaluate(value, context);
@@ -78,7 +102,8 @@ pub(crate) fn evaluate(expr: &Expr, context: &impl EvalContext) -> Result<u64> {
         ExprKind::Binary(op, left, right) => {
             let left = eval(left)?;
             let right = eval(right)?;
-            // GNU ld expressions use unsigned 64-bit, wrapping arithmetic.
+            // GNU ld wraps unsigned expression math; layout checks the final
+            // address range when it places sections.
             match op {
                 BinaryOp::Add => left.wrapping_add(right),
                 BinaryOp::Subtract => left.wrapping_sub(right),
@@ -126,8 +151,8 @@ pub(crate) fn evaluate(expr: &Expr, context: &impl EvalContext) -> Result<u64> {
             Function::AlignOf => context.next_section_alignment(),
             Function::DataSegmentAlign => {
                 let max = eval(&args[0])?;
-                // The static subset uses ALIGN(max) + (. & (max - 1));
-                // the common-page-size argument does not affect this value.
+                // Keep the old offset within a max-sized page. This static
+                // subset does not use ld's common-page-size optimization.
                 align(context.dot(), max, location)?.wrapping_add(context.dot() & (max - 1))
             }
             Function::DataSegmentRelroEnd => eval(&args[1])?,
@@ -149,6 +174,8 @@ fn align(value: u64, alignment: u64, location: Location) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    //! Check GNU expression rules and errors with their source positions.
+
     use super::*;
     use crate::script::parser::parse_expression;
 

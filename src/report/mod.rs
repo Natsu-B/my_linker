@@ -1,5 +1,15 @@
-//! Observe stage results without changing the link. Traces go to stderr;
-//! maps retain archive provenance and the final section and symbol addresses.
+//! Show stage results and write an optional link map.
+//!
+//! [`Reporter`] takes [`Options`] and borrows each stage's result. It keeps file
+//! names and archive reasons so [`trace`] and [`map`] can explain where bytes and
+//! symbols came from. Traces go to stderr; the map goes to the chosen file.
+//!
+//! Like GNU ld's map, the archive list names the member, the file that needed
+//! it, and the missing symbol. Other rows show ELF sections, segment flags,
+//! and relocation values. We collect per-relocation details only for a trace.
+//!
+//! References: [GNU ld map and trace options](https://sourceware.org/binutils/docs/ld/Options.html);
+//! ELF gABI "Sections", "Symbol Table", and "Program Header"; AMD64 psABI §4.4.1.
 
 mod map;
 mod trace;
@@ -19,6 +29,7 @@ use crate::{
 };
 use trace::Phase;
 
+/// Choose trace stages and a map path without changing which inputs enter the link.
 #[derive(Args, Debug)]
 pub(crate) struct Options {
     /// Trace stages: inputs, archive, symbols, mapping, got, layout, relocations
@@ -34,6 +45,7 @@ pub(crate) struct Options {
     map: Option<PathBuf>,
 }
 
+/// Keep file names and archive reasons long enough to explain the final image.
 pub(crate) struct Reporter {
     options: Options,
     files: HashMap<FileId, String>,
@@ -49,25 +61,11 @@ impl Reporter {
         }
     }
 
-    fn file_name(&self, id: FileId) -> &str {
-        self.files
-            .get(&id)
-            .map(String::as_str)
-            .unwrap_or("<unknown>")
-    }
-
-    fn emit(&self, phase: Phase, render: impl FnOnce() -> Result<String>) -> Result<()> {
-        if self.options.trace.contains(&phase) {
-            use std::io::Write;
-            std::io::stderr().lock().write_all(render()?.as_bytes())?;
-        }
-        Ok(())
-    }
-
     pub(crate) fn inputs(&self, inputs: &LoadedInputs) -> Result<()> {
         self.emit(Phase::Inputs, || Ok(trace::inputs(inputs)))
     }
 
+    /// Keep object names and, if a map needs them, the reasons for pulling members.
     pub(crate) fn archive(&mut self, objects: &ExtractedObjects) -> Result<()> {
         for object in &objects.files {
             self.files.insert(object.file_id, object.file_name.clone());
@@ -98,7 +96,7 @@ impl Reporter {
         self.emit(Phase::Layout, || trace::layout(image))
     }
 
-    /// None disables collection; an empty list requests every relocation.
+    /// `None` skips patch records; an empty list records all; names filter exact matches.
     pub(crate) fn relocation_symbols(&self) -> Option<&[String]> {
         self.options
             .trace
@@ -116,10 +114,26 @@ impl Reporter {
         })
     }
 
+    /// Write the optional map after addresses are final, with context on file errors.
     pub(crate) fn write_map(&self, image: &LinkedImage) -> Result<()> {
         if let Some(path) = &self.options.map {
             std::fs::write(path, map::render(image, self))
                 .with_context(|| format!("failed to write link map: {}", path.display()))?;
+        }
+        Ok(())
+    }
+
+    fn file_name(&self, id: FileId) -> &str {
+        self.files
+            .get(&id)
+            .map(String::as_str)
+            .unwrap_or("<unknown>")
+    }
+
+    fn emit(&self, phase: Phase, render: impl FnOnce() -> Result<String>) -> Result<()> {
+        if self.options.trace.contains(&phase) {
+            use std::io::Write;
+            std::io::stderr().lock().write_all(render()?.as_bytes())?;
         }
         Ok(())
     }

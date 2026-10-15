@@ -1,3 +1,18 @@
+//! Pull archive members that define needed symbols.
+//!
+//! [`extract_archive_members`] takes [`LoadedInputs`] and the entry name. It
+//! returns [`ExtractedObjects`] and [`ArchiveExtraction`] reasons. A strong
+//! undefined reference requires a definition. A weak reference is optional, so
+//! it does not pull a member. ENTRY supplies the first required name.
+//!
+//! Like GNU ld/BFD, we visit each archive at its input position and scan the
+//! armap from start to end. A member can add new references. Later armap entries
+//! can meet them in that pass; earlier entries wait for the next pass. We stop
+//! after a pass pulls nothing and do not revisit an earlier archive.
+//!
+//! References: ELF gABI "Symbol Binding";
+//! [GNU ld archive search](https://sourceware.org/binutils/docs/ld/Options.html).
+
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
@@ -7,61 +22,25 @@ use crate::input::{
     object::{self, ObjectFile},
 };
 
-fn update_symbol_sets(
-    object: &ObjectFile<'_>,
-    defined: &mut HashSet<String>,
-    unresolved: &mut HashMap<String, Option<FileId>>,
-) {
-    for symbol in &object.symbols {
-        if symbol.name.is_empty() {
-            continue;
-        }
-
-        if matches!(
-            symbol.info.get_enum(elf::Elf64SymbolInfo::st_type),
-            Some(elf::Elf64SymbolType::STT_FILE | elf::Elf64SymbolType::STT_SECTION)
-        ) {
-            continue;
-        }
-
-        match symbol.section_idx {
-            elf::Elf64SymbolSectionIdx::Undefined => {
-                if symbol.info.get_enum(elf::Elf64SymbolInfo::st_bind)
-                    == Some(elf::Elf64SymbolBinding::STB_GLOBAL)
-                    && !defined.contains(symbol.name)
-                {
-                    unresolved
-                        .entry(symbol.name.to_string())
-                        .or_insert(Some(object.file_id));
-                }
-            }
-            _ => {
-                if matches!(
-                    symbol.info.get_enum(elf::Elf64SymbolInfo::st_bind),
-                    Some(elf::Elf64SymbolBinding::STB_GLOBAL | elf::Elf64SymbolBinding::STB_WEAK)
-                ) {
-                    defined.insert(symbol.name.to_string());
-                    unresolved.remove(symbol.name);
-                }
-            }
-        }
-    }
-}
-
-/// Why a member entered the link, in armap extraction order.
-#[derive(Clone)]
-pub(crate) struct ArchiveExtraction {
-    pub(crate) member: String,
-    pub(crate) symbol: String,
-    // ENTRY can request a member without a referencing object.
-    pub(crate) referencer: Option<FileId>,
-}
-
+/// Objects in link order and the reasons for pulling archive members.
 pub(crate) struct ExtractedObjects<'a> {
     pub(crate) files: Vec<ObjectFile<'a>>,
     pub(crate) extractions: Vec<ArchiveExtraction>,
 }
 
+/// Explain which missing symbol caused one archive member to enter the link.
+#[derive(Clone)]
+pub(crate) struct ArchiveExtraction {
+    pub(crate) member: String,
+    pub(crate) symbol: String,
+    /// First object that needed this symbol, or `None` for ENTRY.
+    pub(crate) referencer: Option<FileId>,
+}
+
+/// Scan each archive in full armap passes until a pass pulls no members.
+///
+/// Strong undefined names, including ENTRY, pull members. Weak names do not.
+/// Finish this archive before moving to the next input; do not revisit it later.
 pub(crate) fn extract_archive_members<'a>(
     inputs: LoadedInputs<'a>,
     entry_name: &str,
@@ -69,7 +48,7 @@ pub(crate) fn extract_archive_members<'a>(
     let mut files = Vec::new();
     let mut extractions = Vec::new();
     let mut defined = HashSet::new();
-    // ENTRY is an archive extraction root, like GNU ld's -u option.
+    // ENTRY must find a definition even before an input refers to it.
     let mut unresolved = HashMap::from([(entry_name.to_string(), None)]);
     for input in inputs.files {
         match input {
@@ -78,9 +57,8 @@ pub(crate) fn extract_archive_members<'a>(
                 files.push(object);
             }
             InputFile::Archive(mut archive) => {
-                // BFD scans the armap in full passes. New references can pull
-                // later entries during this pass; earlier entries must wait
-                // until the next pass. Undefined weak references never extract.
+                // BFD finishes each armap pass before restarting. New names
+                // can pull later entries here; earlier entries wait a pass.
                 loop {
                     let mut loaded = false;
                     for entry in &archive.entries {
@@ -119,8 +97,53 @@ pub(crate) fn extract_archive_members<'a>(
     Ok(ExtractedObjects { files, extractions })
 }
 
+fn update_symbol_sets(
+    object: &ObjectFile<'_>,
+    defined: &mut HashSet<String>,
+    unresolved: &mut HashMap<String, Option<FileId>>,
+) {
+    for symbol in &object.symbols {
+        if symbol.name.is_empty() {
+            continue;
+        }
+
+        if matches!(
+            symbol.info.get_enum(elf::Elf64SymbolInfo::st_type),
+            Some(elf::Elf64SymbolType::STT_FILE | elf::Elf64SymbolType::STT_SECTION)
+        ) {
+            continue;
+        }
+
+        match symbol.section_idx {
+            elf::Elf64SymbolSectionIdx::Undefined => {
+                // A weak reference is optional and may stay zero. Only a
+                // strong reference can require an archive member's bytes.
+                if symbol.info.get_enum(elf::Elf64SymbolInfo::st_bind)
+                    == Some(elf::Elf64SymbolBinding::STB_GLOBAL)
+                    && !defined.contains(symbol.name)
+                {
+                    unresolved
+                        .entry(symbol.name.to_string())
+                        .or_insert(Some(object.file_id));
+                }
+            }
+            _ => {
+                if matches!(
+                    symbol.info.get_enum(elf::Elf64SymbolInfo::st_bind),
+                    Some(elf::Elf64SymbolBinding::STB_GLOBAL | elf::Elf64SymbolBinding::STB_WEAK)
+                ) {
+                    defined.insert(symbol.name.to_string());
+                    unresolved.remove(symbol.name);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    //! Check armap pass order and why strong names pull members but weak names do not.
+
     use super::*;
     use crate::test_utils::{TestSymbol, build_rel_object};
     use elf::{Elf64SymbolBinding, Elf64SymbolType};
@@ -180,7 +203,7 @@ mod tests {
             &[],
         );
         let late = build_rel_object(&[symbol("late", Global, 2)], &[]);
-        // Physical member order deliberately differs from the armap order.
+        // Make file order differ from armap order so the test can tell them apart.
         let members = [
             ("late.o/", late.as_slice()),
             ("early.o/", early.as_slice()),
@@ -258,7 +281,7 @@ mod tests {
             if binding == Weak {
                 assert_eq!(names, ["root.o"]);
             } else {
-                // Multiple armap entries must never load a member twice.
+                // Several armap names may point to this same member.
                 assert_eq!(names, ["root.o", "libtest.a(optional.o)"]);
             }
         }

@@ -1,3 +1,17 @@
+//! Give each needed symbol a slot in the Global Offset Table (GOT).
+//!
+//! [`Got::collect`] takes kept relocations and chosen definitions and returns a
+//! [`Got`] plan. [`GotEntry`] says what a slot will hold: a symbol address, a TLS
+//! offset from the thread pointer, or an IFUNC result set by startup.
+//!
+//! We key slots by [`SymbolId`] and purpose. References to one global share a
+//! slot; equally named local symbols in different files do not. GOTPCRELX can
+//! allow instruction rewrites, but its ordinary GOT formula still works without
+//! them. We leave those instructions as they are.
+//!
+//! References: AMD64 psABI §4.4.1, §5.2 (Global Offset Table), and appendix B.2.
+//! GNU static IFUNC startup fills the result slots.
+
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
@@ -12,17 +26,20 @@ use super::SyntheticSection;
 
 const ENTRY_SIZE: u64 = 8;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum GotEntry {
-    Address(SymbolId),
-    TpOff(SymbolId),
-    Ifunc(SymbolId),
-}
-
+/// Assign eight-byte slots in first-reference order, sharing equal symbol-and-purpose keys.
 #[derive(Default)]
 pub(crate) struct Got {
     entries: Vec<GotEntry>,
     offsets: HashMap<GotEntry, u64>,
+}
+
+/// The same symbol may need distinct slots for an address and a TLS offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum GotEntry {
+    Address(SymbolId),
+    TpOff(SymbolId),
+    /// Leave zero until startup calls the resolver and writes the result.
+    Ifunc(SymbolId),
 }
 
 impl Got {
@@ -36,6 +53,7 @@ impl Got {
         )
     }
 
+    /// Read kept relocations, check their symbol types, and assign GOT slots.
     pub(crate) fn collect(relocations: &[ObjectRelocation], symbols: &SymbolTable) -> Result<Self> {
         let mut got = Self::default();
         for relocation in relocations {
@@ -72,6 +90,7 @@ impl Got {
         }
     }
 
+    /// Visit slots with byte offsets in the order they were first needed.
     pub(crate) fn entries(&self) -> impl Iterator<Item = (GotEntry, u64)> + '_ {
         self.entries
             .iter()
@@ -86,6 +105,7 @@ impl Got {
             .context("missing GOT entry for resolved symbol")
     }
 
+    /// Reserve bytes here; fill slot values only after layout knows addresses.
     pub(crate) fn section(&self) -> InputSection<'static> {
         SyntheticSection::Got.section(self.entries.len() as u64 * ENTRY_SIZE)
     }
@@ -93,6 +113,8 @@ impl Got {
 
 #[cfg(test)]
 mod tests {
+    //! Check which references share slots and which need distinct TLS or IFUNC slots.
+
     use super::*;
     use crate::{
         input::{FileId, object},

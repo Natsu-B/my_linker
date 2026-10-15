@@ -1,5 +1,11 @@
-//! Command-line interface. GNU ld spells some long options with one dash
-//! (`-Map`), which clap does not accept, so those are rewritten first.
+//! Read command-line options for the link.
+//!
+//! [`parse`] turns process arguments into [`Args`]: input paths in search order,
+//! an output path, an optional script, and [`report::Options`].
+//! GNU ld accepts `-Map` with one dash. We change that spelling for clap before
+//! parsing; `--` still ends option parsing.
+//!
+//! Reference: [GNU ld options](https://sourceware.org/binutils/docs/ld/Options.html).
 
 use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
@@ -7,7 +13,11 @@ use clap::Parser;
 
 use crate::report;
 
+/// Input order matters: an archive cannot meet a reference from a later object.
+///
+/// Keep clap's command description empty so Rust docs do not change CLI help.
 #[derive(Parser, Debug)]
+#[command(about = None, long_about = None)]
 pub(crate) struct Args {
     #[command(flatten)]
     pub(crate) report: report::Options,
@@ -29,13 +39,11 @@ pub(crate) struct Args {
     pub(crate) debug: u8,
 }
 
-/// Parse the process arguments, accepting GNU ld's `-Map` spellings.
+/// Read process arguments; clap prints help or errors and exits when needed.
 pub(crate) fn parse() -> Args {
     Args::parse_from(gnu_style_arguments())
 }
 
-/// Clap accepts GNU long options with two dashes. Translate ld's spelling
-/// before parsing, preserving non-UTF-8 paths and the `--` positional boundary.
 fn gnu_style_arguments() -> Vec<OsString> {
     let mut positional = false;
     std::env::args_os()

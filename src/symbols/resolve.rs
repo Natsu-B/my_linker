@@ -1,3 +1,18 @@
+//! Pick one definition for each global name before addresses exist.
+//!
+//! [`resolve`] takes a [`SectionMapping`] and returns a [`SymbolTable`].
+//! References to one global share a [`SymbolId`]; local symbols stay tied to
+//! their input file. A strong definition beats a weak one. Two strong definitions
+//! or a missing strong definition cause an error; a missing weak one gets zero.
+//!
+//! GNU ld's PROVIDE defines a script name only if an input refers to it and no
+//! input or plain script assignment defines it. PROVIDE_HIDDEN makes that symbol
+//! local in static output. This linker rejects COMMON storage.
+//!
+//! References: ELF gABI "Symbol Binding", "Symbol Type", and "Symbol Value";
+//! AMD64 psABI §4.3; GNU ld [`PROVIDE`](https://sourceware.org/binutils/docs/ld/PROVIDE.html)
+//! and PROVIDE_HIDDEN.
+
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Result, bail, ensure};
@@ -12,10 +27,16 @@ use crate::{
     },
 };
 
+/// Pick definitions from the mapped inputs and script assignments, before layout.
 pub(crate) fn resolve(mapping: &SectionMapping) -> Result<SymbolTable> {
     resolve_inputs(&mapping.symbols, &mapping.assignments())
 }
 
+/// Give each global name one definition and keep local symbols separate.
+///
+/// Strong definitions beat weak ones. Reject duplicate strong definitions and
+/// missing strong references. Pick needed PROVIDE assignments here; layout will
+/// compute their values. Missing weak symbols get a definition whose value is zero.
 pub(crate) fn resolve_inputs(
     symbols: &[ObjectSymbol],
     assignments: &[&Assignment],
@@ -58,7 +79,7 @@ pub(crate) fn resolve_inputs(
         }
     }
 
-    // Insert winners in input order so symbol identities are deterministic.
+    // Keep input order so each chosen definition gets a repeatable SymbolId.
     for symbol in symbols {
         if definitions
             .get(symbol.name)
@@ -68,8 +89,8 @@ pub(crate) fn resolve_inputs(
             table.by_name.insert(symbol.name.to_string(), id);
         }
     }
-    // Unconditional script definitions always win over PROVIDE, including a
-    // PROVIDE that appears earlier in the script. Input duplicates are errors.
+    // Like GNU ld, a plain script definition beats PROVIDE even if PROVIDE
+    // appears first. Pick plain definitions before testing PROVIDE's rule.
     for assignment in assignments {
         if assignment.name == "." || assignment.kind != AssignmentKind::Define {
             continue;
@@ -97,8 +118,8 @@ pub(crate) fn resolve_inputs(
             && references.contains(assignment.name.as_str())
             && !table.by_name.contains_key(&assignment.name)
         {
-            // Static output has no dynamic lookup for hidden script symbols.
-            // Like GNU ld, publish them as local symbols in .symtab.
+            // There is no dynamic lookup in this static image. Like GNU ld,
+            // write hidden script symbols as locals in .symtab.
             let binding = if assignment.kind == AssignmentKind::ProvideHidden {
                 Elf64SymbolBinding::STB_LOCAL
             } else {
@@ -117,8 +138,8 @@ pub(crate) fn resolve_inputs(
             table.by_name.insert(assignment.name.clone(), id);
         }
     }
-    // Check strong references before the loop below registers undefined weak
-    // symbols; otherwise an earlier weak reference would hide a strong one.
+    // Check missing strong names before adding weak-zero entries. Otherwise
+    // a weak entry could mask a strong reference that needs an error.
     for symbol in symbols {
         if !symbol.name.is_empty()
             && symbol.section_idx == Elf64SymbolSectionIdx::Undefined
@@ -157,7 +178,7 @@ pub(crate) fn resolve_inputs(
                 );
             }
         } else if symbol.section_idx == Elf64SymbolSectionIdx::Undefined {
-            // The null symbol (index zero) denotes the absolute value zero.
+            // ELF's null symbol supplies zero without a defining section.
             table.insert(
                 "",
                 None,
@@ -207,6 +228,8 @@ fn insert_input(table: &mut SymbolTable, symbol: &ObjectSymbol) -> Result<Symbol
 
 #[cfg(test)]
 mod tests {
+    //! Check strong/weak choices, PROVIDE rules, and missing weak values.
+
     use super::*;
     use crate::{
         input::FileId,

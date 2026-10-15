@@ -1,3 +1,18 @@
+//! Read ELF64 headers and tables while borrowing names and data.
+//!
+//! [`Elf64::new`] takes file bytes and checks the header and table ranges.
+//! [`Elf64Section`] opens symbol and RELA tables when asked; names and data
+//! borrow the input slice. The file's byte-order tag tells each getter how
+//! to read its multi-byte fields.
+//!
+//! An archive can place ELF records on a two-byte boundary, short of Rust's
+//! alignment needs. We copy raw records with unaligned reads rather than borrow
+//! them as structs. This reader accepts x86-64 and AArch64 headers; the linker
+//! checks its stricter target rules when it reads an input object.
+//!
+//! References: ELF gABI "ELF Header", "Sections", "String Table", "Symbol Table",
+//! "Relocation", and "Program Header"; AMD64 psABI §§4.1–4.4 and 5.1.
+
 use anyhow::{Context, Result, bail, ensure};
 use core::{mem::size_of, ptr};
 
@@ -8,6 +23,7 @@ use crate::abi::{
     ElfProgramHeaderType, SHN_ABS, SHN_COMMON, SHN_UNDEF,
 };
 
+/// Borrow the file bytes and decode fields using the byte order in its header.
 pub struct Elf64<'a> {
     data: &'a [u8],
     endian: ElfEndian,
@@ -19,6 +35,11 @@ impl<'a> Elf64<'a> {
         elf.get(0..4) == Some(&[0x7F, b'E', b'L', b'F'][..])
     }
 
+    /// Check the ELF64 header and top-level table ranges, borrowing the bytes.
+    ///
+    /// Read names and section contents only when asked. This checks the outer
+    /// format, not every symbol or relocation. The linker checks its target rules
+    /// separately; the reader accepts x86-64 and AArch64 and both byte orders.
     pub fn new(elf: &'a [u8]) -> Result<Self> {
         ensure!(elf.len() >= size_of::<Elf64Header>(), "File too short");
         ensure!(
@@ -155,6 +176,7 @@ impl<'a> Elf64<'a> {
         }
     }
 
+    /// Visit original section indices, including ELF's required null section.
     pub fn sections(&self) -> Elf64SectionIter<'_, 'a> {
         Elf64SectionIter {
             elf: self,
@@ -218,6 +240,7 @@ impl<'a> Elf64<'a> {
     }
 }
 
+/// Walk program headers in file order.
 pub struct Elf64ProgramHeaderIter<'elf, 'data> {
     elf: &'elf Elf64<'data>,
     ph_idx: u16,
@@ -237,6 +260,7 @@ impl<'elf, 'data> Iterator for Elf64ProgramHeaderIter<'elf, 'data> {
     }
 }
 
+/// Use the file's byte order to read one segment's range and flags.
 pub struct Elf64ProgramHeader<'elf, 'data> {
     elf: &'elf Elf64<'data>,
     header: RawElf64ProgramHeader,
@@ -263,23 +287,28 @@ impl<'elf, 'data> Elf64ProgramHeader<'elf, 'data> {
         self.header.p_paddr.read(self.elf.endian)
     }
 
+    /// Bytes stored in the file; a load can need more memory than this.
     pub fn file_size(&self) -> u64 {
         self.header.p_filesz.read(self.elf.endian)
     }
 
+    /// Total memory size, including any zero-filled tail.
     pub fn mem_size(&self) -> u64 {
         self.header.p_memsz.read(self.elf.endian)
     }
 
+    /// File offset and virtual address must match modulo this value.
     pub fn align(&self) -> u64 {
         self.header.p_align.read(self.elf.endian)
     }
 
+    /// Borrow the file prefix, or return `None` if its range lies outside the input.
     pub fn data(&self) -> Option<&'data [u8]> {
         self.elf.bytes_at(self.offset(), self.file_size())
     }
 }
 
+/// Walk section headers in index order, including section zero.
 pub struct Elf64SectionIter<'elf, 'data> {
     elf: &'elf Elf64<'data>,
     sh_idx: u16,
@@ -296,6 +325,7 @@ impl<'elf, 'data> Iterator for Elf64SectionIter<'elf, 'data> {
     }
 }
 
+/// Keep a section's original index and borrow its name and bytes from the file.
 pub struct Elf64Section<'elf, 'data> {
     elf: &'elf Elf64<'data>,
     header: Elf64SectionHeaderData,
@@ -303,6 +333,7 @@ pub struct Elf64Section<'elf, 'data> {
 }
 
 impl<'elf, 'data> Elf64Section<'elf, 'data> {
+    /// Follow the section-name table and check the name's offset and NUL terminator.
     pub fn name(&self) -> Result<&'data str> {
         let shstr_section = self
             .elf
@@ -327,10 +358,12 @@ impl<'elf, 'data> Elf64Section<'elf, 'data> {
         self.header.sh_flags.read(self.elf.endian)
     }
 
+    /// Required alignment; zero and one impose no constraint.
     pub fn align(&self) -> u64 {
         self.header.sh_addralign.read(self.elf.endian)
     }
 
+    /// NOBITS has no file data. Return `None` for it or an invalid file range.
     pub fn data(&self) -> Option<&'data [u8]> {
         if self.section_type() == Elf64SectionType::SHT_NOBITS {
             None
@@ -342,6 +375,7 @@ impl<'elf, 'data> Elf64Section<'elf, 'data> {
         }
     }
 
+    /// sh_addr is usually zero in ET_REL; output files can give a virtual address.
     pub fn address(&self) -> u64 {
         self.header.sh_addr.read(self.elf.endian)
     }
@@ -350,22 +384,27 @@ impl<'elf, 'data> Elf64Section<'elf, 'data> {
         self.header.sh_offset.read(self.elf.endian)
     }
 
+    /// Table index with a type-specific meaning, such as a symbol table's string table.
     pub fn link(&self) -> u32 {
         self.header.sh_link.read(self.elf.endian)
     }
 
+    /// Type-specific data, such as a RELA target or the first non-local symbol index.
     pub fn info(&self) -> u32 {
         self.header.sh_info.read(self.elf.endian)
     }
 
+    /// Bytes per fixed-size record, or zero for unstructured data.
     pub fn entry_size(&self) -> u64 {
         self.header.sh_entsize.read(self.elf.endian)
     }
 
+    /// Memory size for NOBITS, even though no bytes occupy the file.
     pub fn size(&self) -> u64 {
         self.header.sh_size.read(self.elf.endian)
     }
 
+    /// Require SYMTAB or DYNSYM with a size that fits whole ELF64 symbol records.
     pub fn symbols(&'elf self) -> Result<Elf64SymbolIter<'elf, 'data>> {
         ensure!(
             matches!(
@@ -385,6 +424,7 @@ impl<'elf, 'data> Elf64Section<'elf, 'data> {
         })
     }
 
+    /// Require RELA with a size that fits whole explicit-addend records.
     pub fn rela(&'elf self) -> Result<Elf64RelaIter<'elf, 'data>> {
         ensure!(
             self.section_type() == Elf64SectionType::SHT_RELA,
@@ -402,6 +442,7 @@ impl<'elf, 'data> Elf64Section<'elf, 'data> {
     }
 }
 
+/// Walk explicit-addend records in section order.
 pub struct Elf64RelaIter<'elf, 'data> {
     section: &'elf Elf64Section<'elf, 'data>,
     rela_idx: u16,
@@ -434,12 +475,14 @@ impl<'elf, 'data> Iterator for Elf64RelaIter<'elf, 'data> {
     }
 }
 
+/// Keep the containing relocation section so sh_info can name the patch target.
 pub struct Elf64Rela<'elf, 'data> {
     section: &'elf Elf64Section<'elf, 'data>,
     header: Elf64RelaTable,
 }
 
 impl<'elf, 'data> Elf64Rela<'elf, 'data> {
+    /// ET_REL uses a target-section offset; ET_EXEC uses a virtual address.
     pub fn offset(&self) -> u64 {
         self.header.r_offset.read(self.section.elf.endian)
     }
@@ -456,11 +499,13 @@ impl<'elf, 'data> Elf64Rela<'elf, 'data> {
         self.header.r_addend.read(self.section.elf.endian)
     }
 
+    /// Read the target section index from the containing RELA section's sh_info.
     pub fn target_idx(&self) -> u32 {
         self.section.header.sh_info.read(self.section.elf.endian)
     }
 }
 
+/// Walk symbol indices in file order, including the null symbol.
 pub struct Elf64SymbolIter<'elf, 'data> {
     section: &'elf Elf64Section<'elf, 'data>,
     sym_idx: u16,
@@ -493,12 +538,14 @@ impl<'elf, 'data> Iterator for Elf64SymbolIter<'elf, 'data> {
     }
 }
 
+/// Find a symbol's name through its table's sh_link string table.
 pub struct Elf64Symbol<'elf, 'data> {
     section: &'elf Elf64Section<'elf, 'data>,
     header: Elf64SymbolTable,
 }
 
 impl<'elf, 'data> Elf64Symbol<'elf, 'data> {
+    /// Follow the symbol table's linked string table and check the name's bounds.
     pub fn name(&self) -> Result<&'data str> {
         let strtab_section = self
             .section
@@ -512,6 +559,7 @@ impl<'elf, 'data> Elf64Symbol<'elf, 'data> {
         )
     }
 
+    /// Tell real defining sections from undefined, absolute, and COMMON values.
     pub fn section_idx(&self) -> Elf64SymbolSectionIdx {
         match self.header.st_shndx.read(self.section.elf.endian) {
             SHN_UNDEF => Elf64SymbolSectionIdx::Undefined,
@@ -521,6 +569,8 @@ impl<'elf, 'data> Elf64Symbol<'elf, 'data> {
         }
     }
 
+    /// ET_REL usually stores a section offset. ET_EXEC stores an address,
+    /// except TLS symbols, which store offsets within the TLS template.
     pub fn value(&self) -> u64 {
         self.header.st_value.read(self.section.elf.endian)
     }
@@ -529,6 +579,7 @@ impl<'elf, 'data> Elf64Symbol<'elf, 'data> {
         self.header.st_size.read(self.section.elf.endian)
     }
 
+    /// Keep raw st_other bits, including the low visibility bits.
     pub fn other(&self) -> u8 {
         self.header.st_other
     }
@@ -543,6 +594,9 @@ fn read_struct<T: Copy>(data: &[u8], offset: u64) -> Option<T> {
     let end = start.checked_add(size_of::<T>())?;
     let bytes = data.get(start..end)?;
     let ptr = bytes.as_ptr().cast::<T>();
+    // SAFETY: Every T used here holds integer fields that accept any bits.
+    // The slice covers all of T. Copy without alignment because ar members
+    // need only start at a two-byte boundary.
     Some(unsafe { ptr::read_unaligned(ptr) })
 }
 
@@ -571,6 +625,8 @@ fn read_c_string(data: &[u8], offset: u64) -> Result<&str> {
 
 #[cfg(test)]
 mod tests {
+    //! Check bad table ranges and valid headers at unaligned byte offsets.
+
     use crate::{
         Elf64, Elf64SectionType, Elf64SymbolBinding, Elf64SymbolInfo, Elf64SymbolSectionIdx,
         Elf64SymbolType, ElfEndian, ElfFileType, ElfMachineType, x86_64::X86_64RelocationType,

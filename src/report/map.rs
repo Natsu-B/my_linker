@@ -1,5 +1,13 @@
-//! Link maps preserve GNU ld's archive-reason preamble, followed by the
-//! allocated section contributions and final symbol values in address order.
+//! Show why archive members entered the link and where their bytes went.
+//!
+//! [`render`] takes a [`LinkedImage`] and [`Reporter`] and returns map text.
+//! The archive list uses GNU ld's member, requesting file, and symbol format.
+//! The body lists output sections and their input parts, then symbols sorted by
+//! address and name. TLS values here are template addresses, as used inside
+//! the linker; the ELF symbol table instead holds TLS offsets.
+//!
+//! References: [GNU ld map output](https://sourceware.org/binutils/docs/ld/Options.html);
+//! ELF gABI "Sections" and "Symbol Value".
 
 use std::fmt::Write;
 
@@ -7,27 +15,6 @@ use elf::Elf64SymbolType;
 
 use super::Reporter;
 use crate::layout::LinkedImage;
-
-fn archive_preamble(report: &Reporter) -> String {
-    let mut text =
-        String::from("Archive member included to satisfy reference by file (symbol)\n\n");
-    for extraction in &report.extractions {
-        write!(text, "{}", extraction.member).unwrap();
-        // GNU ld starts the referencer at column 30, wrapping long names.
-        if extraction.member.len() >= 30 {
-            text.push('\n');
-            text.push_str(&" ".repeat(30));
-        } else {
-            text.push_str(&" ".repeat(30 - extraction.member.len()));
-        }
-        if let Some(id) = extraction.referencer {
-            write!(text, "{} ", report.file_name(id)).unwrap();
-        }
-        writeln!(text, "({})", extraction.symbol).unwrap();
-    }
-    text.push('\n');
-    text
-}
 
 pub(super) fn render(image: &LinkedImage, report: &Reporter) -> String {
     let mut text = archive_preamble(report);
@@ -70,5 +57,27 @@ pub(super) fn render(image: &LinkedImage, report: &Reporter) -> String {
         )
         .unwrap();
     }
+    text
+}
+
+fn archive_preamble(report: &Reporter) -> String {
+    let mut text =
+        String::from("Archive member included to satisfy reference by file (symbol)\n\n");
+    for extraction in &report.extractions {
+        write!(text, "{}", extraction.member).unwrap();
+        // Match GNU ld: the requesting file starts in column 30; long member
+        // names force it onto the next line.
+        if extraction.member.len() >= 30 {
+            text.push('\n');
+            text.push_str(&" ".repeat(30));
+        } else {
+            text.push_str(&" ".repeat(30 - extraction.member.len()));
+        }
+        if let Some(id) = extraction.referencer {
+            write!(text, "{} ", report.file_name(id)).unwrap();
+        }
+        writeln!(text, "({})", extraction.symbol).unwrap();
+    }
+    text.push('\n');
     text
 }

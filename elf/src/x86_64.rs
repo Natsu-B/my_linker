@@ -1,20 +1,34 @@
+//! Name AMD64 relocation kinds and show their formulas.
+//!
+//! [`X86_64RelocationType`] turns a raw relocation number into an enum.
+//! Each variant gives the ELF name and formula. For example, R_X86_64_PC32
+//! stores `S + A - P`, the symbol value plus its addend minus the patch address.
+//!
+//! Knowing a relocation number does not mean the linker can apply it. The
+//! linker checks which kinds it supports before writing fields; the enum also
+//! names kinds that must cause an error.
+//!
+//! References: [AMD64 psABI] §4.4.1 and appendix B.2; ELF gABI "Relocation".
+//!
+//! [AMD64 psABI]: https://gitlab.com/x86-psABIs/x86-64-ABI
+
 use anyhow::{Result, anyhow};
 
 use crate::Elf64RelaInfo;
 
-/// Relocation numbers and calculations from the [AMD64 psABI, section 4.4.1].
+/// The [AMD64 psABI §4.4.1] names and formulas, including kinds the linker rejects.
 ///
-/// `S` is the symbol value, `A` the explicit addend, `P` the relocation place,
-/// `B` the load base, `GOT` the GOT address, `G` a symbol's GOT entry offset,
-/// `L` its PLT entry address, and `Z` its size. For TLS, `dtpoff(S)` is the
-/// offset within the defining module's TLS block and `tpoff(S)` the offset
-/// from the thread pointer. `resolve(address)` calls an IFUNC resolver.
+/// S is the symbol value, A the addend, and P the patch address. B is the
+/// load base; G is the symbol's slot offset from GOT; L is its PLT address;
+/// Z is its size. For TLS, dtpoff(S) measures from the module's TLS start,
+/// while tpoff(S) measures from the thread pointer. resolve(address) calls
+/// an IFUNC resolver and uses the function address it returns.
 ///
-/// [AMD64 psABI, section 4.4.1]: https://gitlab.com/x86-psABIs/x86-64-ABI/-/blob/master/x86-64-ABI/object-files.tex
+/// [AMD64 psABI §4.4.1]: https://gitlab.com/x86-psABIs/x86-64-ABI
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum X86_64RelocationType {
-    /// R_X86_64_NONE: no calculation or write.
+    /// R_X86_64_NONE: leave the target bytes alone.
     None = 0,
     /// R_X86_64_64: `S + A`.
     R64 = 1,
@@ -24,7 +38,7 @@ pub enum X86_64RelocationType {
     Got32 = 3,
     /// R_X86_64_PLT32: `L + A - P`.
     Plt32 = 4,
-    /// R_X86_64_COPY: runtime copy of symbol data; no arithmetic calculation.
+    /// R_X86_64_COPY: copy the symbol's bytes at runtime.
     Copy = 5,
     /// R_X86_64_GLOB_DAT: `S`.
     GlobDat = 6,
@@ -46,7 +60,7 @@ pub enum X86_64RelocationType {
     R8 = 14,
     /// R_X86_64_PC8: `S + A - P`.
     Pc8 = 15,
-    /// R_X86_64_DTPMOD64: the TLS module ID of the definition of `S`.
+    /// R_X86_64_DTPMOD64: ID of the TLS module that defines S.
     DtpMod64 = 16,
     /// R_X86_64_DTPOFF64: `dtpoff(S) + A`.
     DtpOff64 = 17,
@@ -74,15 +88,15 @@ pub enum X86_64RelocationType {
     Size64 = 33,
     /// R_X86_64_GOTPC32_TLSDESC: `G + GOT + A - P` for the TLS descriptor pair.
     GotPc32TlsDesc = 34,
-    /// R_X86_64_TLSDESC_CALL: a resolver call marker; no arithmetic calculation.
+    /// R_X86_64_TLSDESC_CALL: mark a resolver call; write no value.
     TlsDescCall = 35,
     /// R_X86_64_TLSDESC: a resolver/argument pair computing `tpoff(S) + A`.
     TlsDesc = 36,
     /// R_X86_64_IRELATIVE: `resolve(B + A)`.
     IRelative = 37,
-    /// R_X86_64_GOTPCRELX: `G + GOT + A - P` before optional relaxation.
+    /// R_X86_64_GOTPCRELX: `G + GOT + A - P`; the linker may rewrite the instruction.
     GotPcRelX = 41,
-    /// R_X86_64_REX_GOTPCRELX: `G + GOT + A - P` before optional relaxation.
+    /// R_X86_64_REX_GOTPCRELX: `G + GOT + A - P`; the linker may rewrite the instruction.
     RexGotPcRelX = 42,
 }
 

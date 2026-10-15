@@ -1,3 +1,17 @@
+//! Compute file offsets and write a little-endian x86-64 ELF executable.
+//!
+//! [`ExecElf64Writer`] takes [`LoadSegment`], [`ProgramHeader`], and [`Section`]
+//! records. It checks them and computes file offsets before
+//! [`ExecElf64Writer::write_into`] fills a buffer. [`SymbolTableBuilder`] adds
+//! the null symbol and puts local symbols before globals, as ELF requires.
+//!
+//! Section headers for loaded data point into load segments; other tables go
+//! after those bytes. Like GNU ld, each PT_LOAD file offset must match its
+//! virtual address modulo alignment. The kernel uses that rule to map pages.
+//!
+//! References: ELF gABI "ELF Header", "Sections", "String Table", "Symbol Table",
+//! and "Program Header"; AMD64 psABI §5.1.
+
 use anyhow::{Context, Result, ensure};
 use typestate::{RawReg, bitregs};
 
@@ -15,21 +29,26 @@ pub const SECTION_HEADER_SIZE: u64 = 64;
 pub const SYMBOL_ENTRY_SIZE: u64 = 24;
 const ELF_VERSION_CURRENT: u32 = 1;
 
+/// Set the image's sections and segments, then compute offsets before writing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecElf64Writer {
+    /// Only little-endian output passes validation.
     pub endian: ElfEndian,
+    /// Only x86-64 output passes validation.
     pub machine: ElfMachineType,
     pub entry: u64,
+    /// Ordinary loads after the optional header load.
     pub segments: Vec<LoadSegment>,
+    /// Headers such as TLS and GNU_STACK; add them before asking for file offsets.
     pub program_headers: Vec<ProgramHeader>,
+    /// The first load's byte prefix holds the ELF and program headers.
     pub header_segment: Option<LoadSegment>,
-    /// Sections in index order, excluding the implicit null section and the
-    /// automatically generated final .shstrtab. Empty means no section table.
+    /// Keep ELF index order, without section zero or the final .shstrtab;
+    /// the writer adds both. An empty list omits the section table.
     pub sections: Vec<Section>,
 }
 
-/// An allocated section describes bytes already present in a PT_LOAD.
-/// Non-allocated section data is appended after all load segments.
+/// Allocated data already lives in a load. Other data follows the load bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Section {
     pub name: String,
@@ -37,20 +56,26 @@ pub struct Section {
     pub flags: Elf64SectionFlags,
     pub address: u64,
     pub size: u64,
+    /// sh_link: a related table index, such as .strtab for .symtab.
     pub link: u32,
+    /// sh_info: type-specific data, such as the first non-local symbol index.
     pub info: u32,
     pub align: u64,
+    /// Bytes per fixed-size record, or zero for unstructured bytes.
     pub entry_size: u64,
+    /// Supply bytes only for non-allocated sections; allocated bytes come from loads.
     pub data: Option<Vec<u8>>,
 }
 
-/// One ELF64 symbol, with its final value and section index supplied by a caller.
+/// Set the final st_value and ELF section index before adding a symbol.
 pub struct Elf64SymbolEntry<'a> {
     pub name: &'a str,
     pub binding: Elf64SymbolBinding,
     pub ty: Elf64SymbolType,
     pub other: u8,
+    /// Final output index, or a special value such as SHN_ABS.
     pub section_index: u16,
+    /// Use a virtual address, absolute value, or TLS template offset as the type requires.
     pub value: u64,
     pub size: u64,
 }
@@ -69,8 +94,7 @@ impl Elf64SymbolEntry<'_> {
     }
 }
 
-/// Build a little-endian ELF64 .symtab and its associated .strtab.
-/// The caller selects symbols; this builder handles ELF ordering and encoding.
+/// Build little-endian .symtab and .strtab, adding null entries and sorting locals first.
 #[derive(Default)]
 pub struct SymbolTableBuilder<'a> {
     symbols: Vec<Elf64SymbolEntry<'a>>,
@@ -85,14 +109,17 @@ impl<'a> SymbolTableBuilder<'a> {
         self.symbols.push(symbol);
     }
 
-    /// Supply the section index at which the returned .strtab will be placed.
+    /// Supply the final .strtab section index so .symtab can link to it.
+    ///
+    /// ELF requires the null symbol first and all locals before globals. Stable
+    /// sorting keeps the caller's order within those two groups.
     pub fn build(mut self, strtab_index: u32) -> Result<[Section; 2]> {
         ensure!(
             strtab_index != u32::from(SHN_UNDEF),
             "symbol string table requires a section index"
         );
-        // Symbol zero is the null entry, and sh_info identifies the first
-        // non-local entry. Stable sorting preserves order within each group.
+        // ELF puts the null symbol first and uses sh_info to mark the first
+        // non-local symbol. Keep the caller's order within each group.
         self.symbols
             .sort_by_key(|symbol| symbol.binding != Elf64SymbolBinding::STB_LOCAL);
         let first_global = 1 + self
@@ -139,30 +166,38 @@ impl<'a> SymbolTableBuilder<'a> {
     }
 }
 
-/// Non-PT_LOAD program header that refers to bytes already placed by load segments.
+/// Describe an extra header such as PT_TLS that refers to an existing load's bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProgramHeader {
     pub segment_type: ElfProgramHeaderType,
     pub flags: Elf64ProgramHeaderFlags,
+    /// Set the file offset after all headers that affect load offsets are present.
     pub offset: u64,
     pub vaddr: u64,
     pub paddr: u64,
+    /// Zero for headers without file bytes, such as GNU_STACK.
     pub file_size: u64,
+    /// Can exceed file_size for a TLS zero-fill tail.
     pub mem_size: u64,
     pub align: u64,
 }
 
+/// Map data.len() file bytes and zero the rest up to mem_size.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoadSegment {
     pub flags: Elf64ProgramHeaderFlags,
     pub vaddr: u64,
     pub paddr: u64,
+    /// File offset and virtual address must match modulo this alignment.
     pub align: u64,
+    /// Include explicit zeros for gaps before later initialized bytes.
     pub data: Vec<u8>,
+    /// Memory size, at least as large as data.len().
     pub mem_size: u64,
 }
 
 bitregs! {
+    /// The load's execute, write, and read permissions apply to whole pages.
     pub struct Elf64ProgramHeaderFlags: u32 {
         pub executable@[0:0],
         pub writable@[1:1],
@@ -201,6 +236,7 @@ struct SegmentLayout {
 }
 
 impl ExecElf64Writer {
+    /// Start an empty little-endian x86-64 ET_EXEC image at the given entry address.
     pub fn new_x86_64_executable(entry: u64) -> Self {
         Self {
             endian: ElfEndian::Little,
@@ -213,16 +249,19 @@ impl ExecElf64Writer {
         }
     }
 
+    /// Add a load whose file offset the writer will choose from its address and alignment.
     pub fn add_load_segment(&mut self, seg: LoadSegment) {
         self.segments.push(seg);
     }
 
+    /// Add before asking for offsets: each extra header can move load bytes in the file.
     pub fn add_program_header(&mut self, header: ProgramHeader) {
         self.program_headers.push(header);
     }
 
-    /// Map the ELF headers in a separate read-only load segment.
-    /// Set `header_segment` directly to include additional bytes in this load.
+    /// Map the ELF headers in a read-only load at file offset zero.
+    ///
+    /// Set header_segment directly if this load also needs bytes after the headers.
     pub fn map_headers(&mut self, vaddr: u64, align: u64) {
         self.header_segment = Some(LoadSegment {
             flags: Elf64ProgramHeaderFlags::from_bits(PF_R),
@@ -322,7 +361,8 @@ impl ExecElf64Writer {
         if self.sections.is_empty() {
             return Ok(());
         }
-        // Extended section indices (SHN_XINDEX) are outside this writer's subset.
+        // This writer does not write extended indices (SHN_XINDEX), so keep
+        // section counts below the reserved range.
         ensure!(
             self.sections.len() + 2 < usize::from(SHN_LORESERVE),
             "too many section headers"
@@ -391,13 +431,15 @@ impl ExecElf64Writer {
         Ok(())
     }
 
+    /// Check the image and compute the size needed for loads, tables, and headers.
     pub fn file_size(&self) -> Result<u64> {
         Ok(self.layout()?.file_size)
     }
 
-    /// Translate an address in a PT_LOAD to its corresponding file offset.
-    /// Add all program headers first, since they affect segment file offsets.
-    /// An address in a zero-fill tail may correspond to an offset past EOF.
+    /// Find the file offset for an address in a load, after adding all headers.
+    ///
+    /// A zero-fill tail can map to a conceptual offset past EOF; no file bytes
+    /// exist there.
     pub fn file_offset(&self, vaddr: u64) -> Result<u64> {
         let layout = self.layout()?;
         let segment = layout
@@ -416,6 +458,10 @@ impl ExecElf64Writer {
             .context("file offset exceeds u64")
     }
 
+    /// Check the image and write it into a buffer large enough for file_size().
+    ///
+    /// Zero the used prefix before filling it so alignment gaps and reserved fields
+    /// do not keep bytes from the caller's buffer.
     pub fn write_into(&self, out: &mut [u8]) -> Result<()> {
         self.validate_writer()?;
         let layout = self.layout()?;
@@ -439,8 +485,8 @@ impl ExecElf64Writer {
 
         let file_size = usize::try_from(layout.file_size).context("layout file size too large")?;
         out[..file_size].fill(0);
-        // Header-segment data includes space for the headers. Write the actual
-        // ELF header and program header table over that reserved prefix below.
+        // The first load leaves room for headers. Copy its bytes before
+        // writing headers into that prefix, or the copy would erase them.
         if let Some(header) = &self.header_segment {
             out[..header.data.len()].copy_from_slice(&header.data);
         }
@@ -788,6 +834,8 @@ fn write_bytes(out: &mut [u8], offset: usize, bytes: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    //! Check ELF tables, zero-fill tails, and file-offset/address alignment.
+
     use crate::{
         Elf64, Elf64ProgramHeaderFlags, Elf64SectionFlags, Elf64SectionType, ElfFileType,
         ElfProgramHeaderType, PF_R, PF_W, PF_X, SHN_UNDEF,
@@ -832,7 +880,7 @@ mod tests {
             data: vec![0],
             mem_size: 1,
         });
-        // Only the symbol tables follow section zero; .strtab has index two.
+        // This image has no allocated sections, so .strtab follows null and .symtab.
         writer.sections.extend(builder.build(2).unwrap());
         let mut bytes = vec![0; writer.file_size().unwrap() as usize];
         writer.write_into(&mut bytes).unwrap();
@@ -935,8 +983,8 @@ mod tests {
         assert_eq!(sections[4].name().unwrap(), ".shstrtab");
         assert_eq!(load.file_size(), 3);
         assert_eq!(load.mem_size(), 0x100);
-        // Reject PROGBITS in a load's zero-fill tail, and inconsistent trailing
-        // section sizes, before touching an output buffer.
+        // A file-backed section cannot live in a zero-fill tail; bad sizes
+        // must also fail before the writer touches the buffer.
         writer.sections[1].section_type = Elf64SectionType::SHT_PROGBITS;
         assert!(
             writer

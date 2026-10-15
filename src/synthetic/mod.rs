@@ -1,3 +1,17 @@
+//! Plan sections the linker must make for symbol references.
+//!
+//! [`build`] takes the section mapping and chosen definitions and returns
+//! [`SyntheticSections`]. The GOT stores addresses or TLS offsets. The IPLT
+//! holds small call stubs for IFUNCs, whose startup resolver chooses the function
+//! to call. RELA inputs hold the records startup uses to fill those GOT slots.
+//!
+//! [`reserve_inputs`] gives these inputs names and IDs before script matching.
+//! [`SyntheticSection`] finds them by ID even if a script changes the output
+//! name. We set their sizes here and fill their bytes after layout. GNU static
+//! glibc startup expects this GOT, stub, and IRELATIVE arrangement.
+//!
+//! References: ELF gABI "Relocation" and "Sections"; AMD64 psABI §§4.4.1 and 5.2.
+
 mod got;
 mod iplt;
 
@@ -19,14 +33,34 @@ use crate::{
     symbols::SymbolTable,
 };
 
+/// Keep the sized inputs with the GOT and IFUNC plans that will fill their bytes.
 pub(crate) struct SyntheticSections<'a, 's> {
     pub(crate) mapping: SectionMapping<'a, 's>,
     pub(crate) got: Got,
     pub(crate) iplt: Iplt,
 }
 
-/// Reserve stable input identities and attributes before script mapping.
-/// Only sizes and contents change after resolution; script matching does not.
+/// Size the reserved inputs from the chosen definitions, without changing script matches.
+pub(crate) fn build<'a, 's>(
+    mut mapping: SectionMapping<'a, 's>,
+    symbols: &SymbolTable,
+) -> Result<SyntheticSections<'a, 's>> {
+    let got = Got::collect(&mapping.relocations, symbols)?;
+    let iplt = Iplt::new(&got);
+    for section in [got.section()].into_iter().chain(iplt.sections()) {
+        if let Some(input) = mapping.inputs.iter_mut().find(|input| {
+            input.section.file_id == FileId::LinkerGenerated && input.section.idx == section.idx
+        }) {
+            input.section = section;
+        }
+    }
+    Ok(SyntheticSections { mapping, got, iplt })
+}
+
+/// Give scripts the generated names before their sizes are known.
+///
+/// Only size and bytes may change after matching; file ID, section ID, and
+/// flags must stay fixed so later steps find the same inputs.
 pub(crate) fn reserve_inputs(
     inputs: &mut Vec<MappingInput>,
     symbols: &[ObjectSymbol],
@@ -53,26 +87,14 @@ pub(crate) fn reserve_inputs(
     }
 }
 
-pub(crate) fn build<'a, 's>(
-    mut mapping: SectionMapping<'a, 's>,
-    symbols: &SymbolTable,
-) -> Result<SyntheticSections<'a, 's>> {
-    let got = Got::collect(&mapping.relocations, symbols)?;
-    let iplt = Iplt::new(&got);
-    for section in [got.section()].into_iter().chain(iplt.sections()) {
-        if let Some(input) = mapping.inputs.iter_mut().find(|input| {
-            input.section.file_id == FileId::LinkerGenerated && input.section.idx == section.idx
-        }) {
-            input.section = section;
-        }
-    }
-    Ok(SyntheticSections { mapping, got, iplt })
-}
-
+/// Find linker-made inputs by ID even when a script changes their output names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SyntheticSection {
+    /// Slots for symbol addresses, thread offsets, and IFUNC results.
     Got = 0,
+    /// Small jumps through IFUNC result slots; direct function references share these addresses.
     Iplt = 1,
+    /// IRELATIVE records that tell startup which resolver fills each GOT slot.
     RelaIplt = 2,
 }
 
@@ -83,6 +105,7 @@ impl SyntheticSection {
         input.file_id == FileId::LinkerGenerated && input.idx == self as u16
     }
 
+    /// Make an input with fixed ID and flags, owning space for the requested byte count.
     pub(crate) fn section(self, size: u64) -> InputSection<'static> {
         let (name, align) = match self {
             Self::Got => (".got", 8),
@@ -116,6 +139,7 @@ impl SyntheticSection {
         }
     }
 
+    /// Find the input by ID; its output name may differ from its input name.
     pub(crate) fn location(self, index: &SectionIndex) -> Result<&SectionLocation> {
         index
             .get(&(FileId::LinkerGenerated, self as u16))
@@ -132,6 +156,7 @@ impl SyntheticSection {
             .context("synthetic input address exceeds u64")
     }
 
+    /// Patch bytes within this generated input, after layout sets its output offset.
     pub(crate) fn write(
         self,
         sections: &mut [OutputSection],

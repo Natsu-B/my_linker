@@ -1,3 +1,19 @@
+//! Choose which input sections belong to each output section.
+//!
+//! [`map_sections`] takes the script and extracted objects and returns a
+//! [`SectionMapping`]. [`MappingInput`] holds a candidate section;
+//! [`MappedItem`] lists the chosen sections and assignments in script order.
+//! Only kept sections keep their relocations.
+//!
+//! Like GNU ld, the first matching rule wins. We apply sorts and file exclusions,
+//! then place orphan sections: inputs no rule chose. We group orphans by name
+//! and memory flags. Linker-made inputs also need names here so scripts can
+//! match them before symbol resolution tells us their sizes.
+//!
+//! References: ELF gABI "Sections" and "Section Flags";
+//! GNU ld [input rules](https://sourceware.org/binutils/docs/ld/Input-Section.html)
+//! and [orphans](https://sourceware.org/binutils/docs/ld/Orphan-Sections.html).
+
 use std::{collections::HashSet, path::Path};
 
 use anyhow::{Result, ensure};
@@ -13,15 +29,19 @@ use crate::{
     synthetic,
 };
 
-/// Mapping preserves script order and retains only relocations in kept inputs.
+/// Script-ordered section choices; addresses wait until layout.
 pub(crate) struct SectionMapping<'a, 's> {
+    /// All candidates, including discarded inputs and linker-made placeholders.
     pub(crate) inputs: Vec<MappingInput<'a>>,
     pub(crate) items: Vec<MappedItem<'s>>,
+    /// Keep input symbols even when their sections are not placed.
     pub(crate) symbols: Vec<ObjectSymbol<'a>>,
+    /// Keep only records whose target input sections survived mapping.
     pub(crate) relocations: Vec<ObjectRelocation>,
 }
 
 impl SectionMapping<'_, '_> {
+    /// Read assignments in the same order that layout will reach them.
     pub(crate) fn assignments(&self) -> Vec<&Assignment> {
         let mut assignments = Vec::new();
         for item in &self.items {
@@ -40,6 +60,10 @@ impl SectionMapping<'_, '_> {
     }
 }
 
+/// Match extracted inputs to script rules and reserve names for linker-made inputs.
+///
+/// Keep relocations only for kept targets. Keep input indices, not addresses,
+/// so later steps can join symbols and patch sites after layout.
 pub(crate) fn map_sections<'a, 's>(
     script: &'s Script,
     objects: ExtractedObjects<'a>,
@@ -65,8 +89,8 @@ pub(crate) fn map_sections<'a, 's>(
         symbols.extend(object.symbols);
         relocations.extend(object.relocations);
     }
-    // Script patterns must see linker-generated inputs, even though their
-    // final sizes depend on the definitions chosen during symbol resolution.
+    // Scripts must match linker-made names before we know their sizes;
+    // the chosen symbol definitions will tell us how many slots to make.
     synthetic::reserve_inputs(&mut inputs, &symbols, &relocations);
     let items = map_inputs(script, &inputs)?;
     let mut kept = HashSet::new();
@@ -89,11 +113,13 @@ pub(crate) fn map_sections<'a, 's>(
     })
 }
 
+/// A candidate input section with the filename that script patterns match.
 pub(crate) struct MappingInput<'a> {
     pub(crate) file_name: String,
     pub(crate) section: InputSection<'a>,
 }
 
+/// Chosen inputs and script assignments for one output; its address is still an expression.
 pub(crate) struct MappedOutputSection<'s> {
     pub(crate) name: String,
     pub(crate) address: Option<&'s Expr>,
@@ -103,11 +129,13 @@ pub(crate) struct MappedOutputSection<'s> {
     pub(crate) orphan: bool,
 }
 
+/// Keep input indices mixed with assignments so layout runs them in script order.
 pub(crate) enum MappedStatement<'s> {
     Assignment(&'s Assignment),
     Input(usize),
 }
 
+/// Keep assignments between output sections, as well as the output sections themselves.
 pub(crate) enum MappedItem<'s> {
     Assignment(&'s Assignment),
     Output(MappedOutputSection<'s>),
@@ -126,6 +154,7 @@ impl MappedOutputSection<'_> {
         Elf64SectionFlags::from_bits(self.flags).get(Elf64SectionFlags::SHF_TLS) != 0
     }
 
+    /// Turn section WRITE/EXECINSTR flags into load W/X flags; every load is readable.
     pub(crate) fn permissions(&self) -> Elf64ProgramHeaderFlags {
         let flags = Elf64SectionFlags::from_bits(self.flags);
         Elf64ProgramHeaderFlags::from_bits(
@@ -141,6 +170,7 @@ impl MappedOutputSection<'_> {
         )
     }
 
+    /// A dot assignment can reserve memory even when no input has bytes.
     pub(crate) fn has_contents(&self, inputs: &[MappingInput]) -> bool {
         self.statements.iter().any(|statement| match statement {
             MappedStatement::Input(index) => inputs[*index].section.size != 0,
@@ -156,8 +186,7 @@ impl MappedOutputSection<'_> {
     }
 }
 
-// Archive display names are path/to/lib.a(member.o); file patterns match
-// the member name, while ordinary objects match their path basename.
+/// Match the object or member basename, not `path/lib.a(member.o)` as a whole.
 pub(crate) fn input_name(file_name: &str, file_id: FileId) -> &str {
     let name = if matches!(file_id, FileId::ArchiveMember { .. })
         && let Some((_, member)) = file_name.rsplit_once('(')
@@ -172,6 +201,7 @@ pub(crate) fn input_name(file_name: &str, file_id: FileId) -> &str {
         .unwrap_or(name)
 }
 
+/// Give each input to its first matching rule, then place unmatched allocated inputs as orphans.
 pub(crate) fn map_inputs<'s>(
     script: &'s Script,
     inputs: &[MappingInput],
@@ -235,8 +265,8 @@ pub(crate) fn map_inputs<'s>(
                             if output.info || output.name == "/DISCARD/" {
                                 continue;
                             }
-                            // Debug/comment sections at address zero do not participate
-                            // in the allocated address space or define layout symbols.
+                            // Non-allocated debug and comment sections must
+                            // not move dot or define memory-layout symbols.
                             if mapped.flags == 0
                                 && (matched_nonalloc
                                     || matches!(
@@ -259,7 +289,8 @@ pub(crate) fn map_inputs<'s>(
             continue;
         }
         let flags = input.section.flags.to_raw();
-        // Combine orphan fragments with the same name and attributes.
+        // Like GNU ld, group orphans with the same name. Keep different TLS,
+        // permission, and zero-fill needs apart when choosing that group.
         let existing = items.iter_mut().find_map(|item| match item {
             MappedItem::Output(output)
                 if output.orphan && output.name == input.section.name && output.flags == flags =>
@@ -280,8 +311,8 @@ pub(crate) fn map_inputs<'s>(
                 MappedItem::Output(output) => output.orphan_class(inputs) == class,
                 _ => false,
             };
-            // Prefer the related section name (rodata.cst32 follows .rodata),
-            // then fall back to the last output with the same memory attributes.
+            // Follow GNU ld's usual order: .rodata.cst32 goes near .rodata.
+            // With no related name, use the last output with the same flags.
             let related = items.iter().rposition(|item| {
                 let MappedItem::Output(output) = item else {
                     return false;
@@ -311,8 +342,8 @@ fn section_family(name: &str) -> &str {
 }
 
 fn orphan_class(flags: u64, nobits: bool) -> (Elf64SectionFlags, bool) {
-    // MERGE and STRINGS describe the contents, not their memory permissions.
-    // Keep TLS and zero-fill separate from ordinary initialized data.
+    // MERGE and STRINGS change entries, not load permissions. TLS and zero
+    // fill need distinct groups because the loader treats them differently.
     let flags = Elf64SectionFlags::from_bits(flags);
     let attributes = Elf64SectionFlags::new()
         .set(
@@ -411,12 +442,13 @@ fn select_patterns(
                 selected.extend(sorted);
             }
             SectionPattern::ExcludeFile(patterns) => exclusions.extend_from_slice(patterns),
-            // SHN_COMMON allocation is deferred; it is not an input section.
+            // COMMON asks for storage, not a section match. Accept the script
+            // keyword; resolution rejects inputs that need COMMON allocation.
             SectionPattern::Common => {}
         }
     }
-    // Multiple unsorted globs in one input rule are a union. Preserve the
-    // original object/section order rather than grouping matches by glob.
+    // GNU ld treats unsorted patterns as one set of matches. Keep input order
+    // across the set; pattern order must not group the sections.
     if !patterns
         .iter()
         .any(|pattern| matches!(pattern, SectionPattern::Sort(_, _)))
@@ -441,6 +473,8 @@ fn init_priority(name: &str) -> u32 {
         .and_then(|(_, suffix)| suffix.parse::<u32>().ok())
         .unwrap_or(65535);
     if name.starts_with(".ctors.") || name.starts_with(".dtors.") {
+        // Legacy section suffixes count down from 65535; .init_array suffixes
+        // use the priority itself. Convert both to the same sort key.
         65535u32.saturating_sub(priority)
     } else {
         priority
@@ -449,6 +483,8 @@ fn init_priority(name: &str) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    //! Check first-match rules, sort scope, file exclusions, and orphan order.
+
     use super::*;
     use crate::script::parser;
 
@@ -542,7 +578,7 @@ mod tests {
             "SECTIONS { .first : { *(.text EXCLUDE_FILE(last.o) .text) } .rest : { *(.text) } }",
         )
         .unwrap();
-        // An exclusion only affects the subsequent patterns in its list.
+        // An exclusion affects only later patterns in this list.
         let items = map_inputs(&script, &inputs).unwrap();
         let MappedItem::Output(first) = &items[0] else {
             panic!()

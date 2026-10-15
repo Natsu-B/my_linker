@@ -1,54 +1,22 @@
+//! Read archive members, names, and the symbol index.
+//!
+//! [`ArchiveReader`] borrows ar bytes and returns [`ArchiveMember`] views and
+//! [`ArchiveSymbol`] entries. [`MemberName`] tells short names, long-name table
+//! offsets, BSD inline names, and special members apart.
+//!
+//! The symbol index, or armap, stores big-endian words even when its ELF members
+//! use little-endian words. Members start on two-byte boundaries, so their ELF
+//! records may lack Rust's native alignment. We follow GNU ar's name and index
+//! formats and also accept BSD inline names.
+//!
+//! References: [GNU ar](https://sourceware.org/binutils/docs/binutils/ar.html);
+//! ELF gABI "ELF Header" applies to the bytes from [`ArchiveMember::object_bytes`].
+
 use std::{cell::OnceCell, mem::size_of};
 
 use anyhow::{Context, Result, bail, ensure};
 
-const AR_MAGIC: &[u8; 8] = b"!<arch>\n";
-const THIN_MAGIC: &[u8; 8] = b"!<thin>\n";
-pub(crate) const AR_FMAG: [u8; 2] = *b"`\n";
-const AR_NAME_OFFSET: usize = std::mem::offset_of!(ArchiveMemberHeader, ar_name);
-const AR_NAME_LEN: usize = size_of::<[u8; 16]>();
-const AR_SIZE_OFFSET: usize = std::mem::offset_of!(ArchiveMemberHeader, ar_size);
-const AR_SIZE_LEN: usize = size_of::<[u8; 10]>();
-const AR_FMAG_OFFSET: usize = std::mem::offset_of!(ArchiveMemberHeader, ar_fmag);
-const AR_FMAG_LEN: usize = size_of::<[u8; 2]>();
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct ArchiveMemberHeader {
-    ar_name: [u8; 16],
-    ar_date: [u8; 12],
-    ar_uid: [u8; 6],
-    ar_gid: [u8; 6],
-    ar_mode: [u8; 8],
-    ar_size: [u8; 10],
-    ar_fmag: [u8; 2],
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MemberName<'a> {
-    SymbolTable,
-    SymbolTable64,
-    LongNameTable,
-    Short(&'a str),
-    LongNameOffset(usize),
-    BsdExtended(usize),
-}
-
-#[derive(Debug, Clone, Copy)]
-struct MemberSlice {
-    offset: usize,
-    size: usize,
-}
-
-pub(crate) fn check_magic(data: &[u8]) -> bool {
-    data.starts_with(AR_MAGIC)
-}
-
-pub(crate) struct ArchiveSymbol<'a> {
-    pub(crate) name: &'a str,
-    pub(crate) member_offset: usize,
-}
-
+/// Borrow the ar bytes and cache where the long-name table lives.
 #[derive(Debug)]
 pub(crate) struct ArchiveReader<'a> {
     data: &'a [u8],
@@ -56,6 +24,7 @@ pub(crate) struct ArchiveReader<'a> {
 }
 
 impl<'a> ArchiveReader<'a> {
+    /// Check the magic. Thin archives refer to other files, so reject them here.
     pub(crate) fn new(data: &'a [u8]) -> Result<Self> {
         if data.starts_with(THIN_MAGIC) {
             bail!("thin archives are unsupported");
@@ -71,6 +40,7 @@ impl<'a> ArchiveReader<'a> {
         })
     }
 
+    /// Visit members in file order, including the armap and long-name table.
     pub(crate) fn iter(&self) -> ArchiveIter<'_, 'a> {
         ArchiveIter {
             reader: self,
@@ -78,10 +48,12 @@ impl<'a> ArchiveReader<'a> {
         }
     }
 
+    /// Visit object members without the armap and long-name table.
     pub(crate) fn object_members(&self) -> ArchiveObjectIter<'_, 'a> {
         ArchiveObjectIter { inner: self.iter() }
     }
 
+    /// Find and cache the optional name table; borrow its bytes from the archive.
     pub(crate) fn long_name_table(&self) -> Result<Option<&'a [u8]>> {
         if let Some(cached) = self.long_name_table.get() {
             return Ok((*cached).map(|slice| self.slice(slice)));
@@ -92,8 +64,9 @@ impl<'a> ArchiveReader<'a> {
         Ok(found.map(|slice| self.slice(slice)))
     }
 
-    /// The GNU/SysV armap stores a big-endian count, member-header offsets,
-    /// and NUL-terminated names. Preserve its order, including duplicate names.
+    /// Read the armap in its stored order, including duplicate names.
+    ///
+    /// Its count and member offsets use big-endian words regardless of ELF byte order.
     pub(crate) fn symbol_table(&self) -> Result<Option<Vec<ArchiveSymbol<'a>>>> {
         for member in self.iter() {
             let member = member?;
@@ -126,6 +99,63 @@ impl<'a> ArchiveReader<'a> {
     }
 }
 
+const AR_MAGIC: &[u8; 8] = b"!<arch>\n";
+const THIN_MAGIC: &[u8; 8] = b"!<thin>\n";
+pub(crate) const AR_FMAG: [u8; 2] = *b"`\n";
+const AR_NAME_OFFSET: usize = std::mem::offset_of!(ArchiveMemberHeader, ar_name);
+const AR_NAME_LEN: usize = size_of::<[u8; 16]>();
+const AR_SIZE_OFFSET: usize = std::mem::offset_of!(ArchiveMemberHeader, ar_size);
+const AR_SIZE_LEN: usize = size_of::<[u8; 10]>();
+const AR_FMAG_OFFSET: usize = std::mem::offset_of!(ArchiveMemberHeader, ar_fmag);
+const AR_FMAG_LEN: usize = size_of::<[u8; 2]>();
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct ArchiveMemberHeader {
+    ar_name: [u8; 16],
+    ar_date: [u8; 12],
+    ar_uid: [u8; 6],
+    ar_gid: [u8; 6],
+    ar_mode: [u8; 8],
+    ar_size: [u8; 10],
+    ar_fmag: [u8; 2],
+}
+
+/// Tell object names from ar's special index and name-table members.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MemberName<'a> {
+    /// `/` holds a count and member offsets as big-endian 32-bit words.
+    SymbolTable,
+    /// `/SYM64/` uses big-endian 64-bit words instead.
+    SymbolTable64,
+    /// `//` stores names that do not fit in the header.
+    LongNameTable,
+    /// Strip the trailing slash from an inline name.
+    Short(&'a str),
+    /// Byte offset in the GNU long-name table.
+    LongNameOffset(usize),
+    /// `#1/length` puts filename bytes at the start of the member data.
+    BsdExtended(usize),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MemberSlice {
+    offset: usize,
+    size: usize,
+}
+
+pub(crate) fn check_magic(data: &[u8]) -> bool {
+    data.starts_with(AR_MAGIC)
+}
+
+/// A symbol name and the archive byte offset of its member header.
+pub(crate) struct ArchiveSymbol<'a> {
+    pub(crate) name: &'a str,
+    /// Points to the member header, not its ELF data.
+    pub(crate) member_offset: usize,
+}
+
+/// Keep the member's header offset, which the armap uses to find it.
 #[derive(Debug)]
 pub(crate) struct ArchiveMember<'a> {
     data: &'a [u8],
@@ -137,6 +167,7 @@ impl<'a> ArchiveMember<'a> {
         self.offset
     }
 
+    /// Read the decimal member size, including any BSD inline filename.
     pub(crate) fn size(&self) -> Result<usize> {
         Ok(to_decimal(self.header_field(AR_SIZE_OFFSET, AR_SIZE_LEN))? as usize)
     }
@@ -145,6 +176,7 @@ impl<'a> ArchiveMember<'a> {
         self.offset + size_of::<ArchiveMemberHeader>()
     }
 
+    /// Borrow the whole member data after checking its bounds; this may include a filename.
     pub(crate) fn payload(&self) -> Result<&'a [u8]> {
         let start = self.payload_offset();
         let end = start
@@ -156,6 +188,7 @@ impl<'a> ArchiveMember<'a> {
             .context("archive member payload is out of bounds")
     }
 
+    /// Round past odd-sized data: ar puts the next header on an even byte boundary.
     pub(crate) fn next_offset(&self) -> Result<usize> {
         let size = self.size()?;
         let payload_end = self
@@ -169,6 +202,7 @@ impl<'a> ArchiveMember<'a> {
             .context("member padding overflowed usize")
     }
 
+    /// Read the header name format before following any long-name reference.
     pub(crate) fn member_name(&'a self) -> Result<MemberName<'a>> {
         let raw_name = std::str::from_utf8(self.header_field(AR_NAME_OFFSET, AR_NAME_LEN))
             .context("archive member name is not valid UTF-8")?;
@@ -205,6 +239,7 @@ impl<'a> ArchiveMember<'a> {
         }
     }
 
+    /// Read a GNU table name or BSD inline name for use in script patterns and errors.
     pub(crate) fn resolved_name(&self, long_names: Option<&[u8]>) -> Result<String> {
         match self.member_name()? {
             MemberName::Short(name) => Ok(name.to_string()),
@@ -230,6 +265,7 @@ impl<'a> ArchiveMember<'a> {
         }
     }
 
+    /// Skip any BSD inline filename so the returned bytes start at the ELF header.
     pub(crate) fn object_bytes(&self) -> Result<&'a [u8]> {
         let payload = self.payload()?;
 
@@ -262,6 +298,7 @@ impl<'a> ArchiveMember<'a> {
     }
 }
 
+/// Visit all members, including index and name-table members; report bad headers.
 #[derive(Debug, Clone)]
 pub(crate) struct ArchiveIter<'reader, 'data> {
     reader: &'reader ArchiveReader<'data>,
@@ -308,6 +345,7 @@ impl<'reader, 'data> Iterator for ArchiveIter<'reader, 'data> {
     }
 }
 
+/// Skip archive tables so the caller sees only object members.
 pub(crate) struct ArchiveObjectIter<'reader, 'data> {
     inner: ArchiveIter<'reader, 'data>,
 }
@@ -330,6 +368,7 @@ impl<'reader, 'data> Iterator for ArchiveObjectIter<'reader, 'data> {
     }
 }
 
+/// Read a name at a checked table offset; GNU ends each entry with `/\n`.
 pub(crate) fn resolve_long_name(long_names: &[u8], offset: usize) -> Result<String> {
     ensure!(
         offset < long_names.len(),
@@ -396,6 +435,8 @@ fn to_decimal(bytes: &[u8]) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    //! Check GNU/BSD names, armap word sizes, padding, and bad member ranges.
+
     use super::*;
     use crate::test_utils::{TestSymbol, build_archive, build_rel_object};
     use elf::{Elf64SymbolBinding, Elf64SymbolType};

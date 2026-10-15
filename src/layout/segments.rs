@@ -1,31 +1,36 @@
+//! Group placed sections into the memory ranges the kernel will load.
+//!
+//! [`load_segment_layouts`] takes section addresses and returns
+//! [`LoadSegmentLayout`] records. [`load_segments`] adds the patched bytes to
+//! make ELF [`LoadSegment`] values. [`load_segment_count`] supplies the count
+//! needed to set SIZEOF_HEADERS.
+//!
+//! A PT_LOAD segment gives one range a set of read, write, and execute flags.
+//! As in GNU ld's usual static layout, a permission change starts a new page.
+//! A .bss tail needs memory only; if more data follows .bss in the same segment,
+//! we must put zeros in the file for that gap. The first load maps the headers.
+//!
+//! References: ELF gABI "Program Header", "Segment Permissions", and "Segment Contents";
+//! AMD64 psABI §5.1.
+
 use anyhow::{Context, Result, ensure};
 use elf::{Elf64ProgramHeaderFlags, LoadSegment, PF_R};
 
 use super::{HeaderInfo, OutputSection, PAGE_SIZE, tls::TlsSegment};
 
-pub(crate) fn load_segment_count(sections: &[OutputSection]) -> u64 {
-    let mut count = 1; // Mapped headers are the first read-only load.
-    let mut flags = Elf64ProgramHeaderFlags::from_bits(PF_R);
-    for section in sections.iter().filter(|section| section.size != 0) {
-        if section.flags != flags {
-            count += 1;
-            flags = section.flags;
-        }
-    }
-    count
-}
-
-/// The PT_LOAD fields that can be known before assembling file bytes.
+/// A PT_LOAD's memory and file sizes, before collecting its bytes.
 pub(crate) struct LoadSegmentLayout {
     pub(crate) flags: Elf64ProgramHeaderFlags,
     pub(crate) address: u64,
+    /// File bytes, including any internal gaps filled with zeros.
     pub(crate) file_size: u64,
+    /// Memory bytes, including any trailing NOBITS range.
     pub(crate) mem_size: u64,
+    /// File offset and virtual address must match modulo this alignment.
     pub(crate) align: u64,
 }
 
-// Consecutive output sections with the same permissions share one PT_LOAD.
-// Reporting and output use the same description, including internal zero fill.
+/// Give reports and output the same load ranges, file sizes, and zero-fill tails.
 pub(crate) fn load_segment_layouts(
     sections: &[OutputSection],
     headers: &HeaderInfo,
@@ -63,7 +68,7 @@ pub(crate) fn load_segment_layouts(
             });
         }
         let segment = segments.last_mut().unwrap();
-        // The header load has p_offset zero and PAGE_SIZE alignment.
+        // File offset zero already fixes the header load's page alignment.
         if segment.address != headers.address {
             segment.align = segment.align.max(section.align);
         }
@@ -91,7 +96,7 @@ pub(crate) fn load_segment_layouts(
                     })
             })
             .context("TLS template must be contained in one PT_LOAD segment")?;
-        // A script may reserve trailing padding in .tdata with assignments.
+        // Startup also copies padding a script leaves at the end of .tdata.
         segment.file_size = segment
             .file_size
             .max(tls.vaddr - segment.address + tls.file_size);
@@ -99,7 +104,10 @@ pub(crate) fn load_segment_layouts(
     Ok(segments)
 }
 
-// Output-section data remains separate until relocations have been applied.
+/// Join patched bytes into zero-filled load buffers.
+///
+/// A NOBITS gap before later data needs zeros in the file. A NOBITS tail
+/// only needs a larger memory size.
 pub(crate) fn load_segments(
     sections: Vec<OutputSection>,
     headers: &HeaderInfo,
@@ -133,8 +141,23 @@ pub(crate) fn load_segments(
     Ok(segments)
 }
 
+/// Count loads for SIZEOF_HEADERS, including the load that maps the headers.
+pub(crate) fn load_segment_count(sections: &[OutputSection]) -> u64 {
+    let mut count = 1; // Mapped headers are the first read-only load.
+    let mut flags = Elf64ProgramHeaderFlags::from_bits(PF_R);
+    for section in sections.iter().filter(|section| section.size != 0) {
+        if section.flags != flags {
+            count += 1;
+            flags = section.flags;
+        }
+    }
+    count
+}
+
 #[cfg(test)]
 mod tests {
+    //! Check file bytes for internal zero-fill gaps and memory-only tails.
+
     use std::cell::OnceCell;
 
     use super::*;

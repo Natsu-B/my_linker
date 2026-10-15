@@ -1,3 +1,16 @@
+//! Build a symbol index without loading each archive member into the link.
+//!
+//! [`index_archive`] takes mapped archive bytes and returns [`ArchiveState`].
+//! [`MemberInfo`] holds each member's bytes; [`ArchiveEntry`] maps a symbol to a
+//! member. Flags stop search from pulling the same member twice.
+//!
+//! We keep the armap's order because GNU ld searches it in that order. If there
+//! is no armap, we read member definitions in member and symbol order to build
+//! one. Weak definitions can meet a strong reference; local symbols cannot.
+//!
+//! References: ELF gABI "Symbol Binding"; [GNU ar indexes](https://sourceware.org/binutils/docs/binutils/ar.html)
+//! and GNU ld/BFD armap search.
+
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
@@ -7,25 +20,35 @@ use crate::input::{FileId, object};
 
 use super::reader::ArchiveReader;
 
+/// Keep armap order and track members already pulled into the link.
+pub(crate) struct ArchiveState<'a> {
+    pub(crate) file_name: String,
+    /// Position in the command-line list, used in member file IDs.
+    pub(crate) archive_index: usize,
+    pub(crate) members: Vec<MemberInfo<'a>>,
+    /// Search in this order, even when members use a different order in the file.
+    pub(crate) entries: Vec<ArchiveEntry<'a>>,
+    /// One flag per member; several armap names can point to the same member.
+    pub(crate) extracted: Vec<bool>,
+}
+
+/// Borrow a member's ELF bytes without adding its object to the link.
 pub(crate) struct MemberInfo<'a> {
     pub(crate) name: String,
     pub(crate) bytes: &'a [u8],
 }
 
+/// An armap name and its index in `ArchiveState::members`.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ArchiveEntry<'a> {
     pub(crate) symbol: &'a str,
     pub(crate) member_index: usize,
 }
 
-pub(crate) struct ArchiveState<'a> {
-    pub(crate) file_name: String,
-    pub(crate) archive_index: usize,
-    pub(crate) members: Vec<MemberInfo<'a>>,
-    pub(crate) entries: Vec<ArchiveEntry<'a>>,
-    pub(crate) extracted: Vec<bool>,
-}
-
+/// Use the armap if present; otherwise build one in member and symbol order.
+///
+/// Reject armap offsets that do not point to object member headers. With an
+/// armap, leave ELF parsing until search needs the member.
 pub(crate) fn index_archive<'a>(
     bytes: &'a [u8],
     file_name: String,
@@ -49,8 +72,8 @@ pub(crate) fn index_archive<'a>(
             .object_bytes()
             .with_context(|| format!("failed to read object bytes for {file_name}({name})"))?;
         member_offsets.insert(member.header_offset(), member_index);
-        // Archives without an armap use the same member/symbol traversal order
-        // that an archiver would use to build one.
+        // Without an armap, use the member and symbol order that an archiver
+        // would use to build the index.
         if armap.is_none() {
             let object = parse_member_object(member_bytes, &name, archive_index, member_index)
                 .with_context(|| format!("failed to parse archive member {name}"))?;
@@ -137,6 +160,8 @@ fn collect_defined_symbols<'a>(object: &object::ObjectFile<'a>) -> Vec<&'a str> 
 
 #[cfg(test)]
 mod tests {
+    //! Check that armap order and member offsets choose the right objects.
+
     use super::{ArchiveEntry, index_archive, parse_member_object};
     use crate::{
         input::FileId,
@@ -149,7 +174,7 @@ mod tests {
         let object = build_rel_object(&[], &[]);
         let mut archive =
             crate::test_utils::build_indexed_archive(&[("member.o/", &object)], &[("symbol", 0)]);
-        // Corrupt the first offset to point into the armap rather than a member.
+        // An armap offset must find a member header, not bytes inside the index.
         archive[72..76].copy_from_slice(&8u32.to_be_bytes());
         let error = index_archive(&archive, "bad.a".to_string(), 0)
             .err()

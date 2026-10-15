@@ -1,9 +1,25 @@
+//! Place sections for one guess at the ELF header size.
+//!
+//! [`SectionPlacer::place`] takes mapped script rules and inputs and returns
+//! [`OutputSection`] values. `PlacementState` keeps alignments and load flags.
+//! We align each input, leave space between pages with different permissions,
+//! and compute script symbols as the location counter `.` moves.
+//!
+//! We also remember which section each symbol belongs to. The address alone
+//! cannot tell us: `data_end` and `__bss_start` may have the same value but belong
+//! to different sections. A plain constant outside a section is absolute.
+//! After a section ends, `.` still belongs to it for later script expressions.
+//!
+//! References: ELF gABI "Sections" and "Segment Permissions"; AMD64 psABI §5.1;
+//! GNU ld's [location counter](https://sourceware.org/binutils/docs/ld/Location-Counter.html)
+//! and output-section addresses.
+
 use std::{cell::OnceCell, collections::HashMap};
 
 use anyhow::{Context, Result, ensure};
 use elf::{Elf64ProgramHeaderFlags, Elf64SymbolSectionIdx, PF_R};
 
-use super::{OutputSection, PAGE_SIZE};
+use super::{OutputSection, PAGE_SIZE, ScriptSymbols};
 use crate::{
     input::{FileId, object::InputSection},
     script::{
@@ -14,19 +30,21 @@ use crate::{
     symbols::{Definition, ResolvedSymbol, SymbolTable},
 };
 
+/// Run one placement pass, keeping symbol values and their sections together.
 pub(super) struct SectionPlacer<'s> {
     context: eval::Context,
     symbols: &'s SymbolTable,
     section_symbols: HashMap<(FileId, u16), Vec<&'s ResolvedSymbol>>,
-    pub(super) script_symbols: HashMap<String, u64>,
-    pub(super) script_symbol_sections: HashMap<String, usize>,
+    script_symbols: HashMap<String, u64>,
     symbol_sections: HashMap<String, usize>,
-    current_section: Option<usize>,
+    /// `.` still belongs to the last output section after that section's block ends.
     dot_section: Option<usize>,
-    pub(super) header_vaddr: Option<u64>,
+    /// Page-aligned address of file offset zero, once the first output needs headers.
+    pub(super) header_address: Option<u64>,
 }
 
 impl<'s> SectionPlacer<'s> {
+    /// Start with a fixed header-size guess and the known absolute symbol values.
     pub(super) fn new(symbols: &'s SymbolTable, sizeof_headers: u64) -> Self {
         let mut section_symbols: HashMap<_, Vec<_>> = HashMap::new();
         let mut context = eval::Context {
@@ -59,15 +77,48 @@ impl<'s> SectionPlacer<'s> {
             symbols,
             section_symbols,
             script_symbols: HashMap::new(),
-            script_symbol_sections: HashMap::new(),
             symbol_sections: HashMap::new(),
-            current_section: None,
             dot_section: None,
-            header_vaddr: None,
+            header_address: None,
         }
     }
 
-    fn assign(&mut self, assignment: &Assignment) -> Result<()> {
+    /// Run mapped statements in order, aligning each input and filling output bytes.
+    pub(super) fn place<'a>(
+        &mut self,
+        items: &[MappedItem],
+        inputs: &[MappingInput<'a>],
+    ) -> Result<Vec<OutputSection<'a>>> {
+        let mut sections = Vec::new();
+        let mut state = PlacementState::new(items);
+        for (item_index, item) in items.iter().enumerate() {
+            self.context.next_section_alignment =
+                next_section_alignment(&items[item_index + 1..], inputs);
+            match item {
+                MappedItem::Assignment(assignment) => self.assign(assignment, None)?,
+                MappedItem::Output(output) => {
+                    if output.statements.is_empty() {
+                        continue;
+                    }
+                    let section = self.place_output(output, inputs, sections.len(), &mut state)?;
+                    sections.push(section);
+                }
+            }
+        }
+        Ok(sections)
+    }
+
+    /// Keep script names for output. Expressions can also use input names.
+    pub(super) fn into_script_symbols(mut self) -> ScriptSymbols {
+        self.symbol_sections
+            .retain(|name, _| self.script_symbols.contains_key(name));
+        ScriptSymbols {
+            values: self.script_symbols,
+            sections: self.symbol_sections,
+        }
+    }
+
+    fn assign(&mut self, assignment: &Assignment, output_index: Option<usize>) -> Result<()> {
         if !self.symbols.should_assign(assignment) {
             return Ok(());
         }
@@ -75,19 +126,13 @@ impl<'s> SectionPlacer<'s> {
         if assignment.name == "." {
             self.context.dot = value;
         } else {
-            // Section identity cannot be reconstructed from an address: an
-            // absolute constant may equal an address, and end symbols lie on
-            // boundaries. Carry the association alongside the numeric value.
-            let section = self
-                .current_section
-                .or(self.expression_section(&assignment.value)?);
+            // Equal addresses need not belong to the same section. Keep the
+            // section too, so .symtab can tell end markers from absolute values.
+            let section = output_index.or(self.expression_section(&assignment.value)?);
             if let Some(section) = section {
-                self.script_symbol_sections
-                    .insert(assignment.name.clone(), section);
                 self.symbol_sections
                     .insert(assignment.name.clone(), section);
             } else {
-                self.script_symbol_sections.remove(&assignment.name);
                 self.symbol_sections.remove(&assignment.name);
             }
             self.context.symbols.insert(assignment.name.clone(), value);
@@ -131,30 +176,6 @@ impl<'s> SectionPlacer<'s> {
         })
     }
 
-    pub(super) fn place<'a>(
-        &mut self,
-        items: &[MappedItem],
-        inputs: &[MappingInput<'a>],
-    ) -> Result<Vec<OutputSection<'a>>> {
-        let mut sections = Vec::new();
-        let mut state = PlacementState::new(items);
-        for (item_index, item) in items.iter().enumerate() {
-            self.context.next_section_alignment =
-                next_section_alignment(&items[item_index + 1..], inputs);
-            match item {
-                MappedItem::Assignment(assignment) => self.assign(assignment)?,
-                MappedItem::Output(output) => {
-                    if output.statements.is_empty() {
-                        continue;
-                    }
-                    let section = self.place_output(output, inputs, sections.len(), &mut state)?;
-                    sections.push(section);
-                }
-            }
-        }
-        Ok(sections)
-    }
-
     fn place_output<'a>(
         &mut self,
         output: &MappedOutputSection,
@@ -165,8 +186,7 @@ impl<'s> SectionPlacer<'s> {
         let output_align = state.output_alignment(output, inputs);
         let address = self.output_address(output, inputs, output_align, state)?;
         self.context.dot = address;
-        self.current_section = Some(output_index);
-        self.dot_section = self.current_section;
+        self.dot_section = Some(output_index);
         let mut section = OutputSection {
             name: output.name.clone(),
             flags: output.permissions(),
@@ -179,7 +199,7 @@ impl<'s> SectionPlacer<'s> {
         for statement in &output.statements {
             match statement {
                 MappedStatement::Assignment(assignment) => {
-                    self.assign_in_section(assignment, &section.name)?
+                    self.assign_in_section(assignment, &section.name, output_index)?
                 }
                 MappedStatement::Input(index) => {
                     self.place_input(&inputs[*index].section, &mut section, output_index)?
@@ -193,13 +213,17 @@ impl<'s> SectionPlacer<'s> {
             section.name,
             section.size
         );
-        self.current_section = None;
         Ok(section)
     }
 
-    fn assign_in_section(&mut self, assignment: &Assignment, name: &str) -> Result<()> {
+    fn assign_in_section(
+        &mut self,
+        assignment: &Assignment,
+        name: &str,
+        output_index: usize,
+    ) -> Result<()> {
         let old_dot = self.context.dot;
-        self.assign(assignment)?;
+        self.assign(assignment, Some(output_index))?;
         ensure!(
             self.context.dot >= old_dot,
             "location counter moves backwards in output section {name}"
@@ -218,7 +242,7 @@ impl<'s> SectionPlacer<'s> {
             Some(expression) => eval::evaluate(expression, &self.context)?,
             None => align(self.context.dot, alignment)?,
         };
-        if self.header_vaddr.is_none() {
+        if self.header_address.is_none() {
             self.reserve_headers(address, state)?;
         }
         if output.has_contents(inputs) {
@@ -247,7 +271,7 @@ impl<'s> SectionPlacer<'s> {
             .context("no space for mapped ELF headers before the first output section")?
             / PAGE_SIZE
             * PAGE_SIZE;
-        self.header_vaddr = Some(base);
+        self.header_address = Some(base);
         state.previous_end = base + self.context.sizeof_headers;
         Ok(())
     }
@@ -307,7 +331,7 @@ impl<'s> SectionPlacer<'s> {
     }
 }
 
-/// State shared by consecutive output sections, independent of script symbols.
+/// Track page permissions and TLS alignment across output sections.
 struct PlacementState {
     previous_flags: Elf64ProgramHeaderFlags,
     previous_end: u64,
@@ -335,8 +359,8 @@ impl PlacementState {
 
     fn output_alignment(&mut self, output: &MappedOutputSection, inputs: &[MappingInput]) -> u64 {
         if !self.tls_started && output.is_tls() && output.has_contents(inputs) {
-            // The first TLS section anchors the whole PT_TLS template. Align
-            // it for every TLS input, including a more strictly aligned .tbss.
+            // PT_TLS starts here, so align it for the whole block. A later
+            // .tbss input may need stricter alignment than .tdata does.
             self.tls_started = true;
             output.align.max(self.tls_align)
         } else {
@@ -348,8 +372,8 @@ impl PlacementState {
         if flags == self.previous_flags {
             Ok(self.previous_end)
         } else {
-            // PT_LOAD permissions apply to pages, so a change of permissions
-            // starts a new page even when both sections would fit in one.
+            // The kernel sets permissions per page. Sections with different
+            // flags must not share a page, even if their bytes would fit.
             align(self.previous_end, PAGE_SIZE)
         }
     }
@@ -392,6 +416,8 @@ fn align(value: u64, alignment: u64) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    //! Check page gaps, TLS alignment, and which section each script symbol belongs to.
+
     use super::*;
     use crate::{
         input::object::InputSection,
@@ -473,8 +499,8 @@ mod tests {
         };
         assert_eq!(members(extra), vec![3, 4]);
         let symbols = SymbolTable::default();
-        let mut layout = SectionPlacer::new(&symbols, 64 + 56 * 5);
-        let sections = layout.place(&items, &inputs).unwrap();
+        let mut placer = SectionPlacer::new(&symbols, 64 + 56 * 5);
+        let sections = placer.place(&items, &inputs).unwrap();
         let text = &sections[0];
         let extra = &sections[1];
         let rodata = &sections[2];
@@ -499,8 +525,8 @@ mod tests {
         let items = map_inputs(&script, &inputs).unwrap();
         assert_eq!(names(&items), vec![".text"]);
         let symbols = SymbolTable::default();
-        let mut layout = SectionPlacer::new(&symbols, 232);
-        let sections = layout.place(&items, &inputs).unwrap();
+        let mut placer = SectionPlacer::new(&symbols, 232);
+        let sections = placer.place(&items, &inputs).unwrap();
         assert_eq!(*sections[0].address.get().unwrap(), 0x401000);
     }
 
@@ -510,8 +536,8 @@ mod tests {
         let script = parser::parse("SECTIONS { . = 0x400000 + SIZEOF_HEADERS; .text 0x401000 : { *(.text) } .data 0x401001 : { *(.data) } }").unwrap();
         let items = map_inputs(&script, &inputs).unwrap();
         let symbols = SymbolTable::default();
-        let mut layout = SectionPlacer::new(&symbols, 232);
-        let error = layout.place(&items, &inputs).err().unwrap();
+        let mut placer = SectionPlacer::new(&symbols, 232);
+        let error = placer.place(&items, &inputs).err().unwrap();
         assert!(
             error
                 .to_string()
@@ -528,15 +554,72 @@ mod tests {
         let script = parser::parse("SECTIONS { . = 0x400000 + SIZEOF_HEADERS; before = .; alignment = ALIGNOF(NEXT_SECTION); .rodata : { start = .; next_alignment = ALIGNOF(NEXT_SECTION); *(.rodata) . = ALIGN(16); finish = .; } after = .; .data : { *(.data) } }").unwrap();
         let items = map_inputs(&script, &inputs).unwrap();
         let symbols = SymbolTable::default();
-        let mut layout = SectionPlacer::new(&symbols, 176);
-        let sections = layout.place(&items, &inputs).unwrap();
-        assert_eq!(layout.script_symbols["before"], 0x4000b0);
-        assert_eq!(layout.script_symbols["alignment"], 64);
-        assert_eq!(layout.script_symbols["next_alignment"], 128);
-        assert_eq!(layout.script_symbols["start"], 0x4000c0);
-        assert_eq!(layout.script_symbols["finish"], 0x4000d0);
-        assert_eq!(layout.script_symbols["after"], 0x4000d0);
+        let mut placer = SectionPlacer::new(&symbols, 176);
+        let sections = placer.place(&items, &inputs).unwrap();
+        assert_eq!(placer.script_symbols["before"], 0x4000b0);
+        assert_eq!(placer.script_symbols["alignment"], 64);
+        assert_eq!(placer.script_symbols["next_alignment"], 128);
+        assert_eq!(placer.script_symbols["start"], 0x4000c0);
+        assert_eq!(placer.script_symbols["finish"], 0x4000d0);
+        assert_eq!(placer.script_symbols["after"], 0x4000d0);
         assert_eq!(sections[0].size, 16);
+    }
+
+    #[test]
+    fn script_symbols_keep_sections_when_values_match() {
+        use crate::input::object::ObjectSymbol;
+        use elf::{Elf64SymbolBinding, Elf64SymbolInfo, Elf64SymbolType};
+
+        let mut inputs = vec![input("a.o", ".data", 3, 1), input("a.o", ".bss", 3, 1)];
+        inputs[1].section.idx = 2;
+        inputs[1].section.data = None;
+        let input_symbol = ObjectSymbol {
+            file_id: inputs[0].section.file_id,
+            idx: 1,
+            section_idx: Elf64SymbolSectionIdx::Index(1),
+            name: "input_data",
+            info: Elf64SymbolInfo::new()
+                .set(
+                    Elf64SymbolInfo::st_bind,
+                    Elf64SymbolBinding::STB_GLOBAL as u8,
+                )
+                .set(Elf64SymbolInfo::st_type, Elf64SymbolType::STT_OBJECT as u8),
+            size: 1,
+            other: 0,
+            value: 0,
+        };
+        let symbols = crate::symbols::resolve_inputs(&[input_symbol], &[]).unwrap();
+        let script = parser::parse(
+            "SECTIONS {
+                . = 0x401000;
+                .data : { *(.data) inside = 7; data_end = .; }
+                after = .;
+                alias = input_data;
+                absolute = 7;
+                .bss : { bss_start = .; *(.bss) }
+            }",
+        )
+        .unwrap();
+        let items = map_inputs(&script, &inputs).unwrap();
+        let mut placer = SectionPlacer::new(&symbols, 232);
+        placer.place(&items, &inputs).unwrap();
+        let script_symbols = placer.into_script_symbols();
+
+        assert_eq!(
+            script_symbols.values["data_end"],
+            script_symbols.values["bss_start"]
+        );
+        assert_eq!(
+            script_symbols.values["inside"],
+            script_symbols.values["absolute"]
+        );
+        for name in ["data_end", "after", "alias", "inside"] {
+            assert_eq!(script_symbols.sections[name], 0);
+        }
+        assert_eq!(script_symbols.sections["bss_start"], 1);
+        assert!(!script_symbols.sections.contains_key("absolute"));
+        assert!(!script_symbols.sections.contains_key("input_data"));
+        assert!(!script_symbols.values.contains_key("input_data"));
     }
 
     #[test]
@@ -553,8 +636,8 @@ mod tests {
         ).unwrap();
         let items = map_inputs(&script, &inputs).unwrap();
         let symbols = SymbolTable::default();
-        let mut layout = SectionPlacer::new(&symbols, 288);
-        let sections = layout.place(&items, &inputs).unwrap();
+        let mut placer = SectionPlacer::new(&symbols, 288);
+        let sections = placer.place(&items, &inputs).unwrap();
         assert_eq!(*sections[1].address.get().unwrap(), 0x401020);
         assert_eq!(*sections[2].address.get().unwrap(), 0x401040);
         assert_eq!(*sections[3].address.get().unwrap(), 0x401048);

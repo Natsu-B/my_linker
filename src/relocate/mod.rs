@@ -1,3 +1,18 @@
+//! Patch symbol references after layout has set all addresses.
+//!
+//! [`apply`] takes a [`LinkedImage`], fills linker-made bytes, and patches kept
+//! relocations. It returns [`AppliedRelocation`] records only for requested
+//! traces. File and section indices locate the patch; [`SymbolId`] finds the
+//! chosen definition. [`x86_64`] computes and writes the value.
+//!
+//! A relocation's addend comes from the input RELA record, not the bytes we
+//! patch. GOT references need the slot's address; TLS references need a thread
+//! offset. Like GNU ld, direct IFUNC calls use a stub, while IRELATIVE records
+//! keep the resolver address for startup.
+//!
+//! References: ELF gABI "Relocation"; AMD64 psABI §4.4.1.
+//! This linker supports local-exec and initial-exec TLS.
+
 mod x86_64;
 
 use anyhow::{Context, Result};
@@ -11,20 +26,10 @@ use crate::{
 };
 use x86_64::{Operands, RelocationSite};
 
-/// A computed relocation, retained only when its trace is requested.
-pub(crate) struct AppliedRelocation {
-    pub(crate) file_id: FileId,
-    pub(crate) symbol: Option<SymbolId>,
-    pub(crate) ty: X86_64RelocationType,
-    pub(crate) place: u64,
-    pub(crate) address: u64,
-    pub(crate) addend: i64,
-    pub(crate) value: i128,
-    pub(crate) got_slot: Option<u64>,
-    pub(crate) tls_offset: Option<i64>,
-    pub(crate) iplt_address: Option<u64>,
-}
-
+/// Fill GOT/IPLT bytes and patch all kept relocations using final addresses.
+///
+/// With no trace filter, keep no patch records. An empty filter records all
+/// patches; a nonempty filter matches exact symbol names.
 pub(crate) fn apply(
     image: &mut LinkedImage,
     trace_symbols: Option<&[String]>,
@@ -55,8 +60,8 @@ pub(crate) fn apply(
             .context("relocation input section has no output location")?;
         let ty = X86_64RelocationType::try_from(relocation.info)?;
         if ty == X86_64RelocationType::None {
-            // NONE ignores its operands. A trace can name a valid symbol,
-            // but must not require the ignored symbol index to be valid.
+            // NONE does not use its symbol index. Tracing must not turn an
+            // ignored, invalid index into a link error.
             if let Some(names) = trace_symbols {
                 let symbol_id = symbols.input(relocation.file_id, relocation.info.sym).ok();
                 let symbol = symbol_id.map(|id| symbols.get(id));
@@ -103,8 +108,8 @@ pub(crate) fn apply(
             .checked_add(offset)
             .context("relocation place exceeds u64")?;
 
-        // GOT references name the slot, not its contents. IFUNC slots are
-        // filled at startup; initial-exec TLS slots hold a signed TP offset.
+        // Patch a GOT reference with the slot's address, not its contents.
+        // Startup fills IFUNC slots; initial-exec slots hold signed TP offsets.
         let got_slot = if Got::needs_entry(relocation.info.ty) {
             let entry = if ty == X86_64RelocationType::GotTpOff {
                 GotEntry::TpOff(symbol_id)
@@ -136,8 +141,8 @@ pub(crate) fn apply(
         } else {
             None
         };
-        // Direct references to an IFUNC use its canonical IPLT address.
-        // Keep the resolver address in the symbol table for IRELATIVE addends.
+        // Calls and function pointers need one shared IFUNC address: the stub.
+        // Keep the resolver value too, since IRELATIVE must call it at startup.
         let iplt_address = if symbol.is_ifunc()
             && matches!(
                 ty,
@@ -194,6 +199,28 @@ pub(crate) fn apply(
     Ok(applied)
 }
 
+/// Keep the inputs and result of one patch when its trace is requested.
+pub(crate) struct AppliedRelocation {
+    pub(crate) file_id: FileId,
+    /// NONE may have no valid symbol index, so its trace can leave this unset.
+    pub(crate) symbol: Option<SymbolId>,
+    pub(crate) ty: X86_64RelocationType,
+    /// P: virtual address of the field being patched.
+    pub(crate) place: u64,
+    /// S: final symbol value; for an IFUNC this still names the resolver.
+    pub(crate) address: u64,
+    /// A: signed addend from the input RELA record.
+    pub(crate) addend: i64,
+    /// Result before checking field range and writing bytes.
+    pub(crate) value: i128,
+    /// G + GOT: slot address, not the value stored in the slot.
+    pub(crate) got_slot: Option<u64>,
+    /// Signed offset from the thread pointer for local-exec TLS.
+    pub(crate) tls_offset: Option<i64>,
+    /// The shared IFUNC stub address used by direct references.
+    pub(crate) iplt_address: Option<u64>,
+}
+
 fn initialize_got(layout: &mut Layout, got: &Got, symbols: &SymbolTable) -> Result<()> {
     for (entry, offset) in got.entries() {
         let (GotEntry::Address(id) | GotEntry::TpOff(id) | GotEntry::Ifunc(id)) = entry;
@@ -212,8 +239,8 @@ fn initialize_got(layout: &mut Layout, got: &Got, symbols: &SymbolTable) -> Resu
                     format!("invalid TLS GOT target: {} at {address:#x}", symbol.name)
                 })?
                 .to_le_bytes(),
-            // Startup applies IRELATIVE before IFUNC calls. Leave the slot
-            // zero until it stores the resolver's result.
+            // Startup calls the resolver and fills this slot before any IFUNC
+            // call. It has no function address to store yet.
             GotEntry::Ifunc(_) => continue,
         };
         SyntheticSection::Got.write(&mut layout.sections, &layout.section_index, offset, &bytes)?;

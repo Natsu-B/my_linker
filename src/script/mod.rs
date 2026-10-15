@@ -1,3 +1,16 @@
+//! Read the rules that choose sections and set addresses.
+//!
+//! [`parse_script`] takes an optional path and returns an [`ast::Script`].
+//! Without a path it uses [`DEFAULT_SCRIPT`]. [`mapping`] matches input sections
+//! to the rules; [`eval`] computes expressions during layout.
+//!
+//! The script's location counter, `.`, is the address where the next bytes go.
+//! ENTRY names the start symbol. We read it before archive search so that name
+//! can pull a member. The syntax follows the GNU ld subset this linker supports.
+//!
+//! References: [GNU ld scripts](https://sourceware.org/binutils/docs/ld/Scripts.html);
+//! ELF gABI "Sections" and "Symbol Table".
+
 pub(crate) mod ast;
 pub(crate) mod eval;
 mod lexer;
@@ -13,7 +26,7 @@ use ast::{Script, Statement};
 
 pub(crate) const DEFAULT_SCRIPT: &str = include_str!("elf_x86_64_static.ld");
 
-/// Parse the linker script given by `-T`, or the built-in script.
+/// Read `-T` or the built-in script, and report syntax errors with the source name.
 pub(crate) fn parse_script(path: Option<&str>) -> Result<Script> {
     pr_debug!("Parsing script...");
 
@@ -31,6 +44,7 @@ pub(crate) fn parse_script(path: Option<&str>) -> Result<Script> {
 }
 
 impl ast::Script {
+    /// Use the last ENTRY command; without one, start at `_start`.
     pub(crate) fn entry_name(&self) -> &str {
         self.statements
             .iter()

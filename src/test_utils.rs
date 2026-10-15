@@ -1,3 +1,13 @@
+//! Build small ELF objects and archives for unit tests.
+//!
+//! [`build_rel_object`] takes [`TestSymbol`] and [`TestRelocation`] records and
+//! returns x86-64 ET_REL bytes. Archive builders wrap object bytes and can set
+//! armap order. Tests can thus check bad headers, unaligned members, and search
+//! order without running an assembler.
+//!
+//! References: ELF gABI "ELF Header", "Sections", "Symbol Table", and "Relocation";
+//! AMD64 psABI §4.4.1; GNU ar's member and index formats.
+
 use elf::{Elf64SectionType, Elf64SymbolBinding, Elf64SymbolType, ElfFileType, ElfMachineType};
 
 use crate::input::archive::reader::AR_FMAG;
@@ -8,6 +18,7 @@ const SYMBOL_SIZE: usize = 24;
 const RELA_SIZE: usize = 24;
 const AR_MAGIC: &[u8; 8] = b"!<arch>\n";
 
+/// Choose the input symbol fields a test needs; the builder adds its name to .strtab.
 #[derive(Clone, Copy)]
 pub(crate) struct TestSymbol<'a> {
     pub(crate) name: &'a str,
@@ -18,14 +29,18 @@ pub(crate) struct TestSymbol<'a> {
     pub(crate) size: u64,
 }
 
+/// A RELA record that patches the test object's .text.
 #[derive(Clone, Copy)]
 pub(crate) struct TestRelocation {
+    /// Byte offset within .text.
     pub(crate) offset: u64,
+    /// Symbol index after the builder puts locals before globals.
     pub(crate) sym: u32,
     pub(crate) ty: u32,
     pub(crate) addend: i64,
 }
 
+/// Build x86-64 ET_REL bytes with five text bytes, chosen symbols, and optional RELA.
 pub(crate) fn build_rel_object(
     symbols: &[TestSymbol<'_>],
     relocations: &[TestRelocation],
@@ -164,6 +179,7 @@ pub(crate) fn build_rel_object(
     out
 }
 
+/// Wrap member bytes in ar headers, adding a padding byte after odd lengths.
 pub(crate) fn build_archive(members: &[(&str, &[u8])]) -> Vec<u8> {
     let mut out = Vec::from(AR_MAGIC.as_slice());
     for &(name, payload) in members {
@@ -208,8 +224,7 @@ fn push_member(out: &mut Vec<u8>, name: &str, payload: &[u8]) {
     }
 }
 
-/// Build a GNU armap with a caller-selected symbol order, independent of the
-/// physical member order, so extraction tests exercise the on-disk index.
+/// Set armap order apart from file order so tests check which one search follows.
 pub(crate) fn build_indexed_archive(
     members: &[(&str, &[u8])],
     entries: &[(&str, usize)],

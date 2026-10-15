@@ -1,9 +1,27 @@
+//! Read ELF64 records and write an executable into a byte buffer.
+//!
+//! [`read::Elf64`] borrows bytes and gives access to headers, sections, symbols,
+//! and RELA relocations. [`write::ExecElf64Writer`] takes segment and section
+//! records and fills a caller's buffer. [`abi`] defines the file fields;
+//! [`x86_64`] names relocation kinds.
+//!
+//! ELF has two views of the same file: sections for the linker and segments for
+//! the loader. This crate reads and writes those views. The linker crate picks
+//! inputs and follows GNU ld script rules. The reader accepts both byte orders;
+//! the writer accepts only little-endian x86-64.
+//!
+//! References: [ELF gABI], "ELF Header", "Sections", "String Table", "Symbol Table",
+//! "Relocation", and "Program Loading"; [AMD64 psABI] §§4–5.
+//!
+//! [ELF gABI]: https://gabi.xinuos.com/elf.pdf
+//! [AMD64 psABI]: https://gitlab.com/x86-psABIs/x86-64-ABI
+
 pub mod abi;
 pub mod read;
 pub mod write;
 pub mod x86_64;
 
-/// Lets callers read raw bits (`to_raw`) from the bit-register types below.
+/// Let callers get the raw bits from ELF bit-field types.
 pub use typestate::RawReg;
 
 pub use abi::{

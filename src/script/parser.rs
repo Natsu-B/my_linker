@@ -1,3 +1,16 @@
+//! Turn script text into rules and expression trees.
+//!
+//! [`parse`] takes text and returns a [`Script`]. The private `Parser` checks
+//! syntax, operator order, and built-in arguments. Errors include the text's
+//! line and column; unsupported commands fail instead of silently changing layout.
+//!
+//! We follow the supported GNU ld syntax. OUTPUT_FORMAT and OUTPUT_ARCH are
+//! accepted but do not choose a target: input checks and output already fix
+//! little-endian x86-64.
+//!
+//! References: [GNU ld script format](https://sourceware.org/binutils/docs/ld/Script-Format.html),
+//! SECTIONS, and expressions; ELF gABI "Sections" and "Symbol Table".
+
 use anyhow::{Result, bail, ensure};
 
 use super::{
@@ -5,10 +18,12 @@ use super::{
     lexer::{Token, TokenKind, lex},
 };
 
+/// Parse the full script; reject unsupported commands with their line and column.
 pub(crate) fn parse(source: &str) -> Result<Script> {
     Parser::new(source)?.script()
 }
 
+/// Parse a whole expression for tests, rejecting trailing text.
 #[cfg(test)]
 pub(crate) fn parse_expression(source: &str) -> Result<Expr> {
     let mut parser = Parser::new(source)?;
@@ -398,8 +413,8 @@ impl<'a> Parser<'a> {
         Ok(patterns)
     }
 
-    // Wildcards and filenames are lexed as expression tokens. Reassemble only
-    // adjacent tokens here, so '*' and '?' retain their expression meanings.
+    // A '*' or '?' can be a pattern or an expression token. Join only
+    // adjacent spans here so whitespace still separates script expressions.
     fn pattern(&mut self) -> Result<String> {
         let token = self.token();
         if let TokenKind::String(value) = &token.kind {
@@ -610,6 +625,8 @@ fn number(text: &str, location: Location) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    //! Check the accepted GNU script subset and errors for unsupported commands.
+
     use super::*;
 
     fn output(source: &str) -> OutputSectionRule {

@@ -1,3 +1,14 @@
+//! Print log messages at the chosen level.
+//!
+//! The macros take format arguments and write to stdout or stderr.
+//! [`crate::debugs_or!`] picks a full error or a short error. The main thread sets
+//! [`crate::DEBUG_LEVEL`] before rayon starts, so worker threads only read it.
+//! These logs help diagnose a failed link; [`crate::report`] shows ELF stage results.
+//!
+//! Reference: [GNU ld options](https://sourceware.org/binutils/docs/ld/Options.html)
+//! gives the context for linker diagnostics; these macros use our own log format.
+
+/// Use full error details at level four and short text at lower levels.
 #[macro_export]
 macro_rules! debugs_or {
     ($debug:expr, $normal:expr) => {{
@@ -12,6 +23,7 @@ macro_rules! debugs_or {
     }};
 }
 
+/// Print to stderr at level one or higher.
 #[macro_export]
 macro_rules! pr_err {
     ($($arg:tt)*) => {{
@@ -24,6 +36,7 @@ macro_rules! pr_err {
     }};
 }
 
+/// Print to stderr at level two or higher.
 #[macro_export]
 macro_rules! pr_warn {
     ($($arg:tt)*) => {{
@@ -36,6 +49,7 @@ macro_rules! pr_warn {
     }};
 }
 
+/// Print progress to stdout at level three or higher.
 #[macro_export]
 macro_rules! pr_info {
     ($($arg:tt)*) => {{
@@ -48,6 +62,7 @@ macro_rules! pr_info {
     }};
 }
 
+/// Print details to stdout at level four or higher.
 #[macro_export]
 macro_rules! pr_debug {
     ($($arg:tt)*) => {{

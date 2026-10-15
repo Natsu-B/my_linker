@@ -1,3 +1,17 @@
+//! Keep the chosen definitions and let later steps look them up.
+//!
+//! [`SymbolTable`] maps input symbol indices and global names to [`SymbolId`].
+//! Each [`ResolvedSymbol`] keeps a [`Definition`] before layout sets its address.
+//! For example, a symbol at offset 8 in an input section needs that section's
+//! output address and offset before we can give the symbol an address.
+//!
+//! Like GNU ld, absolute symbols keep their value and missing weak symbols get
+//! zero. A discarded section has no output address. TLS values stay as template
+//! addresses inside the linker; output changes them to TLS offsets for .symtab.
+//!
+//! References: ELF gABI "Symbol Table" and "Symbol Value"; AMD64 psABI §§4.3–4.4.1;
+//! GNU ld [`PROVIDE`](https://sourceware.org/binutils/docs/ld/PROVIDE.html).
+
 use std::{cell::OnceCell, collections::HashMap};
 
 use anyhow::{Context, Result, ensure};
@@ -11,30 +25,49 @@ use crate::{
     script::ast::{Assignment, AssignmentKind, Location},
 };
 
+/// Map input indices and global names to the definitions this link chose.
+#[derive(Default)]
+pub(crate) struct SymbolTable {
+    symbols: Vec<ResolvedSymbol>,
+    pub(super) by_input: HashMap<(FileId, u16), SymbolId>,
+    pub(super) by_name: HashMap<String, SymbolId>,
+}
+
+/// A table index shared by all input references to one chosen definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SymbolId(usize);
 
+/// Keep where a value comes from until layout can compute it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Definition {
+    /// An input value is a section offset unless its section index is SHN_ABS.
     Input {
         file_id: FileId,
         section_idx: Elf64SymbolSectionIdx,
         value: u64,
     },
+    /// Layout computes the expression when it reaches this script assignment.
     Script {
+        /// Location of the chosen PROVIDE; `None` means a plain assignment.
         provide: Option<Location>,
     },
+    /// Missing weak references and the null symbol both get value zero.
     UndefinedWeak,
 }
 
+/// One chosen definition; layout sets its final value once.
 #[derive(Debug)]
 pub(crate) struct ResolvedSymbol {
     pub(crate) name: String,
+    /// `None` covers the null symbol and type numbers the reader does not name.
     pub(crate) ty: Option<Elf64SymbolType>,
     pub(crate) definition: Definition,
     pub(crate) binding: Elf64SymbolBinding,
     pub(crate) size: u64,
+    /// Raw `st_other`, including visibility bits.
     pub(crate) other: u8,
+    /// Unset for discarded input sections. TLS keeps a template address here;
+    /// output changes it to an offset only when writing .symtab.
     pub(crate) address: OnceCell<u64>,
 }
 
@@ -44,6 +77,7 @@ impl ResolvedSymbol {
             && matches!(self.definition, Definition::Input { .. })
     }
 
+    /// Reject TLS models and IFUNC references that this linker cannot handle.
     pub(crate) fn validate_relocation(&self, ty: X86_64RelocationType) -> Result<()> {
         use X86_64RelocationType::*;
         ensure!(
@@ -67,7 +101,8 @@ impl ResolvedSymbol {
             "non-TLS relocation {ty:?} references TLS symbol: {}",
             self.name
         );
-        // Local TLS variables may be referenced through their TLS section symbol.
+        // An assembler may name the TLS section plus an addend for a local
+        // variable, so STT_SECTION must work as well as STT_TLS.
         ensure!(
             !tls || matches!(
                 self.ty,
@@ -87,13 +122,6 @@ impl ResolvedSymbol {
         );
         Ok(())
     }
-}
-
-#[derive(Default)]
-pub(crate) struct SymbolTable {
-    symbols: Vec<ResolvedSymbol>,
-    pub(super) by_input: HashMap<(FileId, u16), SymbolId>,
-    pub(super) by_name: HashMap<String, SymbolId>,
 }
 
 impl SymbolTable {
@@ -123,6 +151,7 @@ impl SymbolTable {
         &self.symbols[id.0]
     }
 
+    /// Find the chosen definition for a relocation's per-file symbol index.
     pub(crate) fn input(&self, file_id: FileId, idx: u32) -> Result<SymbolId> {
         let idx = u16::try_from(idx).context("Failed to convert symbol index")?;
         self.by_input
@@ -135,14 +164,17 @@ impl SymbolTable {
         self.by_name.get(name).map(|id| self.get(*id))
     }
 
+    /// Visit all entries, including locals, in the order they were added.
     pub(crate) fn all_symbols(&self) -> impl Iterator<Item = &ResolvedSymbol> {
         self.symbols.iter()
     }
 
+    /// Visit global and script definitions; hash-map order is not stable.
     pub(crate) fn named_symbols(&self) -> impl Iterator<Item = &ResolvedSymbol> {
         self.by_name.values().map(|id| self.get(*id))
     }
 
+    /// Use only the PROVIDE chosen during resolution, even if the script has several.
     pub(crate) fn should_assign(&self, assignment: &Assignment) -> bool {
         if assignment.name == "." || assignment.kind == AssignmentKind::Define {
             return true;
@@ -153,6 +185,11 @@ impl SymbolTable {
         )
     }
 
+    /// Set each final value after section addresses stop changing.
+    ///
+    /// For an input definition, add the output address, the input's output offset,
+    /// and the symbol's input offset. Absolute and missing weak symbols need no
+    /// section; symbols in discarded sections stay unset.
     pub(crate) fn assign_addresses(
         &self,
         sections: &[OutputSection],
@@ -189,7 +226,7 @@ impl SymbolTable {
                 }
                 Definition::UndefinedWeak => Some(0),
             };
-            // Symbols in discarded/non-ALLOC sections have no output address.
+            // Discarded or non-allocated sections give no address to their symbols.
             if let Some(address) = address {
                 symbol.address.set(address).unwrap();
             }

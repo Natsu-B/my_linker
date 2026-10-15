@@ -1,4 +1,13 @@
-/// Match the glob syntax used by input file and section patterns.
+//! Match a script's file or section pattern against a name.
+//!
+//! [`matches()`] takes a glob and a name and returns whether they match.
+//! A glob is a name pattern: `*` matches any run of characters, `?` matches one,
+//! and brackets select a character class. [`super::mapping`] uses these GNU ld
+//! patterns to pick input sections; this code does not search the filesystem.
+//!
+//! References: [GNU ld input wildcards](https://sourceware.org/binutils/docs/ld/Input-Section-Wildcards.html);
+//! ELF gABI "Sections".
+
 pub(crate) fn matches(pattern: &str, name: &str) -> bool {
     let pattern = pattern.as_bytes();
     let name = name.as_bytes();
@@ -60,6 +69,8 @@ fn component(pattern: &[u8], byte: u8) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    //! Check wildcard matches, including bracket classes and literal brackets.
+
     use super::matches;
 
     #[test]

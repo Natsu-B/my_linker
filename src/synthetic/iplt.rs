@@ -1,3 +1,17 @@
+//! Build IFUNC call stubs and the records that fill their GOT slots.
+//!
+//! [`Iplt::new`] takes the GOT plan and picks its IFUNCs. An IFUNC symbol names a
+//! resolver that returns a function address at startup. Calls go through an IPLT
+//! stub, a small jump through the GOT slot. That gives direct function references
+//! one shared address before the resolver has run.
+//!
+//! After layout, [`Iplt::write`] fills the stubs and IRELATIVE records.
+//! Each record holds the GOT slot address in r_offset and the resolver address
+//! in r_addend; its symbol index is zero. Like GNU ld, the script marks the
+//! record range with `__rela_iplt_start` and `__rela_iplt_end` for glibc startup.
+//!
+//! References: ELF gABI "Relocation"; AMD64 psABI §§4.3, 4.4.1, and 5.2.
+
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
@@ -14,19 +28,24 @@ use super::{Got, GotEntry, SyntheticSection};
 const STUB_SIZE: u64 = 16;
 const RELA_SIZE: u64 = 24;
 
-pub(crate) struct IpltEntry {
-    pub(crate) symbol: SymbolId,
-    pub(crate) stub_offset: u64,
-    pub(crate) relocation_offset: u64,
-}
-
+/// One stub and startup record for each IFUNC result slot.
 #[derive(Default)]
 pub(crate) struct Iplt {
     entries: Vec<SymbolId>,
     offsets: HashMap<SymbolId, u64>,
 }
 
+/// One IFUNC's offsets in the stub input and the startup relocation input.
+pub(crate) struct IpltEntry {
+    pub(crate) symbol: SymbolId,
+    /// Byte offset from the start of .iplt.
+    pub(crate) stub_offset: u64,
+    /// Byte offset from the start of .rela.iplt.
+    pub(crate) relocation_offset: u64,
+}
+
 impl Iplt {
+    /// Use IFUNC slots from the GOT plan, in the same order.
     pub(crate) fn new(got: &Got) -> Self {
         let entries = got
             .entries()
@@ -61,6 +80,7 @@ impl Iplt {
         ]
     }
 
+    /// Give direct IFUNC references the stub address, not the resolver address.
     pub(crate) fn address(
         &self,
         id: SymbolId,
@@ -73,6 +93,7 @@ impl Iplt {
             .context("IPLT stub address exceeds u64")
     }
 
+    /// Write jumps through GOT slots and IRELATIVE records with resolver addends.
     pub(crate) fn write(
         &self,
         sections: &mut [OutputSection],
@@ -117,7 +138,8 @@ impl Iplt {
     }
 
     fn stub(address: u64, slot: u64) -> Result<[u8; STUB_SIZE as usize]> {
-        // jmp *slot(%rip), followed by int3 padding.
+        // RIP points past this six-byte jump, not at its start. Fill the rest
+        // with traps so a bad fall-through cannot run padding as code.
         let displacement = i32::try_from(i128::from(slot) - i128::from(address) - 6)
             .context("IPLT GOT slot is outside the signed 32-bit displacement range")?;
         let mut bytes = [0xcc; STUB_SIZE as usize];
@@ -128,7 +150,8 @@ impl Iplt {
 
     fn irelative(slot: u64, resolver: u64) -> [u8; RELA_SIZE as usize] {
         let mut bytes = [0; RELA_SIZE as usize];
-        // Elf64_Rela: r_offset, r_info (symbol 0), r_addend (resolver).
+        // IRELATIVE calls the resolver in r_addend and writes to r_offset.
+        // It needs no symbol lookup, so the symbol index stays zero.
         for (field, value) in
             bytes
                 .chunks_exact_mut(8)
@@ -142,6 +165,8 @@ impl Iplt {
 
 #[cfg(test)]
 mod tests {
+    //! Check RIP-relative jump bytes and IRELATIVE records with symbol index zero.
+
     use super::*;
 
     #[test]

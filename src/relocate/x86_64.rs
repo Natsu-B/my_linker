@@ -1,6 +1,20 @@
+//! Compute relocation values and check that they fit before writing them.
+//!
+//! [`compute`] takes a kind and [`Operands`] and returns a [`RelocationValue`].
+//! Its [`Width`] gives the field size; [`Signedness`] gives the allowed range.
+//! [`write_value`] checks that range and the byte-buffer bounds, then writes
+//! little-endian bytes. [`RelocationSite`] supplies error details.
+//!
+//! For example, PC32 stores `S + A - P`: the symbol address plus the addend,
+//! minus the patch address. We use a wide integer so a too-large result cannot
+//! wrap before we check it. As in GNU ld, 32 and 32S use different range checks.
+//!
+//! References: AMD64 psABI §4.4.1; ELF gABI "Relocation".
+
 use anyhow::{Context, Result, bail, ensure};
 use elf::x86_64::X86_64RelocationType;
 
+/// The psABI field size, including NONE's no-write case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Width {
     None,
@@ -8,17 +22,18 @@ pub(super) enum Width {
     Bits64,
 }
 
+/// Check the value's range before taking its low bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Signedness {
-    /// The value must fit after zero extension (e.g. R_X86_64_32).
+    /// R_X86_64_32 must fit after zero extension.
     Unsigned,
-    /// The value is two's complement in a 64-bit field (R_X86_64_64): the
-    /// psABI word64 accepts both signed and unsigned values, so `S + A` with a
-    /// negative result (e.g. undefined weak `S = 0` and `A < 0`) is valid.
+    /// A 64-bit word accepts signed or unsigned values, including `S = 0, A = -8`.
     Either,
+    /// PC and TLS offsets, and R_X86_64_32S, must fit after sign extension.
     Signed,
 }
 
+/// Keep a wide result with the range rule for the field it will fill.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct RelocationValue {
     pub(super) width: Width,
@@ -26,23 +41,30 @@ pub(super) struct RelocationValue {
     pub(super) value: i128,
 }
 
+/// Values used in the psABI formulas; GOT, TLS, and IFUNC values exist only when needed.
 pub(super) struct Operands {
+    /// S: chosen symbol value, still the resolver address for IFUNC.
     pub(super) symbol: u64,
+    /// A: explicit signed addend.
     pub(super) addend: i64,
+    /// P: address of the patch field.
     pub(super) place: u64,
+    /// G + GOT: the slot's address.
     pub(super) got_slot: Option<u64>,
+    /// tpoff(S): signed offset from TP.
     pub(super) tls_offset: Option<i64>,
+    /// Use the IFUNC stub in place of S or L for direct references.
     pub(super) iplt_address: Option<u64>,
 }
 
-/// Calculations for supported relocations (AMD64 psABI, section 4.4.1).
+/// Use the AMD64 psABI §4.4.1 formulas for the supported kinds.
 ///
-/// | R_X86_64_ suffix | Calculation | Field |
+/// | R_X86_64_ suffix | Value | Field |
 /// | --- | --- | --- |
 /// | NONE | no write | none |
-/// | 64 | S + A | unsigned 64 |
-/// | 32 | S + A | unsigned 32 (zero extension) |
-/// | 32S | S + A | signed 32 (sign extension) |
+/// | 64 | S + A | word64, signed or unsigned |
+/// | 32 | S + A | unsigned 32 |
+/// | 32S | S + A | signed 32 |
 /// | PC32 | S + A - P | signed 32 |
 /// | PLT32 | L + A - P | signed 32 |
 /// | GOTPCREL, GOTPCRELX, REX_GOTPCRELX | G + GOT + A - P | signed 32 |
@@ -50,15 +72,17 @@ pub(super) struct Operands {
 /// | TPOFF32 | tpoff(S) + A | signed 32 |
 /// | TPOFF64 | tpoff(S) + A | signed 64 |
 ///
-/// `got_slot` is G + GOT. For static output L is S unless an IFUNC needs an
-/// IPLT stub. GOTPCRELX instructions remain unrelaxed. Wide intermediate
-/// arithmetic keeps overflow checks separate from these psABI formulas.
+/// S is the symbol value, A the signed addend, and P the patch address.
+/// G is the slot offset from GOT; `got_slot` already adds them. L is the PLT
+/// address: S for an ordinary static function, the IPLT stub for an IFUNC.
+/// Direct IFUNC references use that stub for S too. tpoff(S) is the offset
+/// from the thread pointer. Leave GOTPCRELX instructions unchanged.
 pub(super) fn compute(ty: X86_64RelocationType, operands: &Operands) -> Result<RelocationValue> {
     use Signedness::{Either, Signed, Unsigned};
     use Width::{Bits32, Bits64};
     use X86_64RelocationType::*;
-    // The IPLT stub is the canonical function address of an IFUNC. Its
-    // resolver's S is retained separately for the IRELATIVE relocation.
+    // Direct IFUNC references use the stub so calls and function pointers
+    // agree. The caller keeps the resolver address for IRELATIVE.
     let s = i128::from(operands.iplt_address.unwrap_or(operands.symbol));
     let a = i128::from(operands.addend);
     let p = i128::from(operands.place);
@@ -87,13 +111,17 @@ pub(super) fn compute(ty: X86_64RelocationType, operands: &Operands) -> Result<R
     })
 }
 
+/// Name the kind, symbol, and patch address when a range or bounds check fails.
 pub(super) struct RelocationSite<'a> {
     pub(super) ty: X86_64RelocationType,
     pub(super) symbol: &'a str,
     pub(super) place: u64,
 }
 
-/// Check the psABI's extension rule before writing one little-endian field.
+/// Check the psABI range and buffer bounds before writing any bytes.
+///
+/// An overflow or bad offset must leave the target unchanged; report the
+/// relocation kind, symbol, and address with the error.
 pub(super) fn write_value(
     data: &mut [u8],
     offset: u64,
@@ -142,6 +170,8 @@ pub(super) fn write_value(
 
 #[cfg(test)]
 mod tests {
+    //! Check psABI formulas and prove that a failed field check writes no bytes.
+
     use super::*;
 
     #[test]

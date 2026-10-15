@@ -1,7 +1,21 @@
+//! Split script text into tokens for the parser.
+//!
+//! [`lex`] returns [`Token`] records with a [`TokenKind`], [`Location`], and
+//! byte range. It handles comments and quoted strings but leaves names and
+//! numbers for the parser to interpret.
+//!
+//! The byte ranges let the parser tell adjacent filename or glob pieces from
+//! separate expression tokens. A `*` can mean a wildcard or multiplication;
+//! the GNU ld script rule around it decides which.
+//!
+//! Reference: [GNU ld script format](https://sourceware.org/binutils/docs/ld/Script-Format.html)
+//! and expressions. [`super::mapping`] later gives section names their ELF meaning.
+
 use anyhow::{Result, bail};
 
 use super::ast::Location;
 
+/// Keep words unsplit until the parser knows whether they name a file or an expression.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum TokenKind {
     Word(String),
@@ -14,14 +28,18 @@ pub(super) enum TokenKind {
     Eof,
 }
 
+/// Keep line and column for errors and byte offsets for pattern joins.
 #[derive(Clone, Debug)]
 pub(super) struct Token {
     pub(crate) kind: TokenKind,
     pub(crate) location: Location,
+    /// First byte in the source; adjacent spans can form one filename or glob.
     pub(crate) start: usize,
+    /// First byte after the token.
     pub(crate) end: usize,
 }
 
+/// Read comments, strings, and tokens, then add an EOF token with the final position.
 pub(super) fn lex(source: &str) -> Result<Vec<Token>> {
     let mut lexer = Lexer {
         source,
@@ -149,6 +167,8 @@ impl Lexer<'_> {
 
 #[cfg(test)]
 mod tests {
+    //! Check where tokens start and end around comments and strings.
+
     use super::*;
 
     #[test]

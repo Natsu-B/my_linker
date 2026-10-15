@@ -1,3 +1,18 @@
+//! Write the patched image as an ELF executable.
+//!
+//! [`write()`] takes a [`LinkedImage`] and an output path. It joins sections into
+//! load segments and asks [`ExecElf64Writer`] to fill a writable memory map.
+//! `SectionHeaderIndices` gives kept output sections their ELF numbers after
+//! empty sections are dropped.
+//!
+//! Program headers tell the kernel what to load. Section headers and the static
+//! symbol table let readelf, nm, and debuggers inspect the result. Those tables
+//! follow the loaded bytes. Like GNU ld, we write TLS symbol values as offsets
+//! in the TLS template, not virtual addresses.
+//!
+//! References: ELF gABI "ELF Header", "Sections", "String Table", "Symbol Table",
+//! and "Program Header"; AMD64 psABI §§4.3 and 5.1.
+
 use std::{
     fs::{OpenOptions, Permissions},
     os::unix::fs::PermissionsExt,
@@ -18,7 +33,39 @@ use crate::{
     synthetic::SyntheticSection,
 };
 
-/// Translate layout indices to ELF section indices without emitting empty sections.
+/// Write the patched image and ELF tables, flush the file, and make it executable.
+///
+/// Compute the final size before making the writable map. Load segments own
+/// the allocated bytes; symbol and name tables follow them outside the loads.
+pub(crate) fn write(linked: LinkedImage, output_file: String) -> Result<()> {
+    pr_debug!("Write output file: {}", output_file);
+    let indices = SectionHeaderIndices::new(&linked.layout.sections)?;
+    let tables = symbol_table_sections(&linked, &indices)?;
+    let mut writer = executable_writer(
+        linked.layout.sections,
+        &linked.layout.headers,
+        linked.layout.tls,
+        linked.entry,
+    )?;
+    writer.sections.extend(tables);
+    let file_size = writer.file_size()?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&output_file)?;
+    file.set_len(file_size)?;
+    // SAFETY: We set the file's final size and write only through this map.
+    // The caller must prevent other writers from truncating the file.
+    let mut mmap = unsafe { MmapMut::map_mut(&file) }?;
+    writer.write_into(&mut mmap)?;
+    mmap.flush()?;
+    file.set_permissions(Permissions::from_mode(0o755))?;
+    Ok(())
+}
+
+/// Give only nonempty output sections ELF indices, starting after section zero.
 struct SectionHeaderIndices {
     by_output: Vec<Option<u16>>,
     kept_count: usize,
@@ -61,9 +108,9 @@ impl SectionHeaderIndices {
             .by_output
             .get(output_index..)
             .context("symbol output section index is out of range")?;
-        // An empty section's markers retain their values. Associate them with
-        // the following kept section, or the preceding one at the end of the
-        // image. This also makes empty preinit-array markers name .init_array.
+        // Empty sections have no header, but their marker symbols still need
+        // a section index. Use the next kept section, or the last one at EOF;
+        // empty preinit-array markers then name .init_array.
         Ok(following
             .iter()
             .find_map(|index| *index)
@@ -110,8 +157,8 @@ fn output_sections(
                 .inputs
                 .iter()
                 .any(|(input, _)| input.flags.get(Elf64SectionFlags::SHF_TLS) != 0);
-            // MERGE/STRINGS describe the whole output only when every input has
-            // that attribute and their fixed-size entries agree.
+            // MERGE/STRINGS apply to every entry, so keep a flag only when all
+            // inputs have it and agree on entry size.
             let merge = entry_size != 0
                 && section
                     .inputs
@@ -136,8 +183,8 @@ fn output_sections(
                 .set(Elf64SectionFlags::SHF_MERGE, u64::from(merge))
                 .set(Elf64SectionFlags::SHF_STRINGS, u64::from(strings));
             let info = if contains_synthetic(section, SyntheticSection::RelaIplt) {
-                // IRELATIVE records write the synthetic GOT slots. SHF_INFO_LINK
-                // makes sh_info identify that output section, even under a custom name.
+                // IRELATIVE writes GOT slots. SHF_INFO_LINK makes sh_info
+                // point to their output section even if a script renames it.
                 let target = sections
                     .iter()
                     .position(|candidate| contains_synthetic(candidate, SyntheticSection::Got))
@@ -201,8 +248,8 @@ fn output_symbol<'a>(
     };
     let mut value = *symbol.address.get().context("output symbol has no value")?;
     if symbol.ty == Some(Elf64SymbolType::STT_TLS) && output_index.is_some() {
-        // Executable TLS st_value is an offset in the TLS template, whereas
-        // relocation evaluation keeps using the symbol's virtual address.
+        // ELF writes TLS st_value as an offset from the template start.
+        // Relocation math inside the linker still needs a virtual address.
         value = value
             .checked_sub(
                 linked
@@ -239,7 +286,8 @@ fn symbol_table_sections(
     }) {
         builder.add(output_symbol(symbol, linked, indices)?);
     }
-    // The allocated headers follow section zero, then .symtab and .strtab.
+    // sh_link names .strtab by its ELF index: count section zero, the kept
+    // allocated sections, and .symtab before it.
     let strtab_index = u32::try_from(indices.kept_count + 2).context("too many sections")?;
     builder.build(strtab_index)
 }
@@ -280,8 +328,8 @@ fn executable_writer(
         mem_size: 0,
         align: 16,
     });
-    // Layout reserved SIZEOF_HEADERS bytes before the first section; the
-    // headers written here must fit exactly in that space.
+    // The script placed bytes using SIZEOF_HEADERS. A different header count
+    // here would move those bytes and break their assigned addresses.
     let phnum = 1 + writer.segments.len() + writer.program_headers.len();
     ensure!(
         ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE * phnum as u64 == headers.size,
@@ -289,7 +337,8 @@ fn executable_writer(
         headers.size
     );
     if let Some(tls) = tls {
-        // All headers are reserved before translating the TLS template VMA.
+        // Adding a header can move load bytes, so find the TLS file offset
+        // only after adding every header.
         let offset = writer.file_offset(tls.vaddr)?;
         let header = writer
             .program_headers
@@ -302,34 +351,10 @@ fn executable_writer(
     Ok(writer)
 }
 
-pub(crate) fn write(linked: LinkedImage, output_file: String) -> Result<()> {
-    pr_debug!("Write output file: {}", output_file);
-    let indices = SectionHeaderIndices::new(&linked.layout.sections)?;
-    let tables = symbol_table_sections(&linked, &indices)?;
-    let mut writer = executable_writer(
-        linked.layout.sections,
-        &linked.layout.headers,
-        linked.layout.tls,
-        linked.entry,
-    )?;
-    writer.sections.extend(tables);
-    let file_size = writer.file_size()?;
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&output_file)?;
-    file.set_len(file_size)?;
-    let mut mmap = unsafe { MmapMut::map_mut(&file) }?;
-    writer.write_into(&mut mmap)?;
-    mmap.flush()?;
-    file.set_permissions(Permissions::from_mode(0o755))?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
+    //! Check that TLS headers describe both copied bytes and zero-filled memory.
+
     use std::{borrow::Cow, cell::OnceCell};
 
     use super::*;
@@ -386,7 +411,7 @@ mod tests {
 
     #[test]
     fn tls_headers_describe_initialized_zero_fill_and_alignment_ranges() {
-        // Exercise both a TLS tail and initialized RW data after .tbss.
+        // Data after .tbss forces zero fill into the load's file bytes.
         for following_data in [false, true] {
             for (mut sections, expected) in [
                 (
