@@ -1,36 +1,41 @@
+mod got;
+mod iplt;
+
+pub(crate) use got::{Got, GotEntry};
+pub(crate) use iplt::Iplt;
+
 use std::borrow::Cow;
 
 use anyhow::{Context, Result};
 use elf::{Elf64SectionFlags, Elf64SectionType};
 
 use crate::{
-    input_id::FileId,
-    link::{SectionIndex, SectionLocation, SectionPlacement},
-    parse::ObjectSection,
+    input::{FileId, object::InputSection},
+    layout::{OutputSection, SectionIndex, SectionLocation},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SyntheticSection {
+pub(crate) enum SyntheticSection {
     Got = 0,
     Iplt = 1,
     RelaIplt = 2,
 }
 
 impl SyntheticSection {
-    pub const ALL: [Self; 3] = [Self::Got, Self::Iplt, Self::RelaIplt];
+    pub(crate) const ALL: [Self; 3] = [Self::Got, Self::Iplt, Self::RelaIplt];
 
-    pub fn is_input(self, input: &ObjectSection) -> bool {
-        input.file_id == FileId::Synthetic && input.idx == self as u16
+    pub(crate) fn is_input(self, input: &InputSection) -> bool {
+        input.file_id == FileId::LinkerGenerated && input.idx == self as u16
     }
 
-    pub fn section(self, size: u64) -> ObjectSection<'static> {
+    pub(crate) fn section(self, size: u64) -> InputSection<'static> {
         let (name, align) = match self {
             Self::Got => (".got", 8),
             Self::Iplt => (".iplt", 16),
             Self::RelaIplt => (".rela.iplt", 8),
         };
-        ObjectSection {
-            file_id: FileId::Synthetic,
+        InputSection {
+            file_id: FileId::LinkerGenerated,
             idx: self as u16,
             name,
             flags: Elf64SectionFlags::new()
@@ -56,25 +61,25 @@ impl SyntheticSection {
         }
     }
 
-    pub fn location(self, index: &SectionIndex) -> Result<&SectionLocation> {
+    pub(crate) fn location(self, index: &SectionIndex) -> Result<&SectionLocation> {
         index
-            .get(&(FileId::Synthetic, self as u16))
+            .get(&(FileId::LinkerGenerated, self as u16))
             .with_context(|| format!("synthetic {self:?} input section was discarded"))
     }
 
-    pub fn address(self, sections: &[SectionPlacement], index: &SectionIndex) -> Result<u64> {
+    pub(crate) fn address(self, sections: &[OutputSection], index: &SectionIndex) -> Result<u64> {
         let location = self.location(index)?;
         sections[location.output_idx]
-            .va
+            .address
             .get()
             .context("synthetic output section has no address")?
             .checked_add(location.offset)
             .context("synthetic input address exceeds u64")
     }
 
-    pub fn write(
+    pub(crate) fn write(
         self,
-        sections: &mut [SectionPlacement],
+        sections: &mut [OutputSection],
         index: &SectionIndex,
         offset: u64,
         bytes: &[u8],

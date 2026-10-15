@@ -4,24 +4,24 @@ use anyhow::{Context, Result};
 use elf::x86_64::X86_64RelocationType;
 
 use crate::{
-    got::{Got, GotEntry},
-    link::{SectionIndex, SectionPlacement},
-    parse::ObjectSection,
-    resolve::{SymbolId, SymbolTable},
-    synthetic::SyntheticSection,
+    input::object::InputSection,
+    layout::{OutputSection, SectionIndex},
+    symbols::{SymbolId, SymbolTable},
 };
+
+use super::{Got, GotEntry, SyntheticSection};
 
 const STUB_SIZE: u64 = 16;
 const RELA_SIZE: u64 = 24;
 
 #[derive(Default)]
-pub struct Iplt {
+pub(crate) struct Iplt {
     entries: Vec<SymbolId>,
     offsets: HashMap<SymbolId, u64>,
 }
 
 impl Iplt {
-    pub fn new(got: &Got) -> Self {
+    pub(crate) fn new(got: &Got) -> Self {
         let entries = got
             .entries()
             .filter_map(|(entry, _)| match entry {
@@ -37,17 +37,17 @@ impl Iplt {
         Self { entries, offsets }
     }
 
-    pub fn sections(&self) -> [ObjectSection<'static>; 2] {
+    pub(crate) fn sections(&self) -> [InputSection<'static>; 2] {
         [
             SyntheticSection::Iplt.section(self.entries.len() as u64 * STUB_SIZE),
             SyntheticSection::RelaIplt.section(self.entries.len() as u64 * RELA_SIZE),
         ]
     }
 
-    pub fn address(
+    pub(crate) fn address(
         &self,
         id: SymbolId,
-        sections: &[SectionPlacement],
+        sections: &[OutputSection],
         index: &SectionIndex,
     ) -> Result<u64> {
         SyntheticSection::Iplt
@@ -56,9 +56,9 @@ impl Iplt {
             .context("IPLT stub address exceeds u64")
     }
 
-    pub fn write(
+    pub(crate) fn write(
         &self,
-        sections: &mut [SectionPlacement],
+        sections: &mut [OutputSection],
         index: &SectionIndex,
         got: &Got,
         symbols: &SymbolTable,
@@ -71,7 +71,7 @@ impl Iplt {
         for (entry, id) in self.entries.iter().enumerate() {
             let offset = entry as u64 * STUB_SIZE;
             let slot = got_va + got.offset(GotEntry::Ifunc(*id))?;
-            let resolver = *symbols.get(*id).va.get().with_context(|| {
+            let resolver = *symbols.get(*id).address.get().with_context(|| {
                 format!(
                     "IFUNC resolver has no output address: {}",
                     symbols.get(*id).name

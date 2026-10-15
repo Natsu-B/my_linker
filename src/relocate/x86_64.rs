@@ -1,27 +1,36 @@
-use crate::{got::GotEntry, input_id::FileId, link::Linked, synthetic::SyntheticSection};
+use crate::{
+    input::FileId,
+    layout::Layout,
+    link::LinkedImage,
+    synthetic::{GotEntry, SyntheticSection},
+};
 
 use anyhow::{Context, Result, bail};
 use elf::x86_64::X86_64RelocationType;
 use num::traits::ToBytes;
 
-pub fn relocate(linked: &mut Linked, entry_name: &str) -> Result<u64 /* start address */> {
+pub(crate) fn apply(linked: &mut LinkedImage, entry_name: &str) -> Result<u64 /* start address */> {
     pr_debug!("Relocating sections...");
-    let Linked {
-        sections,
+    let LinkedImage {
+        layout,
         symbols,
         relocations,
-        section_index,
         got,
         iplt,
-        elf_data,
     } = linked;
-    let got_location = section_index.get(&(FileId::Synthetic, SyntheticSection::Got as u16));
+    let Layout {
+        sections,
+        section_index,
+        tls,
+        ..
+    } = layout;
+    let got_location = section_index.get(&(FileId::LinkerGenerated, SyntheticSection::Got as u16));
     let got_va = got_location
-        .map(|location| sections[location.output_idx].va.get().unwrap() + location.offset);
+        .map(|location| sections[location.output_idx].address.get().unwrap() + location.offset);
     for (entry, offset) in got.entries() {
         let location = got_location.context("synthetic GOT input section was discarded")?;
         let (GotEntry::Address(id) | GotEntry::TpOff(id) | GotEntry::Ifunc(id)) = entry;
-        let address = *symbols.get(id).va.get().with_context(|| {
+        let address = *symbols.get(id).address.get().with_context(|| {
             format!("GOT target has no output address: {}", symbols.get(id).name)
         })?;
         let data = sections[location.output_idx]
@@ -33,8 +42,7 @@ pub fn relocate(linked: &mut Linked, entry_name: &str) -> Result<u64 /* start ad
                 write_data(data, location.offset + offset, address)?;
             }
             GotEntry::TpOff(_) => {
-                let tpoff = elf_data
-                    .tls
+                let tpoff = tls
                     .context("TLS GOT entry has no TLS segment")?
                     .tpoff(address)
                     .with_context(|| {
@@ -88,7 +96,7 @@ pub fn relocate(linked: &mut Linked, entry_name: &str) -> Result<u64 /* start ad
         };
         let section = &mut sections[location.output_idx];
         let section_va = *section
-            .va
+            .address
             .get()
             .context("relocation section has no address")?;
         let target_offset = location.offset;
@@ -99,7 +107,7 @@ pub fn relocate(linked: &mut Linked, entry_name: &str) -> Result<u64 /* start ad
         // S comes from the winning definition, including references within
         // an object whose weak definition was replaced by a strong one.
         let symbol_addr = canonical_address
-            .or_else(|| target_symbol.va.get().copied())
+            .or_else(|| target_symbol.address.get().copied())
             .with_context(|| {
                 format!(
                     "relocation target has no output address: {}",
@@ -146,8 +154,7 @@ pub fn relocate(linked: &mut Linked, entry_name: &str) -> Result<u64 /* start ad
                 write_data(target_data, target_offset + relocation.offset, addr)?;
             }
             X86_64RelocationType::TpOff32 | X86_64RelocationType::TpOff64 => {
-                let tpoff = elf_data
-                    .tls
+                let tpoff = tls
                     .context("TLS relocation has no TLS segment")?
                     .tpoff(symbol_addr)
                     .with_context(|| {
@@ -221,7 +228,7 @@ pub fn relocate(linked: &mut Linked, entry_name: &str) -> Result<u64 /* start ad
 
     symbols
         .named(entry_name)
-        .and_then(|symbol| symbol.va.get().copied())
+        .and_then(|symbol| symbol.address.get().copied())
         .context("Failed to find entry point")
 }
 

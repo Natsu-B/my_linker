@@ -1,5 +1,5 @@
 /// Match the glob syntax used by input file and section patterns.
-pub fn matches(pattern: &str, name: &str) -> bool {
+pub(crate) fn matches(pattern: &str, name: &str) -> bool {
     let pattern = pattern.as_bytes();
     let name = name.as_bytes();
     let (mut p, mut n) = (0, 0);

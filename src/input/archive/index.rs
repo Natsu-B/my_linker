@@ -3,25 +3,27 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use elf::{Elf64SymbolBinding, Elf64SymbolInfo, Elf64SymbolSectionIdx, Elf64SymbolType};
 
-use crate::{archive::ArchiveReader, input_id::FileId, parse};
+use crate::input::{FileId, object};
 
-pub struct MemberInfo<'a> {
-    pub name: String,
-    pub bytes: &'a [u8],
+use super::reader::ArchiveReader;
+
+pub(crate) struct MemberInfo<'a> {
+    pub(crate) name: String,
+    pub(crate) bytes: &'a [u8],
 }
 
-pub struct ArchiveState<'a> {
-    pub file_name: String,
-    pub archive_idx: usize,
-    pub members: Vec<MemberInfo<'a>>,
-    pub by_symbol: HashMap<&'a str, usize>,
-    pub extracted: Vec<bool>,
+pub(crate) struct ArchiveState<'a> {
+    pub(crate) file_name: String,
+    pub(crate) archive_index: usize,
+    pub(crate) members: Vec<MemberInfo<'a>>,
+    pub(crate) by_symbol: HashMap<&'a str, usize>,
+    pub(crate) extracted: Vec<bool>,
 }
 
-pub fn index_archive<'a>(
+pub(crate) fn index_archive<'a>(
     bytes: &'a [u8],
     file_name: String,
-    archive_idx: usize,
+    archive_index: usize,
 ) -> Result<ArchiveState<'a>> {
     let reader = ArchiveReader::new(bytes)
         .with_context(|| format!("failed to parse archive: {file_name}"))?;
@@ -29,7 +31,7 @@ pub fn index_archive<'a>(
     let mut members: Vec<MemberInfo<'a>> = Vec::new();
     let mut by_symbol: HashMap<&'a str, usize> = HashMap::new();
 
-    for (member_idx, member) in reader.object_members().enumerate() {
+    for (member_index, member) in reader.object_members().enumerate() {
         let member =
             member.with_context(|| format!("failed to read archive member in {file_name}"))?;
         let name = member
@@ -38,10 +40,10 @@ pub fn index_archive<'a>(
         let member_bytes = member
             .object_bytes()
             .with_context(|| format!("failed to read object bytes for {file_name}({name})"))?;
-        let object = parse_member_object(member_bytes, &name, archive_idx, member_idx)
+        let object = parse_member_object(member_bytes, &name, archive_index, member_index)
             .with_context(|| format!("failed to parse archive member {name}"))?;
         for symbol in collect_defined_symbols(&object) {
-            by_symbol.entry(symbol).or_insert(member_idx);
+            by_symbol.entry(symbol).or_insert(member_index);
         }
 
         members.push(MemberInfo {
@@ -54,7 +56,7 @@ pub fn index_archive<'a>(
 
     Ok(ArchiveState {
         file_name,
-        archive_idx,
+        archive_index,
         members,
         by_symbol,
         extracted,
@@ -64,20 +66,20 @@ pub fn index_archive<'a>(
 fn parse_member_object<'a>(
     bytes: &'a [u8],
     member_name: &str,
-    archive_idx: usize,
-    member_idx: usize,
-) -> Result<parse::ObjectFile<'a>> {
-    parse::parse(
+    archive_index: usize,
+    member_index: usize,
+) -> Result<object::ObjectFile<'a>> {
+    object::parse(
         bytes,
         member_name.to_string(),
         FileId::ArchiveMember {
-            archive_idx,
-            member_idx,
+            archive_index,
+            member_index,
         },
     )
 }
 
-fn collect_defined_symbols<'a>(object: &parse::ObjectFile<'a>) -> Vec<&'a str> {
+fn collect_defined_symbols<'a>(object: &object::ObjectFile<'a>) -> Vec<&'a str> {
     let mut defined = Vec::new();
 
     for symbol in &object.symbols {
@@ -107,7 +109,7 @@ fn collect_defined_symbols<'a>(object: &parse::ObjectFile<'a>) -> Vec<&'a str> {
 mod tests {
     use super::{index_archive, parse_member_object};
     use crate::{
-        input_id::FileId,
+        input::FileId,
         test_utils::{TestRelocation, TestSymbol, build_archive, build_rel_object},
     };
     use elf::{Elf64SymbolBinding, Elf64SymbolType};
@@ -130,7 +132,7 @@ mod tests {
         let state = index_archive(&archive, "libfoo.a".to_string(), 3).unwrap();
 
         assert_eq!(state.file_name, "libfoo.a");
-        assert_eq!(state.archive_idx, 3);
+        assert_eq!(state.archive_index, 3);
         assert_eq!(state.members.len(), 1);
         assert_eq!(state.members[0].name, "foo.o");
         assert_eq!(state.by_symbol["foo"], 0);
@@ -328,8 +330,8 @@ mod tests {
         let archive = build_archive(&[("foo.o/", &object)]);
         let state = index_archive(&archive, "libfoo.a".to_string(), 9).unwrap();
         let file_id = FileId::ArchiveMember {
-            archive_idx: 9,
-            member_idx: 0,
+            archive_index: 9,
+            member_index: 0,
         };
 
         let parsed =

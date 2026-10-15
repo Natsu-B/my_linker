@@ -16,10 +16,10 @@ pub(super) enum TokenKind {
 
 #[derive(Clone, Debug)]
 pub(super) struct Token {
-    pub kind: TokenKind,
-    pub location: Location,
-    pub start: usize,
-    pub end: usize,
+    pub(crate) kind: TokenKind,
+    pub(crate) location: Location,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
 }
 
 pub(super) fn lex(source: &str) -> Result<Vec<Token>> {

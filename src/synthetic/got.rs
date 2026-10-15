@@ -4,28 +4,29 @@ use anyhow::{Context, Result};
 use elf::x86_64::X86_64RelocationType;
 
 use crate::{
-    parse::{ObjectRelocation, ObjectSection},
-    resolve::{SymbolId, SymbolTable},
-    synthetic::SyntheticSection,
+    input::object::{InputSection, ObjectRelocation},
+    symbols::{SymbolId, SymbolTable},
 };
+
+use super::SyntheticSection;
 
 const ENTRY_SIZE: u64 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum GotEntry {
+pub(crate) enum GotEntry {
     Address(SymbolId),
     TpOff(SymbolId),
     Ifunc(SymbolId),
 }
 
 #[derive(Default)]
-pub struct Got {
+pub(crate) struct Got {
     entries: Vec<GotEntry>,
     offsets: HashMap<GotEntry, u64>,
 }
 
 impl Got {
-    pub fn needs_entry(ty: u32) -> bool {
+    pub(crate) fn needs_entry(ty: u32) -> bool {
         matches!(
             X86_64RelocationType::try_from(ty),
             Ok(X86_64RelocationType::GotPcRel
@@ -35,7 +36,7 @@ impl Got {
         )
     }
 
-    pub fn collect(relocations: &[ObjectRelocation], symbols: &SymbolTable) -> Result<Self> {
+    pub(crate) fn collect(relocations: &[ObjectRelocation], symbols: &SymbolTable) -> Result<Self> {
         let mut got = Self::default();
         for relocation in relocations {
             let ty = X86_64RelocationType::try_from(relocation.info)?;
@@ -71,21 +72,21 @@ impl Got {
         }
     }
 
-    pub fn entries(&self) -> impl Iterator<Item = (GotEntry, u64)> + '_ {
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (GotEntry, u64)> + '_ {
         self.entries
             .iter()
             .enumerate()
             .map(|(index, entry)| (*entry, index as u64 * ENTRY_SIZE))
     }
 
-    pub fn offset(&self, entry: GotEntry) -> Result<u64> {
+    pub(crate) fn offset(&self, entry: GotEntry) -> Result<u64> {
         self.offsets
             .get(&entry)
             .copied()
             .context("missing GOT entry for resolved symbol")
     }
 
-    pub fn section(&self) -> ObjectSection<'static> {
+    pub(crate) fn section(&self) -> InputSection<'static> {
         SyntheticSection::Got.section(self.entries.len() as u64 * ENTRY_SIZE)
     }
 }
@@ -94,9 +95,9 @@ impl Got {
 mod tests {
     use super::*;
     use crate::{
-        input_id::FileId,
-        iplt::Iplt,
-        parse, resolve,
+        input::{FileId, object},
+        symbols,
+        synthetic::Iplt,
         test_utils::{TestRelocation, TestSymbol, build_rel_object},
     };
     use elf::{Elf64SectionFlags, Elf64SymbolBinding, Elf64SymbolType};
@@ -125,9 +126,24 @@ mod tests {
             }),
         );
         let mut objects = [
-            parse::parse(&definition, "def.o".to_string(), FileId::Object(0)).unwrap(),
-            parse::parse(&reference, "a.o".to_string(), FileId::Object(1)).unwrap(),
-            parse::parse(&reference, "b.o".to_string(), FileId::Object(2)).unwrap(),
+            object::parse(
+                &definition,
+                "def.o".to_string(),
+                FileId::InputObject { input_index: 0 },
+            )
+            .unwrap(),
+            object::parse(
+                &reference,
+                "a.o".to_string(),
+                FileId::InputObject { input_index: 1 },
+            )
+            .unwrap(),
+            object::parse(
+                &reference,
+                "b.o".to_string(),
+                FileId::InputObject { input_index: 2 },
+            )
+            .unwrap(),
         ];
         let symbols = objects
             .iter_mut()
@@ -137,7 +153,7 @@ mod tests {
             .into_iter()
             .flat_map(|object| object.relocations)
             .collect::<Vec<_>>();
-        let symbols = resolve::resolve_names(&symbols, &[]).unwrap();
+        let symbols = symbols::resolve(&symbols, &[]).unwrap();
         let got = Got::collect(&relocations, &symbols).unwrap();
         assert_eq!(got.entries().count(), 1);
         assert_eq!(got.section().size, 8);
@@ -148,7 +164,9 @@ mod tests {
         for file in 0..3 {
             assert_eq!(
                 got.offset(GotEntry::Address(
-                    symbols.input(FileId::Object(file), 1).unwrap()
+                    symbols
+                        .input(FileId::InputObject { input_index: file }, 1)
+                        .unwrap()
                 ))
                 .unwrap(),
                 0
@@ -168,8 +186,18 @@ mod tests {
             }],
         );
         let mut objects = [
-            parse::parse(&bytes, "a.o".to_string(), FileId::Object(0)).unwrap(),
-            parse::parse(&bytes, "b.o".to_string(), FileId::Object(1)).unwrap(),
+            object::parse(
+                &bytes,
+                "a.o".to_string(),
+                FileId::InputObject { input_index: 0 },
+            )
+            .unwrap(),
+            object::parse(
+                &bytes,
+                "b.o".to_string(),
+                FileId::InputObject { input_index: 1 },
+            )
+            .unwrap(),
         ];
         let symbols = objects
             .iter_mut()
@@ -179,20 +207,24 @@ mod tests {
             .into_iter()
             .flat_map(|object| object.relocations)
             .collect::<Vec<_>>();
-        let symbols = resolve::resolve_names(&symbols, &[]).unwrap();
+        let symbols = symbols::resolve(&symbols, &[]).unwrap();
         let got = Got::collect(&relocations, &symbols).unwrap();
         assert_eq!(got.entries().count(), 2);
         assert_eq!(got.section().size, 16);
         assert_eq!(
             got.offset(GotEntry::Address(
-                symbols.input(FileId::Object(0), 1).unwrap()
+                symbols
+                    .input(FileId::InputObject { input_index: 0 }, 1)
+                    .unwrap()
             ))
             .unwrap(),
             0
         );
         assert_eq!(
             got.offset(GotEntry::Address(
-                symbols.input(FileId::Object(1), 1).unwrap()
+                symbols
+                    .input(FileId::InputObject { input_index: 1 }, 1)
+                    .unwrap()
             ))
             .unwrap(),
             8
@@ -202,9 +234,16 @@ mod tests {
     #[test]
     fn tls_offsets_are_deduplicated_separately_from_addresses() {
         let bytes = build_rel_object(&[symbol(Elf64SymbolBinding::STB_GLOBAL, 2)], &[]);
-        let object = parse::parse(&bytes, "a.o".to_string(), FileId::Object(0)).unwrap();
-        let symbols = resolve::resolve_names(&object.symbols, &[]).unwrap();
-        let id = symbols.input(FileId::Object(0), 1).unwrap();
+        let object = object::parse(
+            &bytes,
+            "a.o".to_string(),
+            FileId::InputObject { input_index: 0 },
+        )
+        .unwrap();
+        let symbols = symbols::resolve(&object.symbols, &[]).unwrap();
+        let id = symbols
+            .input(FileId::InputObject { input_index: 0 }, 1)
+            .unwrap();
         let mut got = Got::default();
         for _ in 0..2 {
             got.allocate(GotEntry::Address(id));
@@ -236,16 +275,33 @@ mod tests {
                 addend: -4,
             }),
         );
-        let definition = parse::parse(&definition, "def.o".to_string(), FileId::Object(0)).unwrap();
-        let reference = parse::parse(&reference, "ref.o".to_string(), FileId::Object(1)).unwrap();
+        let definition = object::parse(
+            &definition,
+            "def.o".to_string(),
+            FileId::InputObject { input_index: 0 },
+        )
+        .unwrap();
+        let reference = object::parse(
+            &reference,
+            "ref.o".to_string(),
+            FileId::InputObject { input_index: 1 },
+        )
+        .unwrap();
         let symbols = definition
             .symbols
             .into_iter()
             .chain(reference.symbols)
             .collect::<Vec<_>>();
-        let symbols = resolve::resolve_names(&symbols, &[]).unwrap();
-        let id = symbols.input(FileId::Object(0), 1).unwrap();
-        assert_eq!(symbols.input(FileId::Object(1), 1).unwrap(), id);
+        let symbols = symbols::resolve(&symbols, &[]).unwrap();
+        let id = symbols
+            .input(FileId::InputObject { input_index: 0 }, 1)
+            .unwrap();
+        assert_eq!(
+            symbols
+                .input(FileId::InputObject { input_index: 1 }, 1)
+                .unwrap(),
+            id
+        );
         let got = Got::collect(&reference.relocations, &symbols).unwrap();
         assert_eq!(
             got.entries().collect::<Vec<_>>(),

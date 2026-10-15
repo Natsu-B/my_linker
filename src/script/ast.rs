@@ -1,9 +1,9 @@
 use std::fmt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Location {
-    pub line: usize,
-    pub column: usize,
+pub(crate) struct Location {
+    pub(crate) line: usize,
+    pub(crate) column: usize,
 }
 
 impl fmt::Display for Location {
@@ -13,12 +13,12 @@ impl fmt::Display for Location {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Script {
-    pub statements: Vec<Statement>,
+pub(crate) struct Script {
+    pub(crate) statements: Vec<Statement>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Statement {
+pub(crate) enum Statement {
     Entry(String),
     Sections(Vec<SectionStatement>),
     Assignment(Assignment),
@@ -26,7 +26,7 @@ pub enum Statement {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IgnoredCommand {
+pub(crate) enum IgnoredCommand {
     OutputFormat,
     OutputArch,
     Constructors,
@@ -34,64 +34,64 @@ pub enum IgnoredCommand {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SectionStatement {
+pub(crate) enum SectionStatement {
     Assignment(Assignment),
-    Output(OutputSection),
+    Output(OutputSectionRule),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Assignment {
-    pub name: String,
-    pub value: Expr,
-    pub kind: AssignmentKind,
-    pub location: Location,
+pub(crate) struct Assignment {
+    pub(crate) name: String,
+    pub(crate) value: Expr,
+    pub(crate) kind: AssignmentKind,
+    pub(crate) location: Location,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AssignmentKind {
+pub(crate) enum AssignmentKind {
     Define,
     Provide,
     ProvideHidden,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OutputSection {
-    pub name: String,
-    pub address: Option<Expr>,
-    pub constraint: Option<SectionConstraint>,
-    pub info: bool,
-    pub statements: Vec<OutputStatement>,
-    pub location: Location,
+pub(crate) struct OutputSectionRule {
+    pub(crate) name: String,
+    pub(crate) address: Option<Expr>,
+    pub(crate) constraint: Option<SectionConstraint>,
+    pub(crate) info: bool,
+    pub(crate) statements: Vec<OutputStatement>,
+    pub(crate) location: Location,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SectionConstraint {
+pub(crate) enum SectionConstraint {
     ReadOnly,
     ReadWrite,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum OutputStatement {
+pub(crate) enum OutputStatement {
     Assignment(Assignment),
-    Input(InputSection),
+    Input(InputSectionRule),
     Ignored(IgnoredCommand),
 }
 
 // Keep the wrappers in the tree so layout can apply sorting and exclusions
 // at the scope where they appeared in the script.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum InputSection {
+pub(crate) enum InputSectionRule {
     File {
         pattern: String,
         sections: Vec<SectionPattern>,
     },
-    Keep(Box<InputSection>),
-    Sort(SortKind, Box<InputSection>),
-    ExcludeFile(Vec<String>, Box<InputSection>),
+    Keep(Box<InputSectionRule>),
+    Sort(SortKind, Box<InputSectionRule>),
+    ExcludeFile(Vec<String>, Box<InputSectionRule>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SectionPattern {
+pub(crate) enum SectionPattern {
     Glob(String),
     Common,
     Sort(SortKind, Vec<SectionPattern>),
@@ -100,20 +100,20 @@ pub enum SectionPattern {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SortKind {
+pub(crate) enum SortKind {
     Name,
     None,
     InitPriority,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Expr {
-    pub kind: ExprKind,
-    pub location: Location,
+pub(crate) struct Expr {
+    pub(crate) kind: ExprKind,
+    pub(crate) location: Location,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ExprKind {
+pub(crate) enum ExprKind {
     Number(u64),
     Dot,
     Symbol(String),
@@ -126,14 +126,14 @@ pub enum ExprKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UnaryOp {
+pub(crate) enum UnaryOp {
     Negate,
     BitNot,
     LogicalNot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BinaryOp {
+pub(crate) enum BinaryOp {
     Add,
     Subtract,
     Multiply,
@@ -149,7 +149,7 @@ pub enum BinaryOp {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Function {
+pub(crate) enum Function {
     Align,
     Constant,
     SegmentStart,
@@ -160,7 +160,7 @@ pub enum Function {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Constant {
+pub(crate) enum Constant {
     MaxPageSize,
     CommonPageSize,
 }

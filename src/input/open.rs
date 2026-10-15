@@ -3,7 +3,7 @@ use std::fs::File;
 use anyhow::{Context, Ok};
 use memmap2::Mmap;
 
-pub fn open_file_and_mmap(file_name: &String) -> anyhow::Result<Mmap> {
+pub(crate) fn open_file_and_mmap(file_name: &String) -> anyhow::Result<Mmap> {
     pr_info!("Processing file: {}", file_name);
     pr_debug!("Opening file: {}", file_name);
     let file =

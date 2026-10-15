@@ -6,15 +6,16 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use elf::{
     Elf64ProgramHeaderFlags, Elf64SectionFlags, Elf64SectionType, Elf64SymbolSectionIdx,
-    Elf64SymbolType, ElfProgramHeaderType, ExecElf64Writer, LoadSegment, PF_R, PF_W, ProgramHeader,
-    SHN_ABS, SHN_LORESERVE, SHN_UNDEF,
+    Elf64SymbolType, ElfProgramHeaderType, ExecElf64Writer, PF_R, PF_W, ProgramHeader, SHN_ABS,
+    SHN_LORESERVE, SHN_UNDEF,
     write::{ELF_HEADER_SIZE, Elf64SymbolEntry, PROGRAM_HEADER_SIZE, Section, SymbolTableBuilder},
 };
 use memmap2::MmapMut;
 
 use crate::{
-    link::{ElfData, Linked, PAGE_SIZE, SectionPlacement},
-    resolve::{Definition, ResolvedSymbol},
+    layout::{HeaderInfo, OutputSection, segments::load_segments, tls::TlsSegment},
+    link::LinkedImage,
+    symbols::{Definition, ResolvedSymbol},
     synthetic::SyntheticSection,
 };
 
@@ -25,7 +26,7 @@ struct SectionHeaderIndices {
 }
 
 impl SectionHeaderIndices {
-    fn new(sections: &[SectionPlacement]) -> Result<Self> {
+    fn new(sections: &[OutputSection]) -> Result<Self> {
         let mut by_output = Vec::with_capacity(sections.len());
         let mut kept_count = 0;
         for section in sections {
@@ -77,22 +78,22 @@ impl SectionHeaderIndices {
     }
 }
 
-fn contains_synthetic(section: &SectionPlacement, synthetic: SyntheticSection) -> bool {
+fn contains_synthetic(section: &OutputSection, synthetic: SyntheticSection) -> bool {
     section
-        .sections_data
+        .inputs
         .iter()
         .any(|(input, _)| synthetic.is_input(input))
 }
 
 fn output_sections(
-    sections: &[SectionPlacement],
+    sections: &[OutputSection],
     indices: &SectionHeaderIndices,
 ) -> Result<Vec<Section>> {
     sections
         .iter()
         .filter(|section| section.size != 0)
         .map(|section| {
-            let first = section.sections_data.first().map(|(input, _)| input);
+            let first = section.inputs.first().map(|(input, _)| input);
             let section_type = if section.data.is_none() {
                 Elf64SectionType::SHT_NOBITS
             } else {
@@ -100,26 +101,26 @@ fn output_sections(
             };
             let mut entry_size = first.map_or(0, |input| input.entry_size);
             if section
-                .sections_data
+                .inputs
                 .iter()
                 .any(|(input, _)| input.entry_size != entry_size)
             {
                 entry_size = 0;
             }
             let has_tls = section
-                .sections_data
+                .inputs
                 .iter()
                 .any(|(input, _)| input.flags.get(Elf64SectionFlags::SHF_TLS) != 0);
             // MERGE/STRINGS describe the whole output only when every input has
             // that attribute and their fixed-size entries agree.
             let merge = entry_size != 0
                 && section
-                    .sections_data
+                    .inputs
                     .iter()
                     .all(|(input, _)| input.flags.get(Elf64SectionFlags::SHF_MERGE) != 0);
             let strings = entry_size != 0
                 && section
-                    .sections_data
+                    .inputs
                     .iter()
                     .all(|(input, _)| input.flags.get(Elf64SectionFlags::SHF_STRINGS) != 0);
             let mut flags = Elf64SectionFlags::new()
@@ -151,7 +152,10 @@ fn output_sections(
                 name: section.name.clone(),
                 section_type,
                 flags,
-                address: *section.va.get().context("output section has no address")?,
+                address: *section
+                    .address
+                    .get()
+                    .context("output section has no address")?,
                 size: section.size,
                 link: u32::from(SHN_UNDEF),
                 info,
@@ -165,7 +169,7 @@ fn output_sections(
 
 fn output_symbol<'a>(
     symbol: &'a ResolvedSymbol,
-    linked: &Linked,
+    linked: &LinkedImage,
     indices: &SectionHeaderIndices,
 ) -> Result<Elf64SymbolEntry<'a>> {
     let output_index = match symbol.definition {
@@ -175,14 +179,16 @@ fn output_symbol<'a>(
             ..
         } => Some(
             linked
+                .layout
                 .section_index
                 .get(&(file_id, index))
                 .context("symbol section was not placed")?
                 .output_idx,
         ),
         Definition::Script { .. } => linked
-            .elf_data
-            .script_symbol_sections
+            .layout
+            .script_symbols
+            .sections
             .get(&symbol.name)
             .copied(),
         _ => None,
@@ -194,14 +200,14 @@ fn output_symbol<'a>(
     } else {
         SHN_ABS
     };
-    let mut value = *symbol.va.get().context("output symbol has no value")?;
+    let mut value = *symbol.address.get().context("output symbol has no value")?;
     if symbol.ty == Some(Elf64SymbolType::STT_TLS) && output_index.is_some() {
         // Executable TLS st_value is an offset in the TLS template, whereas
         // relocation evaluation keeps using the symbol's virtual address.
         value = value
             .checked_sub(
                 linked
-                    .elf_data
+                    .layout
                     .tls
                     .context("TLS symbol without PT_TLS")?
                     .vaddr,
@@ -219,11 +225,14 @@ fn output_symbol<'a>(
     })
 }
 
-fn symbol_table_sections(linked: &Linked, indices: &SectionHeaderIndices) -> Result<[Section; 2]> {
+fn symbol_table_sections(
+    linked: &LinkedImage,
+    indices: &SectionHeaderIndices,
+) -> Result<[Section; 2]> {
     let mut builder = SymbolTableBuilder::new();
     for symbol in linked.symbols.all_symbols().filter(|symbol| {
         !symbol.name.is_empty()
-            && symbol.va.get().is_some()
+            && symbol.address.get().is_some()
             && !matches!(
                 symbol.ty,
                 Some(Elf64SymbolType::STT_SECTION | Elf64SymbolType::STT_FILE)
@@ -236,102 +245,21 @@ fn symbol_table_sections(linked: &Linked, indices: &SectionHeaderIndices) -> Res
     builder.build(strtab_index)
 }
 
-// Output-section data remains separate until relocations have been applied.
-// Consecutive output sections with the same permissions share one PT_LOAD.
-fn load_segments(sections: Vec<SectionPlacement>, elf_data: &ElfData) -> Result<Vec<LoadSegment>> {
-    let mut segments = vec![LoadSegment {
-        flags: Elf64ProgramHeaderFlags::from_bits(PF_R),
-        vaddr: elf_data.header_vaddr,
-        paddr: elf_data.header_vaddr,
-        align: PAGE_SIZE,
-        data: vec![0; usize::try_from(elf_data.sizeof_headers).context("headers too large")?],
-        mem_size: elf_data.sizeof_headers,
-    }];
-    for section in sections.into_iter().filter(|section| section.size != 0) {
-        let va = *section.va.get().context("output section has no address")?;
-        let previous = segments.last().unwrap();
-        let previous_end = previous
-            .vaddr
-            .checked_add(previous.mem_size)
-            .context("segment address exceeds u64")?;
-        ensure!(va >= previous_end, "output sections overlap");
-        if section.flags != previous.flags {
-            ensure!(
-                va / PAGE_SIZE >= previous_end.div_ceil(PAGE_SIZE),
-                "load segments with different permissions share a virtual page"
-            );
-            segments.push(LoadSegment {
-                flags: section.flags,
-                vaddr: va,
-                paddr: va,
-                align: PAGE_SIZE.max(section.align),
-                data: Vec::new(),
-                mem_size: 0,
-            });
-        }
-        let segment = segments.last_mut().unwrap();
-        // For the header load p_offset is fixed at zero; PAGE_SIZE is its
-        // alignment even if an input section happens to be more aligned.
-        if segment.vaddr != elf_data.header_vaddr {
-            segment.align = segment.align.max(section.align);
-        }
-        let offset = va - segment.vaddr;
-        if let Some(data) = section.data {
-            ensure!(
-                data.len() as u64 <= section.size,
-                "output section file size exceeds memory size"
-            );
-            if !data.is_empty() {
-                segment
-                    .data
-                    .resize(usize::try_from(offset).context("segment too large")?, 0);
-                segment.data.extend(data);
-            }
-            segment.data.resize(
-                usize::try_from(offset + section.size).context("segment too large")?,
-                0,
-            );
-        }
-        segment.mem_size = offset
-            .checked_add(section.size)
-            .context("segment size exceeds u64")?;
-    }
-    if let Some(tls) = elf_data.tls.filter(|tls| tls.file_size != 0) {
-        let segment = segments
-            .iter_mut()
-            .find(|segment| {
-                tls.vaddr.checked_sub(segment.vaddr).is_some_and(|offset| {
-                    offset
-                        .checked_add(tls.mem_size)
-                        .is_some_and(|end| end <= segment.mem_size)
-                })
-            })
-            .context("TLS template must be contained in one PT_LOAD segment")?;
-        let end = tls.vaddr - segment.vaddr + tls.file_size;
-        // A script may reserve trailing padding in .tdata with assignments.
-        let file_size = segment
-            .data
-            .len()
-            .max(usize::try_from(end).context("TLS template too large")?);
-        segment.data.resize(file_size, 0);
-    }
-    Ok(segments)
-}
-
 fn executable_writer(
-    section_placements: Vec<SectionPlacement>,
-    elf_data: &ElfData,
+    image_sections: Vec<OutputSection>,
+    headers: &HeaderInfo,
+    tls: Option<TlsSegment>,
     entry: u64,
 ) -> Result<ExecElf64Writer> {
-    let indices = SectionHeaderIndices::new(&section_placements)?;
-    let sections = output_sections(&section_placements, &indices)?;
+    let indices = SectionHeaderIndices::new(&image_sections)?;
+    let sections = output_sections(&image_sections, &indices)?;
     let mut writer = ExecElf64Writer::new_x86_64_executable(entry);
-    let mut segments = load_segments(section_placements, elf_data)?.into_iter();
+    let mut segments = load_segments(image_sections, headers, tls)?.into_iter();
     writer.header_segment = segments.next();
     for segment in segments {
         writer.add_load_segment(segment);
     }
-    if let Some(tls) = elf_data.tls {
+    if let Some(tls) = tls {
         writer.add_program_header(ProgramHeader {
             segment_type: ElfProgramHeaderType::PT_TLS,
             flags: Elf64ProgramHeaderFlags::from_bits(PF_R),
@@ -357,11 +285,11 @@ fn executable_writer(
     // headers written here must fit exactly in that space.
     let phnum = 1 + writer.segments.len() + writer.program_headers.len();
     ensure!(
-        ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE * phnum as u64 == elf_data.sizeof_headers,
+        ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE * phnum as u64 == headers.size,
         "program header count {phnum} does not match SIZEOF_HEADERS {:#x}",
-        elf_data.sizeof_headers
+        headers.size
     );
-    if let Some(tls) = elf_data.tls {
+    if let Some(tls) = tls {
         // All headers are reserved before translating the TLS template VMA.
         let offset = writer.file_offset(tls.vaddr)?;
         let header = writer
@@ -375,11 +303,16 @@ fn executable_writer(
     Ok(writer)
 }
 
-pub fn output(linked: Linked, output_file: String, entry: u64) -> Result<()> {
+pub(crate) fn write(linked: LinkedImage, output_file: String, entry: u64) -> Result<()> {
     pr_debug!("Write output file: {}", output_file);
-    let indices = SectionHeaderIndices::new(&linked.sections)?;
+    let indices = SectionHeaderIndices::new(&linked.layout.sections)?;
     let tables = symbol_table_sections(&linked, &indices)?;
-    let mut writer = executable_writer(linked.sections, &linked.elf_data, entry)?;
+    let mut writer = executable_writer(
+        linked.layout.sections,
+        &linked.layout.headers,
+        linked.layout.tls,
+        entry,
+    )?;
     writer.sections.extend(tables);
     let file_size = writer.file_size()?;
     let file = OpenOptions::new()
@@ -398,62 +331,38 @@ pub fn output(linked: Linked, output_file: String, entry: u64) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{borrow::Cow, cell::OnceCell, collections::HashMap};
+    use std::{borrow::Cow, cell::OnceCell};
 
     use super::*;
-    use crate::{input_id::FileId, parse::ObjectSection, tls::TlsSegment};
+    use crate::input::{FileId, object::InputSection};
     use elf::{Elf64, Elf64SectionFlags};
 
-    fn section(name: &str, va: u64, size: u64, data: Option<Vec<u8>>) -> SectionPlacement<'static> {
-        SectionPlacement {
+    fn section(
+        name: &str,
+        address: u64,
+        size: u64,
+        data: Option<Vec<u8>>,
+    ) -> OutputSection<'static> {
+        OutputSection {
             name: name.to_string(),
             flags: Elf64ProgramHeaderFlags::from_bits(PF_R | PF_W),
             size,
             align: 16,
-            va: OnceCell::from(va),
+            address: OnceCell::from(address),
             data,
-            sections_data: Vec::new(),
+            inputs: Vec::new(),
         }
-    }
-
-    #[test]
-    fn grouping_keeps_bss_tails_and_materializes_internal_zero_fill() {
-        let elf_data = ElfData {
-            header_vaddr: 0x400000,
-            sizeof_headers: 232,
-            script_symbols: HashMap::new(),
-            script_symbol_sections: HashMap::new(),
-            tls: None,
-        };
-        let segments = load_segments(
-            vec![
-                section(".data", 0x401000, 2, Some(vec![1, 2])),
-                section(".zero", 0x401002, 14, None),
-                section(".more", 0x401010, 1, Some(vec![3])),
-                section(".bss", 0x401020, 32, None),
-                section(".empty", 0x402000, 0, Some(Vec::new())),
-            ],
-            &elf_data,
-        )
-        .unwrap();
-        assert_eq!(segments.len(), 2);
-        assert_eq!(segments[1].vaddr, 0x401000);
-        assert_eq!(segments[1].mem_size, 64);
-        assert_eq!(segments[1].data.len(), 17);
-        assert_eq!(&segments[1].data[..2], &[1, 2]);
-        assert_eq!(&segments[1].data[2..16], &[0; 14]);
-        assert_eq!(segments[1].data[16], 3);
     }
 
     fn tls_section(
         name: &'static str,
-        va: u64,
+        address: u64,
         size: u64,
         align: u64,
         data: Option<Vec<u8>>,
-    ) -> SectionPlacement<'static> {
-        let input = ObjectSection {
-            file_id: FileId::Object(0),
+    ) -> OutputSection<'static> {
+        let input = InputSection {
+            file_id: FileId::InputObject { input_index: 0 },
             idx: 1,
             name,
             flags: Elf64SectionFlags::new()
@@ -470,9 +379,9 @@ mod tests {
             size,
             data: data.clone().map(Cow::Owned),
         };
-        let mut section = section(name, va, size, data);
+        let mut section = section(name, address, size, data);
         section.align = align;
-        section.sections_data.push((input, 0));
+        section.inputs.push((input, 0));
         section
     }
 
@@ -518,14 +427,11 @@ mod tests {
                     sections.insert(0, section(".prefix", 0x401000, 1, Some(vec![9])));
                     sections.push(section(".data", 0x401080, 1, Some(vec![0x42])));
                 }
-                let elf_data = ElfData {
-                    header_vaddr: 0x400000,
-                    sizeof_headers: ELF_HEADER_SIZE + 4 * PROGRAM_HEADER_SIZE,
-                    script_symbols: HashMap::new(),
-                    script_symbol_sections: HashMap::new(),
-                    tls,
+                let headers = HeaderInfo {
+                    address: 0x400000,
+                    size: ELF_HEADER_SIZE + 4 * PROGRAM_HEADER_SIZE,
                 };
-                let writer = executable_writer(sections, &elf_data, 0x400000).unwrap();
+                let writer = executable_writer(sections, &headers, tls, 0x400000).unwrap();
                 let mut bytes = vec![0; writer.file_size().unwrap() as usize];
                 writer.write_into(&mut bytes).unwrap();
                 let elf = Elf64::new(&bytes).unwrap();
@@ -573,14 +479,11 @@ mod tests {
         let tls = TlsSegment::from_sections(&sections).unwrap().unwrap();
         assert_eq!(tls.file_size, 32);
         assert_eq!(tls.mem_size, 32);
-        let elf_data = ElfData {
-            header_vaddr: 0x400000,
-            sizeof_headers: ELF_HEADER_SIZE + 4 * PROGRAM_HEADER_SIZE,
-            script_symbols: HashMap::new(),
-            script_symbol_sections: HashMap::new(),
-            tls: Some(tls),
+        let headers = HeaderInfo {
+            address: 0x400000,
+            size: ELF_HEADER_SIZE + 4 * PROGRAM_HEADER_SIZE,
         };
-        let writer = executable_writer(sections, &elf_data, 0x400000).unwrap();
+        let writer = executable_writer(sections, &headers, Some(tls), 0x400000).unwrap();
         let mut bytes = vec![0; writer.file_size().unwrap() as usize];
         writer.write_into(&mut bytes).unwrap();
         let elf = Elf64::new(&bytes).unwrap();

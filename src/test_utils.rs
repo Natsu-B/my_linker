@@ -1,6 +1,6 @@
 use elf::{Elf64SectionType, Elf64SymbolBinding, Elf64SymbolType, ElfFileType, ElfMachineType};
 
-use crate::archive::AR_FMAG;
+use crate::input::archive::reader::AR_FMAG;
 
 const ELF_HEADER_SIZE: usize = 64;
 const SECTION_HEADER_SIZE: usize = 64;

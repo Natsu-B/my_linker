@@ -5,11 +5,12 @@ use super::{
     lexer::{Token, TokenKind, lex},
 };
 
-pub fn parse(source: &str) -> Result<Script> {
+pub(crate) fn parse(source: &str) -> Result<Script> {
     Parser::new(source)?.script()
 }
 
-pub fn parse_expression(source: &str) -> Result<Expr> {
+#[cfg(test)]
+pub(crate) fn parse_expression(source: &str) -> Result<Expr> {
     let mut parser = Parser::new(source)?;
     let expr = parser.expression(0)?;
     parser.expect_eof()?;
@@ -62,6 +63,7 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    #[cfg(test)]
     fn expect_eof(&self) -> Result<()> {
         ensure!(
             self.token().kind == TokenKind::Eof,
@@ -253,7 +255,7 @@ impl<'a> Parser<'a> {
                 .is_some_and(|token| token.kind == TokenKind::Word("INFO".into()))
     }
 
-    fn output_section(&mut self) -> Result<OutputSection> {
+    fn output_section(&mut self) -> Result<OutputSectionRule> {
         let location = self.token().location;
         let name = self.pattern()?;
         self.unsupported()?;
@@ -308,7 +310,7 @@ impl<'a> Parser<'a> {
             });
         }
         self.unsupported()?;
-        Ok(OutputSection {
+        Ok(OutputSectionRule {
             name,
             address,
             info,
@@ -330,25 +332,25 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn input_section(&mut self) -> Result<InputSection> {
+    fn input_section(&mut self) -> Result<InputSectionRule> {
         self.unsupported()?;
         if self.word("KEEP") {
             self.index += 1;
             self.expect('(')?;
             let input = self.input_section()?;
             self.expect(')')?;
-            return Ok(InputSection::Keep(Box::new(input)));
+            return Ok(InputSectionRule::Keep(Box::new(input)));
         }
         if let Some(kind) = self.sort_kind() {
             self.index += 1;
             self.expect('(')?;
             let input = self.input_section()?;
             self.expect(')')?;
-            return Ok(InputSection::Sort(kind, Box::new(input)));
+            return Ok(InputSectionRule::Sort(kind, Box::new(input)));
         }
         if self.word("EXCLUDE_FILE") {
             let files = self.excluded_files()?;
-            return Ok(InputSection::ExcludeFile(
+            return Ok(InputSectionRule::ExcludeFile(
                 files,
                 Box::new(self.input_section()?),
             ));
@@ -357,7 +359,7 @@ impl<'a> Parser<'a> {
         self.expect('(')?;
         let sections = self.section_patterns()?;
         self.expect(')')?;
-        Ok(InputSection::File { pattern, sections })
+        Ok(InputSectionRule::File { pattern, sections })
     }
 
     fn excluded_files(&mut self) -> Result<Vec<String>> {
@@ -610,7 +612,7 @@ fn number(text: &str, location: Location) -> Result<u64> {
 mod tests {
     use super::*;
 
-    fn output(source: &str) -> OutputSection {
+    fn output(source: &str) -> OutputSectionRule {
         let script = parse(&format!("SECTIONS {{ {source} }}")).unwrap();
         let Statement::Sections(statements) = &script.statements[0] else {
             panic!("expected SECTIONS")
@@ -699,14 +701,14 @@ mod tests {
         );
         assert_eq!(
             section.statements[0],
-            OutputStatement::Input(InputSection::Keep(Box::new(InputSection::File {
+            OutputStatement::Input(InputSectionRule::Keep(Box::new(InputSectionRule::File {
                 pattern: "*crtbegin?.o".into(),
                 sections: vec![SectionPattern::Glob(".ctors".into())]
             })))
         );
         assert_eq!(
             section.statements[1],
-            OutputStatement::Input(InputSection::Keep(Box::new(InputSection::File {
+            OutputStatement::Input(InputSectionRule::Keep(Box::new(InputSectionRule::File {
                 pattern: "*".into(),
                 sections: vec![
                     SectionPattern::ExcludeFile(vec!["*crtend.o".into(), "*crtend?.o".into()]),
@@ -716,7 +718,7 @@ mod tests {
         );
         assert_eq!(
             section.statements[2],
-            OutputStatement::Input(InputSection::File {
+            OutputStatement::Input(InputSectionRule::File {
                 pattern: "*".into(),
                 sections: vec![
                     SectionPattern::Glob(".init_array".into()),
@@ -737,19 +739,19 @@ mod tests {
         );
         assert_eq!(
             section.statements[3],
-            OutputStatement::Input(InputSection::Sort(
+            OutputStatement::Input(InputSectionRule::Sort(
                 SortKind::Name,
-                Box::new(InputSection::File {
+                Box::new(InputSectionRule::File {
                     pattern: "*crt*.o".into(),
                     sections: vec![SectionPattern::Glob(".text".into())]
                 })
             ))
         );
         assert!(
-            matches!(&section.statements[4], OutputStatement::Input(InputSection::ExcludeFile(files, _)) if files == &["foo.o"])
+            matches!(&section.statements[4], OutputStatement::Input(InputSectionRule::ExcludeFile(files, _)) if files == &["foo.o"])
         );
         assert!(
-            matches!(&section.statements[5], OutputStatement::Input(InputSection::File { pattern, .. }) if pattern == "/path with spaces/foo.o")
+            matches!(&section.statements[5], OutputStatement::Input(InputSectionRule::File { pattern, .. }) if pattern == "/path with spaces/foo.o")
         );
     }
 

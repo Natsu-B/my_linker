@@ -1,17 +1,18 @@
-pub mod ast;
-pub mod eval;
+pub(crate) mod ast;
+pub(crate) mod eval;
 mod lexer;
-pub mod parser;
-pub mod pattern;
+pub(crate) mod mapping;
+pub(crate) mod parser;
+pub(crate) mod pattern;
 
 use anyhow::{Context, Result};
 
 use ast::{Script, Statement};
 
-pub const DEFAULT_SCRIPT: &str = include_str!("elf_x86_64_static.ld");
+pub(crate) const DEFAULT_SCRIPT: &str = include_str!("elf_x86_64_static.ld");
 
 /// Parse the linker script given by `-T`, or the built-in script.
-pub fn parse_script(path: Option<&str>) -> Result<Script> {
+pub(crate) fn parse_script(path: Option<&str>) -> Result<Script> {
     pr_debug!("Parsing script...");
 
     let source = match path {
@@ -28,7 +29,7 @@ pub fn parse_script(path: Option<&str>) -> Result<Script> {
 }
 
 impl ast::Script {
-    pub fn entry_name(&self) -> &str {
+    pub(crate) fn entry_name(&self) -> &str {
         self.statements
             .iter()
             .rev()

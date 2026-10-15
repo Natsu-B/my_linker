@@ -5,16 +5,16 @@ use anyhow::{Context, Result, bail, ensure};
 const AR_MAGIC: &[u8; 8] = b"!<arch>\n";
 const THIN_MAGIC: &[u8; 8] = b"!<thin>\n";
 pub(crate) const AR_FMAG: [u8; 2] = *b"`\n";
-const AR_NAME_OFFSET: usize = std::mem::offset_of!(archive_member, ar_name);
+const AR_NAME_OFFSET: usize = std::mem::offset_of!(ArchiveMemberHeader, ar_name);
 const AR_NAME_LEN: usize = size_of::<[u8; 16]>();
-const AR_SIZE_OFFSET: usize = std::mem::offset_of!(archive_member, ar_size);
+const AR_SIZE_OFFSET: usize = std::mem::offset_of!(ArchiveMemberHeader, ar_size);
 const AR_SIZE_LEN: usize = size_of::<[u8; 10]>();
-const AR_FMAG_OFFSET: usize = std::mem::offset_of!(archive_member, ar_fmag);
+const AR_FMAG_OFFSET: usize = std::mem::offset_of!(ArchiveMemberHeader, ar_fmag);
 const AR_FMAG_LEN: usize = size_of::<[u8; 2]>();
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct archive_member {
+struct ArchiveMemberHeader {
     ar_name: [u8; 16],
     ar_date: [u8; 12],
     ar_uid: [u8; 6],
@@ -25,7 +25,7 @@ pub struct archive_member {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MemberName<'a> {
+pub(crate) enum MemberName<'a> {
     SymbolTable,
     SymbolTable64,
     LongNameTable,
@@ -40,18 +40,18 @@ struct MemberSlice {
     size: usize,
 }
 
-pub fn check_magic(data: &[u8]) -> bool {
+pub(crate) fn check_magic(data: &[u8]) -> bool {
     data.starts_with(AR_MAGIC)
 }
 
 #[derive(Debug)]
-pub struct ArchiveReader<'a> {
+pub(crate) struct ArchiveReader<'a> {
     data: &'a [u8],
     long_name_table: OnceCell<Option<MemberSlice>>,
 }
 
 impl<'a> ArchiveReader<'a> {
-    pub fn new(data: &'a [u8]) -> Result<Self> {
+    pub(crate) fn new(data: &'a [u8]) -> Result<Self> {
         if data.starts_with(THIN_MAGIC) {
             bail!("thin archives are unsupported");
         }
@@ -66,18 +66,18 @@ impl<'a> ArchiveReader<'a> {
         })
     }
 
-    pub fn iter(&self) -> ArchiveIter<'_, 'a> {
+    pub(crate) fn iter(&self) -> ArchiveIter<'_, 'a> {
         ArchiveIter {
             reader: self,
             offset: AR_MAGIC.len(),
         }
     }
 
-    pub fn object_members(&self) -> ArchiveObjectIter<'_, 'a> {
+    pub(crate) fn object_members(&self) -> ArchiveObjectIter<'_, 'a> {
         ArchiveObjectIter { inner: self.iter() }
     }
 
-    pub fn long_name_table(&self) -> Result<Option<&'a [u8]>> {
+    pub(crate) fn long_name_table(&self) -> Result<Option<&'a [u8]>> {
         if let Some(cached) = self.long_name_table.get() {
             return Ok((*cached).map(|slice| self.slice(slice)));
         }
@@ -107,21 +107,21 @@ impl<'a> ArchiveReader<'a> {
 }
 
 #[derive(Debug)]
-pub struct ArchiveMember<'a> {
+pub(crate) struct ArchiveMember<'a> {
     data: &'a [u8],
     offset: usize,
 }
 
 impl<'a> ArchiveMember<'a> {
-    pub fn size(&self) -> Result<usize> {
+    pub(crate) fn size(&self) -> Result<usize> {
         Ok(to_decimal(self.header_field(AR_SIZE_OFFSET, AR_SIZE_LEN))? as usize)
     }
 
-    pub fn payload_offset(&self) -> usize {
-        self.offset + size_of::<archive_member>()
+    pub(crate) fn payload_offset(&self) -> usize {
+        self.offset + size_of::<ArchiveMemberHeader>()
     }
 
-    pub fn payload(&self) -> Result<&'a [u8]> {
+    pub(crate) fn payload(&self) -> Result<&'a [u8]> {
         let start = self.payload_offset();
         let end = start
             .checked_add(self.size()?)
@@ -132,7 +132,7 @@ impl<'a> ArchiveMember<'a> {
             .context("archive member payload is out of bounds")
     }
 
-    pub fn next_offset(&self) -> Result<usize> {
+    pub(crate) fn next_offset(&self) -> Result<usize> {
         let size = self.size()?;
         let payload_end = self
             .payload_offset()
@@ -145,7 +145,7 @@ impl<'a> ArchiveMember<'a> {
             .context("member padding overflowed usize")
     }
 
-    pub fn member_name(&'a self) -> Result<MemberName<'a>> {
+    pub(crate) fn member_name(&'a self) -> Result<MemberName<'a>> {
         let raw_name = std::str::from_utf8(self.header_field(AR_NAME_OFFSET, AR_NAME_LEN))
             .context("archive member name is not valid UTF-8")?;
         let raw_name = raw_name.trim_end_matches(' ');
@@ -181,7 +181,7 @@ impl<'a> ArchiveMember<'a> {
         }
     }
 
-    pub fn resolved_name(&self, long_names: Option<&[u8]>) -> Result<String> {
+    pub(crate) fn resolved_name(&self, long_names: Option<&[u8]>) -> Result<String> {
         match self.member_name()? {
             MemberName::Short(name) => Ok(name.to_string()),
             MemberName::LongNameOffset(offset) => {
@@ -206,7 +206,7 @@ impl<'a> ArchiveMember<'a> {
         }
     }
 
-    pub fn object_bytes(&self) -> Result<&'a [u8]> {
+    pub(crate) fn object_bytes(&self) -> Result<&'a [u8]> {
         let payload = self.payload()?;
 
         match self.member_name()? {
@@ -239,7 +239,7 @@ impl<'a> ArchiveMember<'a> {
 }
 
 #[derive(Debug, Clone)]
-pub struct ArchiveIter<'reader, 'data> {
+pub(crate) struct ArchiveIter<'reader, 'data> {
     reader: &'reader ArchiveReader<'data>,
     offset: usize,
 }
@@ -252,7 +252,7 @@ impl<'reader, 'data> Iterator for ArchiveIter<'reader, 'data> {
             return None;
         }
 
-        if self.offset + size_of::<archive_member>() > self.reader.data.len() {
+        if self.offset + size_of::<ArchiveMemberHeader>() > self.reader.data.len() {
             self.offset = self.reader.data.len();
             return Some(Err(anyhow::anyhow!(
                 "invalid archive format: incomplete member header"
@@ -284,7 +284,7 @@ impl<'reader, 'data> Iterator for ArchiveIter<'reader, 'data> {
     }
 }
 
-pub struct ArchiveObjectIter<'reader, 'data> {
+pub(crate) struct ArchiveObjectIter<'reader, 'data> {
     inner: ArchiveIter<'reader, 'data>,
 }
 
@@ -306,7 +306,7 @@ impl<'reader, 'data> Iterator for ArchiveObjectIter<'reader, 'data> {
     }
 }
 
-pub fn resolve_long_name(long_names: &[u8], offset: usize) -> Result<String> {
+pub(crate) fn resolve_long_name(long_names: &[u8], offset: usize) -> Result<String> {
     ensure!(
         offset < long_names.len(),
         "long-name table offset out of bounds: {offset}"

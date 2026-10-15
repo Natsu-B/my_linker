@@ -1,24 +1,24 @@
 use anyhow::{Context, Result, ensure};
 use elf::Elf64SectionFlags;
 
-use crate::link::SectionPlacement;
+use crate::layout::OutputSection;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TlsSegment {
-    pub vaddr: u64,
-    pub file_size: u64,
-    pub mem_size: u64,
-    pub align: u64,
+pub(crate) struct TlsSegment {
+    pub(crate) vaddr: u64,
+    pub(crate) file_size: u64,
+    pub(crate) mem_size: u64,
+    pub(crate) align: u64,
 }
 
 impl TlsSegment {
-    pub fn from_sections(sections: &[SectionPlacement]) -> Result<Option<Self>> {
+    pub(crate) fn from_sections(sections: &[OutputSection]) -> Result<Option<Self>> {
         let mut tls: Option<Self> = None;
         let mut finished = false;
         let mut zero_fill = false;
         for section in sections.iter().filter(|section| section.size != 0) {
             let is_tls = section
-                .sections_data
+                .inputs
                 .iter()
                 .any(|(input, _)| input.flags.get(Elf64SectionFlags::SHF_TLS) != 0);
             if !is_tls {
@@ -26,14 +26,17 @@ impl TlsSegment {
                 continue;
             }
             ensure!(!finished, "TLS output sections must be contiguous");
-            let va = *section.va.get().context("TLS section has no address")?;
+            let address = *section
+                .address
+                .get()
+                .context("TLS section has no address")?;
             let segment = tls.get_or_insert(Self {
-                vaddr: va,
+                vaddr: address,
                 file_size: 0,
                 mem_size: 0,
                 align: 1,
             });
-            for (input, offset) in &section.sections_data {
+            for (input, offset) in &section.inputs {
                 ensure!(
                     input.size == 0 || input.flags.get(Elf64SectionFlags::SHF_TLS) != 0,
                     "output section {} mixes TLS and non-TLS inputs",
@@ -48,7 +51,7 @@ impl TlsSegment {
                 }
                 if input.data.is_some() {
                     ensure!(!zero_fill, "initialized TLS follows zero-fill TLS");
-                    segment.file_size = va
+                    segment.file_size = address
                         .checked_add(*offset)
                         .and_then(|address| address.checked_add(input.size))
                         .and_then(|end| end.checked_sub(segment.vaddr))
@@ -59,7 +62,7 @@ impl TlsSegment {
             }
             // .tbss reserves VMA just like other NOBITS sections. The load
             // writer materializes zeros if initialized RW data follows it.
-            segment.mem_size = va
+            segment.mem_size = address
                 .checked_add(section.size)
                 .and_then(|end| end.checked_sub(segment.vaddr))
                 .context("TLS memory range exceeds u64")?;
@@ -78,7 +81,7 @@ impl TlsSegment {
         Ok(tls)
     }
 
-    pub fn tpoff(&self, address: u64) -> Result<i64> {
+    pub(crate) fn tpoff(&self, address: u64) -> Result<i64> {
         let size = self
             .mem_size
             .checked_next_multiple_of(self.align)

@@ -2,16 +2,10 @@ use std::collections::HashSet;
 
 use anyhow::{Context, Result};
 
-use crate::{
-    archive_index::ArchiveState,
-    input_id::FileId,
-    parse::{self, ObjectFile},
+use crate::input::{
+    FileId, InputFile,
+    object::{self, ObjectFile},
 };
-
-pub enum FileType<'a> {
-    Object(ObjectFile<'a>),
-    Archive(ArchiveState<'a>),
-}
 
 fn update_symbol_sets(
     object: &ObjectFile<'_>,
@@ -52,8 +46,8 @@ fn update_symbol_sets(
     }
 }
 
-pub fn resolve_symbols<'a>(
-    parse_result: Vec<Result<FileType<'a>>>,
+pub(crate) fn extract_archive_members<'a>(
+    parse_result: Vec<Result<InputFile<'a>>>,
     entry_name: &str,
 ) -> Result<Vec<ObjectFile<'a>>> {
     let mut has_err = 0;
@@ -64,7 +58,7 @@ pub fn resolve_symbols<'a>(
 
     for parse_result in parse_result {
         match parse_result {
-            Ok(FileType::Object(object_file)) => {
+            Ok(InputFile::Object(object_file)) => {
                 pr_debug!(
                     "file:{}: parsed successfully\nresult: {:#?}",
                     object_file.file_name,
@@ -73,7 +67,7 @@ pub fn resolve_symbols<'a>(
                 update_symbol_sets(&object_file, &mut defined, &mut unresolved);
                 parsed.push(object_file);
             }
-            Ok(FileType::Archive(mut archive_state)) => {
+            Ok(InputFile::Archive(mut archive_state)) => {
                 pr_debug!(
                     "file:{}: indexed archive with {} member(s)",
                     archive_state.file_name,
@@ -88,27 +82,27 @@ pub fn resolve_symbols<'a>(
 
                     let mut next_member_idx = None;
                     for symbol in unresolved_symbols {
-                        if let Some(&member_idx) = archive_state.by_symbol.get(symbol)
-                            && !archive_state.extracted[member_idx]
+                        if let Some(&member_index) = archive_state.by_symbol.get(symbol)
+                            && !archive_state.extracted[member_index]
                         {
-                            next_member_idx = Some(member_idx);
+                            next_member_idx = Some(member_index);
                             break;
                         }
                     }
 
-                    let Some(member_idx) = next_member_idx else {
+                    let Some(member_index) = next_member_idx else {
                         break;
                     };
 
-                    archive_state.extracted[member_idx] = true;
-                    let member = &archive_state.members[member_idx];
+                    archive_state.extracted[member_index] = true;
+                    let member = &archive_state.members[member_index];
                     let display_name = format!("{}({})", archive_state.file_name, member.name);
                     let file_id = FileId::ArchiveMember {
-                        archive_idx: archive_state.archive_idx,
-                        member_idx,
+                        archive_index: archive_state.archive_index,
+                        member_index,
                     };
                     let object_file =
-                        match parse::parse(member.bytes, display_name.clone(), file_id)
+                        match object::parse(member.bytes, display_name.clone(), file_id)
                             .with_context(|| {
                                 format!("failed to parse archive member {display_name}")
                             }) {
@@ -167,8 +161,18 @@ mod tests {
         };
         let weak = object(Elf64SymbolBinding::STB_WEAK);
         let strong = object(Elf64SymbolBinding::STB_GLOBAL);
-        let weak = parse::parse(&weak, "weak.o".to_string(), FileId::Object(0)).unwrap();
-        let strong = parse::parse(&strong, "strong.o".to_string(), FileId::Object(1)).unwrap();
+        let weak = object::parse(
+            &weak,
+            "weak.o".to_string(),
+            FileId::InputObject { input_index: 0 },
+        )
+        .unwrap();
+        let strong = object::parse(
+            &strong,
+            "strong.o".to_string(),
+            FileId::InputObject { input_index: 1 },
+        )
+        .unwrap();
         let mut defined = HashSet::new();
         let mut unresolved = HashSet::new();
         update_symbol_sets(&weak, &mut defined, &mut unresolved);

@@ -4,7 +4,7 @@ use anyhow::{Result, bail, ensure};
 
 use super::ast::*;
 
-pub trait EvalContext {
+pub(crate) trait EvalContext {
     fn dot(&self) -> u64;
     fn symbol(&self, name: &str) -> Option<u64>;
     fn sizeof_headers(&self) -> u64;
@@ -13,13 +13,13 @@ pub trait EvalContext {
 }
 
 #[derive(Debug)]
-pub struct Context {
-    pub dot: u64,
-    pub symbols: HashMap<String, u64>,
-    pub sizeof_headers: u64,
-    pub max_page_size: u64,
-    pub common_page_size: u64,
-    pub next_section_alignment: u64,
+pub(crate) struct Context {
+    pub(crate) dot: u64,
+    pub(crate) symbols: HashMap<String, u64>,
+    pub(crate) sizeof_headers: u64,
+    pub(crate) max_page_size: u64,
+    pub(crate) common_page_size: u64,
+    pub(crate) next_section_alignment: u64,
 }
 
 impl Default for Context {
@@ -56,7 +56,7 @@ impl EvalContext for Context {
     }
 }
 
-pub fn evaluate(expr: &Expr, context: &impl EvalContext) -> Result<u64> {
+pub(crate) fn evaluate(expr: &Expr, context: &impl EvalContext) -> Result<u64> {
     let location = expr.location;
     let eval = |value: &Expr| evaluate(value, context);
     Ok(match &expr.kind {

@@ -4,27 +4,20 @@ use anyhow::Result;
 use clap::Parser;
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
-use crate::{input_id::FileId, input_symbol::FileType};
+use crate::input::{FileId, InputFile};
 
 #[macro_use]
-pub mod debug;
-mod archive;
-mod archive_index;
-mod got;
-mod input_id;
-mod input_symbol;
-mod iplt;
+mod debug;
+mod input;
+mod layout;
 mod link;
-mod open;
-mod parse;
+mod output;
 mod relocate;
-mod resolve;
-pub mod script;
+mod script;
+mod symbols;
 mod synthetic;
 #[cfg(test)]
 mod test_utils;
-mod tls;
-mod write;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -63,7 +56,7 @@ fn main() -> anyhow::Result<()> {
     let mmaps_result = args
         .input
         .par_iter()
-        .map(open::open_file_and_mmap)
+        .map(input::open::open_file_and_mmap)
         .collect::<Vec<Result<_>>>();
 
     let mut has_err = 0;
@@ -91,21 +84,27 @@ fn main() -> anyhow::Result<()> {
         .enumerate()
         .map(|(input_idx, (mmap, file_name))| {
             if elf::Elf64::check_elf_magic(mmap) {
-                parse::parse(mmap, file_name.clone(), FileId::Object(input_idx))
-                    .map(FileType::Object)
+                input::object::parse(
+                    mmap,
+                    file_name.clone(),
+                    FileId::InputObject {
+                        input_index: input_idx,
+                    },
+                )
+                .map(InputFile::Object)
             } else {
-                archive_index::index_archive(mmap, file_name.clone(), input_idx)
-                    .map(FileType::Archive)
+                input::archive::index::index_archive(mmap, file_name.clone(), input_idx)
+                    .map(InputFile::Archive)
             }
         })
         .collect::<Vec<Result<_>>>();
 
-    let parsed = input_symbol::resolve_symbols(parse_result, script.entry_name())?;
+    let parsed = symbols::extract_archive_members(parse_result, script.entry_name())?;
 
     pr_debug!("Start linking files...");
     let mut linked = link::link(parsed, &script)?;
-    let entry = relocate::relocate(&mut linked, script.entry_name())?;
-    write::output(linked, args.output, entry)?;
+    let entry = relocate::apply(&mut linked, script.entry_name())?;
+    output::write(linked, args.output, entry)?;
 
     Ok(())
 }
