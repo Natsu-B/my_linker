@@ -41,6 +41,11 @@ pub struct ResolvedSymbol {
 }
 
 impl ResolvedSymbol {
+    pub fn is_ifunc(&self) -> bool {
+        self.ty == Some(Elf64SymbolType::STT_GNU_IFUNC)
+            && matches!(self.definition, Definition::Input { .. })
+    }
+
     pub fn validate_relocation(&self, ty: X86_64RelocationType) -> Result<()> {
         use X86_64RelocationType::*;
         ensure!(
@@ -71,6 +76,22 @@ impl ResolvedSymbol {
                 Some(Elf64SymbolType::STT_TLS | Elf64SymbolType::STT_SECTION)
             ),
             "TLS relocation {ty:?} references non-TLS symbol: {}",
+            self.name
+        );
+        ensure!(
+            !self.is_ifunc()
+                || matches!(
+                    ty,
+                    None | Pc32
+                        | Plt32
+                        | Rel64
+                        | Rel32
+                        | Rel32S
+                        | GotPcRel
+                        | GotPcRelX
+                        | RexGotPcRelX
+                ),
+            "unsupported IFUNC relocation {ty:?} for symbol: {}",
             self.name
         );
         Ok(())

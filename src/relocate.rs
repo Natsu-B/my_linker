@@ -1,8 +1,4 @@
-use crate::{
-    got::{self, GotEntry},
-    input_id::FileId,
-    link::Linked,
-};
+use crate::{got::GotEntry, input_id::FileId, link::Linked, synthetic::SyntheticSection};
 
 use anyhow::{Context, Result, bail};
 use elf::{ElfEndian, x86_64::X86_64RelocationType};
@@ -16,15 +12,16 @@ pub fn relocate(linked: &mut Linked, entry_name: &str) -> Result<u64 /* start ad
         relocations,
         section_index,
         got,
+        iplt,
         elf_data,
     } = linked;
     let endianness = elf_data.endianness;
-    let got_location = section_index.get(&(FileId::Synthetic, got::SECTION_IDX));
+    let got_location = section_index.get(&(FileId::Synthetic, SyntheticSection::Got as u16));
     let got_va = got_location
         .map(|location| sections[location.output_idx].va.get().unwrap() + location.offset);
     for (entry, offset) in got.entries() {
         let location = got_location.context("synthetic GOT input section was discarded")?;
-        let (GotEntry::Address(id) | GotEntry::TpOff(id)) = entry;
+        let (GotEntry::Address(id) | GotEntry::TpOff(id) | GotEntry::Ifunc(id)) = entry;
         let address = *symbols.get(id).va.get().with_context(|| {
             format!("GOT target has no output address: {}", symbols.get(id).name)
         })?;
@@ -49,8 +46,12 @@ pub fn relocate(linked: &mut Linked, entry_name: &str) -> Result<u64 /* start ad
                     })?;
                 write_data(data, location.offset + offset, tpoff, endianness)?;
             }
+            // Startup applies IRELATIVE before any IFUNC calls. Leave the
+            // reserved slot zero until it stores the resolver's result.
+            GotEntry::Ifunc(_) => {}
         }
     }
+    iplt.write(sections, section_index, got, symbols, endianness)?;
 
     for relocation in relocations {
         pr_debug!(
@@ -71,6 +72,21 @@ pub fn relocate(linked: &mut Linked, entry_name: &str) -> Result<u64 /* start ad
         }
         let symbol_id = symbols.input(relocation.file_id, relocation.info.sym)?;
         let target_symbol = symbols.get(symbol_id);
+        // Direct references use the canonical IPLT address; resolver addresses
+        // remain available separately for the IRELATIVE addends.
+        let canonical_address = if target_symbol.is_ifunc()
+            && matches!(
+                reloc_type,
+                X86_64RelocationType::Pc32
+                    | X86_64RelocationType::Plt32
+                    | X86_64RelocationType::Rel64
+                    | X86_64RelocationType::Rel32
+                    | X86_64RelocationType::Rel32S
+            ) {
+            Some(iplt.address(symbol_id, sections, section_index)?)
+        } else {
+            None
+        };
         let section = &mut sections[location.output_idx];
         let section_va = *section
             .va
@@ -83,12 +99,14 @@ pub fn relocate(linked: &mut Linked, entry_name: &str) -> Result<u64 /* start ad
             .context("Failed to find target data for relocation")?;
         // S comes from the winning definition, including references within
         // an object whose weak definition was replaced by a strong one.
-        let symbol_addr = *target_symbol.va.get().with_context(|| {
-            format!(
-                "relocation target has no output address: {}",
-                target_symbol.name
-            )
-        })?;
+        let symbol_addr = canonical_address
+            .or_else(|| target_symbol.va.get().copied())
+            .with_context(|| {
+                format!(
+                    "relocation target has no output address: {}",
+                    target_symbol.name
+                )
+            })?;
 
         // A
         let addend = relocation.addend;
@@ -119,6 +137,8 @@ pub fn relocate(linked: &mut Linked, entry_name: &str) -> Result<u64 /* start ad
                 // G + GOT + A - P. Keep the original instruction unchanged.
                 let entry = if reloc_type == X86_64RelocationType::GotTpOff {
                     GotEntry::TpOff(symbol_id)
+                } else if target_symbol.is_ifunc() {
+                    GotEntry::Ifunc(symbol_id)
                 } else {
                     GotEntry::Address(symbol_id)
                 };

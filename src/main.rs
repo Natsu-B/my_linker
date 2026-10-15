@@ -13,12 +13,14 @@ mod archive_index;
 mod got;
 mod input_id;
 mod input_symbol;
+mod iplt;
 mod link;
 mod open;
 mod parse;
 mod relocate;
 mod resolve;
 pub mod script;
+mod synthetic;
 #[cfg(test)]
 mod test_utils;
 mod tls;

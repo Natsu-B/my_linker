@@ -6,17 +6,19 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use elf::{
-    Elf64ProgramHeaderFlags, Elf64SectionFlags, Elf64SymbolSectionIdx, ElfEndian, PF_R, PF_W, PF_X,
-    RawReg,
+    Elf64ProgramHeaderFlags, Elf64SectionFlags, Elf64SymbolInfo, Elf64SymbolSectionIdx,
+    Elf64SymbolType, ElfEndian, PF_R, PF_W, PF_X, RawReg,
     write::{ELF_HEADER_SIZE, PROGRAM_HEADER_SIZE},
 };
 
 use crate::{
     got::Got,
     input_id::FileId,
+    iplt::Iplt,
     parse::{ObjectFile, ObjectRelocation, ObjectSection},
     resolve::{self, Definition, ResolvedSymbol, SymbolTable},
     script::{ast::*, eval, pattern},
+    synthetic::SyntheticSection,
     tls::TlsSegment,
 };
 
@@ -46,6 +48,7 @@ pub struct Linked<'a> {
     pub relocations: Vec<ObjectRelocation>,
     pub section_index: SectionIndex,
     pub got: Got,
+    pub iplt: Iplt,
     pub elf_data: ElfData,
 }
 
@@ -160,21 +163,29 @@ pub fn link<'a>(object_files: Vec<ObjectFile<'a>>, script: &Script) -> Result<Li
         symbols.extend(object.symbols);
         relocations.extend(object.relocations);
     }
-    // Reserve the synthetic input's identity and attributes before mapping.
-    // Its byte count is filled in after names have been resolved, before layout.
-    let got_input = if relocations
-        .iter()
-        .any(|relocation| Got::needs_entry(relocation.info.ty))
-    {
-        let index = inputs.len();
-        inputs.push(Input {
-            file_name: "<linker>".to_string(),
-            section: Got::default().section(),
-        });
-        Some(index)
-    } else {
-        None
-    };
+    // Reserve synthetic identities and attributes before script mapping.
+    // Their sizes depend on resolved symbols and are filled in before layout.
+    let has_ifunc = symbols.iter().any(|symbol| {
+        symbol.info.get_enum(Elf64SymbolInfo::st_type) == Some(Elf64SymbolType::STT_GNU_IFUNC)
+    });
+    let needs_got = has_ifunc
+        || relocations
+            .iter()
+            .any(|relocation| Got::needs_entry(relocation.info.ty));
+    let mut synthetic_inputs = HashMap::new();
+    for section in SyntheticSection::ALL {
+        let needed = match section {
+            SyntheticSection::Got => needs_got,
+            SyntheticSection::Iplt | SyntheticSection::RelaIplt => has_ifunc,
+        };
+        if needed {
+            synthetic_inputs.insert(section as u16, inputs.len());
+            inputs.push(Input {
+                file_name: "<linker>".to_string(),
+                section: section.section(0),
+            });
+        }
+    }
     let items = map_sections(script, &inputs)?;
     let mut assignments = Vec::new();
     let mut placed = HashSet::new();
@@ -197,8 +208,11 @@ pub fn link<'a>(object_files: Vec<ObjectFile<'a>>, script: &Script) -> Result<Li
     let symbols = resolve::resolve_names(&symbols, &assignments)?;
     relocations.retain(|relocation| placed.contains(&(relocation.file_id, relocation.target_idx)));
     let got = Got::collect(&relocations, &symbols)?;
-    if let Some(index) = got_input {
-        inputs[index].section = got.section();
+    let iplt = Iplt::new(&got);
+    for section in [got.section()].into_iter().chain(iplt.sections()) {
+        if let Some(index) = synthetic_inputs.get(&section.idx) {
+            inputs[*index].section = section;
+        }
     }
     // PT_LOAD groups, PT_GNU_STACK and optional PT_TLS. Reevaluate
     // SIZEOF_HEADERS when the count differs from the initial estimate.
@@ -227,6 +241,7 @@ pub fn link<'a>(object_files: Vec<ObjectFile<'a>>, script: &Script) -> Result<Li
                 relocations,
                 section_index,
                 got,
+                iplt,
                 elf_data,
             });
         }
