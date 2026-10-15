@@ -1,16 +1,11 @@
 use std::{mem::MaybeUninit, ptr};
 
-use anyhow::Result;
 use clap::Parser;
-use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
-
-use crate::input::{FileId, InputFile};
 
 #[macro_use]
 mod debug;
 mod input;
 mod layout;
-mod link;
 mod output;
 mod relocate;
 mod script;
@@ -51,60 +46,24 @@ fn main() -> anyhow::Result<()> {
 
     pr_debug!("Arguments: {:?}", args);
 
+    // Linker script: parse the output-section rules and expressions.
     let script = script::parse_script(args.script.as_deref())?;
-
-    let mmaps_result = args
-        .input
-        .par_iter()
-        .map(input::open::open_file_and_mmap)
-        .collect::<Vec<Result<_>>>();
-
-    let mut has_err = 0;
-    let mut mmaps = Vec::with_capacity(mmaps_result.len());
-
-    for mmap_result in mmaps_result.iter().zip(&args.input) {
-        match mmap_result {
-            (Ok(mmap), _) => mmaps.push(mmap),
-            (Err(err), file_name) => {
-                debugs_or!(
-                    pr_err!("file:{}: {:?}", file_name, err),
-                    pr_err!("file:{}: {}", file_name, err)
-                );
-                has_err += 1;
-            }
-        }
-    }
-
-    anyhow::ensure!(has_err == 0, "{} file(s) failed to open", has_err);
-
-    pr_debug!("Start parsing files...");
-    let parse_result = mmaps
-        .par_iter()
-        .zip(args.input.par_iter())
-        .enumerate()
-        .map(|(input_idx, (mmap, file_name))| {
-            if elf::Elf64::check_elf_magic(mmap) {
-                input::object::parse(
-                    mmap,
-                    file_name.clone(),
-                    FileId::InputObject {
-                        input_index: input_idx,
-                    },
-                )
-                .map(InputFile::Object)
-            } else {
-                input::archive::index::index_archive(mmap, file_name.clone(), input_idx)
-                    .map(InputFile::Archive)
-            }
-        })
-        .collect::<Vec<Result<_>>>();
-
-    let parsed = symbols::extract_archive_members(parse_result, script.entry_name())?;
-
-    pr_debug!("Start linking files...");
-    let mut linked = link::link(parsed, &script)?;
-    let entry = relocate::apply(&mut linked, script.entry_name())?;
-    output::write(linked, args.output, entry)?;
-
+    // Input files: mmap and parse objects and archive indexes in parallel.
+    let mut storage = input::MappedFiles::default();
+    let files = input::load(&args.input, &mut storage)?;
+    // Archive extraction: select members needed by strong undefined references.
+    let objects = symbols::extract_archive_members(files, script.entry_name())?;
+    // Script mapping: assign input sections to output-section rules.
+    let mapping = script::map_sections(&script, objects)?;
+    // Symbol resolution: select definitions before assigning addresses.
+    let symbols = symbols::resolve(&mapping)?;
+    // Synthetic sections: size the reserved GOT, IPLT and IRELATIVE inputs.
+    let synthetic = synthetic::build(mapping, &symbols)?;
+    // Layout: assign section and symbol addresses, including the entry point.
+    let mut image = layout::assign_addresses(synthetic, symbols, script.entry_name())?;
+    // Relocation: compute and write references using the final addresses.
+    relocate::apply(&mut image)?;
+    // Output: emit the executable and its section and symbol tables.
+    output::write(image, args.output)?;
     Ok(())
 }

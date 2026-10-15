@@ -7,12 +7,67 @@ pub(crate) use iplt::Iplt;
 use std::borrow::Cow;
 
 use anyhow::{Context, Result};
-use elf::{Elf64SectionFlags, Elf64SectionType};
+use elf::{Elf64SectionFlags, Elf64SectionType, Elf64SymbolInfo, Elf64SymbolType};
 
 use crate::{
-    input::{FileId, object::InputSection},
+    input::{
+        FileId,
+        object::{InputSection, ObjectRelocation, ObjectSymbol},
+    },
     layout::{OutputSection, SectionIndex, SectionLocation},
+    script::mapping::{MappingInput, SectionMapping},
+    symbols::SymbolTable,
 };
+
+pub(crate) struct SyntheticSections<'a, 's> {
+    pub(crate) mapping: SectionMapping<'a, 's>,
+    pub(crate) got: Got,
+    pub(crate) iplt: Iplt,
+}
+
+/// Reserve stable input identities and attributes before script mapping.
+/// Only sizes and contents change after resolution; script matching does not.
+pub(crate) fn reserve_inputs(
+    inputs: &mut Vec<MappingInput>,
+    symbols: &[ObjectSymbol],
+    relocations: &[ObjectRelocation],
+) {
+    let has_ifunc = symbols.iter().any(|symbol| {
+        symbol.info.get_enum(Elf64SymbolInfo::st_type) == Some(Elf64SymbolType::STT_GNU_IFUNC)
+    });
+    let needs_got = has_ifunc
+        || relocations
+            .iter()
+            .any(|relocation| Got::needs_entry(relocation.info.ty));
+    for section in SyntheticSection::ALL {
+        let needed = match section {
+            SyntheticSection::Got => needs_got,
+            SyntheticSection::Iplt | SyntheticSection::RelaIplt => has_ifunc,
+        };
+        if needed {
+            inputs.push(MappingInput {
+                file_name: "<linker>".to_string(),
+                section: section.section(0),
+            });
+        }
+    }
+}
+
+pub(crate) fn build<'a, 's>(
+    mut mapping: SectionMapping<'a, 's>,
+    symbols: &SymbolTable,
+) -> Result<SyntheticSections<'a, 's>> {
+    let got = Got::collect(&mapping.relocations, symbols)?;
+    let iplt = Iplt::new(&got);
+    for section in [got.section()].into_iter().chain(iplt.sections()) {
+        if let Some(input) = mapping.inputs.iter_mut().find(|input| {
+            input.section.file_id == FileId::LinkerGenerated && input.section.idx == section.idx
+        }) {
+            input.section = section;
+        }
+    }
+    Ok(SyntheticSections { mapping, got, iplt })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SyntheticSection {

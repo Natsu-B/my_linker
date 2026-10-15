@@ -227,7 +227,7 @@ int main(void) {
         "thread TLS changed: 101 200\n",
         "main TLS unchanged: 31 7\n",
     );
-    let mut aligned_tls_sizes = Vec::new();
+    let mut tls_sizes = Vec::new();
     for executable in [&baseline, &output] {
         let bytes = read_output_bytes(executable);
         let elf = parse_elf64(&bytes);
@@ -280,12 +280,12 @@ int main(void) {
             max_tls_end = max_tls_end.max(symbol.value() + symbol.size());
         }
         assert_eq!(max_tls_end, tls.mem_size());
-        // Archive extraction order can change padding between TLS inputs.
-        // The x86-64 static TLS allocation rounds both templates to p_align.
-        aligned_tls_sizes.push(tls.mem_size().next_multiple_of(tls.align()));
+        // Matching archive extraction order also preserves padding between
+        // TLS inputs, so compare the exact template size with GNU ld.
+        tls_sizes.push(tls.mem_size());
         run_executable(executable).success().stdout(stdout);
     }
-    assert_eq!(aligned_tls_sizes[0], aligned_tls_sizes[1]);
+    assert_eq!(tls_sizes[0], tls_sizes[1]);
 }
 
 #[test]

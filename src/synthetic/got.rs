@@ -153,7 +153,7 @@ mod tests {
             .into_iter()
             .flat_map(|object| object.relocations)
             .collect::<Vec<_>>();
-        let symbols = symbols::resolve(&symbols, &[]).unwrap();
+        let symbols = symbols::resolve_inputs(&symbols, &[]).unwrap();
         let got = Got::collect(&relocations, &symbols).unwrap();
         assert_eq!(got.entries().count(), 1);
         assert_eq!(got.section().size, 8);
@@ -207,7 +207,7 @@ mod tests {
             .into_iter()
             .flat_map(|object| object.relocations)
             .collect::<Vec<_>>();
-        let symbols = symbols::resolve(&symbols, &[]).unwrap();
+        let symbols = symbols::resolve_inputs(&symbols, &[]).unwrap();
         let got = Got::collect(&relocations, &symbols).unwrap();
         assert_eq!(got.entries().count(), 2);
         assert_eq!(got.section().size, 16);
@@ -240,7 +240,7 @@ mod tests {
             FileId::InputObject { input_index: 0 },
         )
         .unwrap();
-        let symbols = symbols::resolve(&object.symbols, &[]).unwrap();
+        let symbols = symbols::resolve_inputs(&object.symbols, &[]).unwrap();
         let id = symbols
             .input(FileId::InputObject { input_index: 0 }, 1)
             .unwrap();
@@ -292,7 +292,7 @@ mod tests {
             .into_iter()
             .chain(reference.symbols)
             .collect::<Vec<_>>();
-        let symbols = symbols::resolve(&symbols, &[]).unwrap();
+        let symbols = symbols::resolve_inputs(&symbols, &[]).unwrap();
         let id = symbols
             .input(FileId::InputObject { input_index: 0 }, 1)
             .unwrap();

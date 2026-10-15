@@ -114,9 +114,6 @@ pub(crate) struct ObjectRelocation {
     /// Identity of the object file that owns this relocation.
     pub(crate) file_id: FileId,
 
-    /// Index of the relocation section that contains this entry.
-    pub(crate) reloc_section_idx: u16,
-
     /// Index of the section to which this relocation applies.
     pub(crate) target_idx: u32,
 
@@ -221,7 +218,6 @@ pub(crate) fn parse<'a>(
                     let relocation = ObjectRelocation {
                         file_id,
                         target_idx: relocation.target_idx(),
-                        reloc_section_idx: section.idx(),
                         offset: relocation.offset(),
                         info: relocation.info(),
                         addend: relocation.addend(),

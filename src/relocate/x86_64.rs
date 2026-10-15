@@ -1,249 +1,279 @@
-use crate::{
-    input::FileId,
-    layout::Layout,
-    link::LinkedImage,
-    synthetic::{GotEntry, SyntheticSection},
-};
-
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use elf::x86_64::X86_64RelocationType;
-use num::traits::ToBytes;
 
-pub(crate) fn apply(linked: &mut LinkedImage, entry_name: &str) -> Result<u64 /* start address */> {
-    pr_debug!("Relocating sections...");
-    let LinkedImage {
-        layout,
-        symbols,
-        relocations,
-        got,
-        iplt,
-    } = linked;
-    let Layout {
-        sections,
-        section_index,
-        tls,
-        ..
-    } = layout;
-    let got_location = section_index.get(&(FileId::LinkerGenerated, SyntheticSection::Got as u16));
-    let got_va = got_location
-        .map(|location| sections[location.output_idx].address.get().unwrap() + location.offset);
-    for (entry, offset) in got.entries() {
-        let location = got_location.context("synthetic GOT input section was discarded")?;
-        let (GotEntry::Address(id) | GotEntry::TpOff(id) | GotEntry::Ifunc(id)) = entry;
-        let address = *symbols.get(id).address.get().with_context(|| {
-            format!("GOT target has no output address: {}", symbols.get(id).name)
-        })?;
-        let data = sections[location.output_idx]
-            .data
-            .as_mut()
-            .context("GOT output section has no data")?;
-        match entry {
-            GotEntry::Address(_) => {
-                write_data(data, location.offset + offset, address)?;
-            }
-            GotEntry::TpOff(_) => {
-                let tpoff = tls
-                    .context("TLS GOT entry has no TLS segment")?
-                    .tpoff(address)
-                    .with_context(|| {
-                        format!(
-                            "invalid TLS GOT target: {} at {address:#x}",
-                            symbols.get(id).name
-                        )
-                    })?;
-                write_data(data, location.offset + offset, tpoff)?;
-            }
-            // Startup applies IRELATIVE before any IFUNC calls. Leave the
-            // reserved slot zero until it stores the resolver's result.
-            GotEntry::Ifunc(_) => {}
-        }
-    }
-    iplt.write(sections, section_index, got, symbols)?;
-
-    for relocation in relocations {
-        pr_debug!(
-            "Relocating symbol idx: {} in file id: {} at offset: {:#x} in section idx: {}",
-            relocation.target_idx,
-            relocation.file_id,
-            relocation.offset,
-            relocation.reloc_section_idx
-        );
-        let target_idx =
-            u16::try_from(relocation.target_idx).context("Failed to convert target index")?;
-        let Some(location) = section_index.get(&(relocation.file_id, target_idx)) else {
-            continue;
-        };
-        let reloc_type = X86_64RelocationType::try_from(relocation.info)?;
-        if reloc_type == X86_64RelocationType::None {
-            continue;
-        }
-        let symbol_id = symbols.input(relocation.file_id, relocation.info.sym)?;
-        let target_symbol = symbols.get(symbol_id);
-        // Direct references use the canonical IPLT address; resolver addresses
-        // remain available separately for the IRELATIVE addends.
-        let canonical_address = if target_symbol.is_ifunc()
-            && matches!(
-                reloc_type,
-                X86_64RelocationType::Pc32
-                    | X86_64RelocationType::Plt32
-                    | X86_64RelocationType::R64
-                    | X86_64RelocationType::R32
-                    | X86_64RelocationType::R32S
-            ) {
-            Some(iplt.address(symbol_id, sections, section_index)?)
-        } else {
-            None
-        };
-        let section = &mut sections[location.output_idx];
-        let section_va = *section
-            .address
-            .get()
-            .context("relocation section has no address")?;
-        let target_offset = location.offset;
-        let target_data = section
-            .data
-            .as_mut()
-            .context("Failed to find target data for relocation")?;
-        // S comes from the winning definition, including references within
-        // an object whose weak definition was replaced by a strong one.
-        let symbol_addr = canonical_address
-            .or_else(|| target_symbol.address.get().copied())
-            .with_context(|| {
-                format!(
-                    "relocation target has no output address: {}",
-                    target_symbol.name
-                )
-            })?;
-
-        // A
-        let addend = relocation.addend;
-        // P
-        let place_addr = section_va + target_offset + relocation.offset;
-        pr_debug!("Relocation type: {:?}", reloc_type);
-        match reloc_type {
-            X86_64RelocationType::None => {}
-            X86_64RelocationType::Pc32 | X86_64RelocationType::Plt32 => {
-                // S + A - P
-                let value = (symbol_addr as i128) + (addend as i128) - (place_addr as i128);
-                let addr: i32 = value
-                    .try_into()
-                    .with_context(|| format!("Relocation PC32 calculation failed: symbol_addr={:#x}, addend={:#x}, place_addr={:#x}", symbol_addr, addend, place_addr))?;
-                pr_debug!("Relocation PC32: {:#x}", addr);
-
-                write_data(target_data, target_offset + relocation.offset, addr)?;
-            }
-            X86_64RelocationType::GotPcRel
-            | X86_64RelocationType::GotPcRelX
-            | X86_64RelocationType::RexGotPcRelX
-            | X86_64RelocationType::GotTpOff => {
-                // G + GOT + A - P. Keep the original instruction unchanged.
-                let entry = if reloc_type == X86_64RelocationType::GotTpOff {
-                    GotEntry::TpOff(symbol_id)
-                } else if target_symbol.is_ifunc() {
-                    GotEntry::Ifunc(symbol_id)
-                } else {
-                    GotEntry::Address(symbol_id)
-                };
-                let slot_addr = got_va.context("GOT has no output address")? + got.offset(entry)?;
-                let value = (slot_addr as i128) + (addend as i128) - (place_addr as i128);
-                let addr: i32 = value.try_into().with_context(|| {
-                    format!(
-                        "Relocation {reloc_type:?} calculation failed: slot_addr={slot_addr:#x}, addend={addend:#x}, place_addr={place_addr:#x}"
-                    )
-                })?;
-                write_data(target_data, target_offset + relocation.offset, addr)?;
-            }
-            X86_64RelocationType::TpOff32 | X86_64RelocationType::TpOff64 => {
-                let tpoff = tls
-                    .context("TLS relocation has no TLS segment")?
-                    .tpoff(symbol_addr)
-                    .with_context(|| {
-                        format!(
-                            "invalid TLS relocation target: {} at {symbol_addr:#x}",
-                            target_symbol.name
-                        )
-                    })?;
-                let value = i128::from(tpoff) + i128::from(addend);
-                let offset = target_offset + relocation.offset;
-                if reloc_type == X86_64RelocationType::TpOff32 {
-                    let value = i32::try_from(value).with_context(|| {
-                        format!(
-                            "Relocation TPOFF32 calculation failed: tpoff={tpoff}, addend={addend}"
-                        )
-                    })?;
-                    write_data(target_data, offset, value)?;
-                } else {
-                    let value = i64::try_from(value).with_context(|| {
-                        format!(
-                            "Relocation TPOFF64 calculation failed: tpoff={tpoff}, addend={addend}"
-                        )
-                    })?;
-                    write_data(target_data, offset, value)?;
-                }
-            }
-            X86_64RelocationType::R32 => {
-                // S + A
-                let value = (symbol_addr as i128) + (addend as i128);
-                let addr: u32 = value.try_into().with_context(|| {
-                    format!(
-                        "Relocation REL32 calculation failed: symbol_addr={:#x}, addend={:#x}",
-                        symbol_addr, addend
-                    )
-                })?;
-                pr_debug!("Relocation REL32: {:#x}", addr);
-
-                write_data(target_data, target_offset + relocation.offset, addr)?;
-            }
-            X86_64RelocationType::R64 => {
-                // S + A
-                let value = (symbol_addr as i128) + (addend as i128);
-                let addr: u64 = value.try_into().with_context(|| {
-                    format!(
-                        "Relocation REL64 calculation failed: symbol_addr={:#x}, addend={:#x}",
-                        symbol_addr, addend
-                    )
-                })?;
-                pr_debug!("Relocation REL64: {:#x}", addr);
-
-                write_data(target_data, target_offset + relocation.offset, addr)?;
-            }
-            X86_64RelocationType::R32S => {
-                // S + A
-                let value = (symbol_addr as i128) + (addend as i128);
-                let addr: i32 = value.try_into().with_context(|| {
-                    format!(
-                        "Relocation REL32S calculation failed: symbol_addr={:#x}, addend={:#x}",
-                        symbol_addr, addend
-                    )
-                })?;
-                pr_debug!("Relocation REL32S: {:#x}", addr);
-
-                write_data(target_data, target_offset + relocation.offset, addr)?;
-            }
-            x => {
-                bail!("Unsupported relocation type: {:?}", x);
-            }
-        }
-    }
-
-    symbols
-        .named(entry_name)
-        .and_then(|symbol| symbol.address.get().copied())
-        .context("Failed to find entry point")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Width {
+    None,
+    Bits32,
+    Bits64,
 }
 
-fn write_data<T: ToBytes>(data: &mut [u8], offset: u64, value: T) -> Result<()> {
-    let offset = offset as usize;
-    let bytes = value.to_le_bytes();
-    let bytes = bytes.as_ref();
-    if offset + size_of::<T>() > data.len() {
-        bail!(
-            "Write out of bounds: offset {} + size {} > data length {}",
-            offset,
-            size_of::<T>(),
-            data.len()
-        );
-    }
-    data[offset..offset + size_of::<T>()].copy_from_slice(&bytes);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Signedness {
+    /// The value must fit after zero extension (e.g. R_X86_64_32).
+    Unsigned,
+    /// The value is two's complement in a 64-bit field (R_X86_64_64): the
+    /// psABI word64 accepts both signed and unsigned values, so `S + A` with a
+    /// negative result (e.g. undefined weak `S = 0` and `A < 0`) is valid.
+    Either,
+    Signed,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct RelocationValue {
+    pub(super) width: Width,
+    pub(super) signedness: Signedness,
+    pub(super) value: i128,
+}
+
+pub(super) struct Operands {
+    pub(super) symbol: u64,
+    pub(super) addend: i64,
+    pub(super) place: u64,
+    pub(super) got_slot: Option<u64>,
+    pub(super) tls_offset: Option<i64>,
+    pub(super) iplt_address: Option<u64>,
+}
+
+/// Calculations for supported relocations (AMD64 psABI, section 4.4.1).
+///
+/// | R_X86_64_ suffix | Calculation | Field |
+/// | --- | --- | --- |
+/// | NONE | no write | none |
+/// | 64 | S + A | unsigned 64 |
+/// | 32 | S + A | unsigned 32 (zero extension) |
+/// | 32S | S + A | signed 32 (sign extension) |
+/// | PC32 | S + A - P | signed 32 |
+/// | PLT32 | L + A - P | signed 32 |
+/// | GOTPCREL, GOTPCRELX, REX_GOTPCRELX | G + GOT + A - P | signed 32 |
+/// | GOTTPOFF | G + GOT + A - P | signed 32 |
+/// | TPOFF32 | tpoff(S) + A | signed 32 |
+/// | TPOFF64 | tpoff(S) + A | signed 64 |
+///
+/// `got_slot` is G + GOT. For static output L is S unless an IFUNC needs an
+/// IPLT stub. GOTPCRELX instructions remain unrelaxed. Wide intermediate
+/// arithmetic keeps overflow checks separate from these psABI formulas.
+pub(super) fn compute(ty: X86_64RelocationType, operands: &Operands) -> Result<RelocationValue> {
+    use Signedness::{Either, Signed, Unsigned};
+    use Width::{Bits32, Bits64};
+    use X86_64RelocationType::*;
+    // The IPLT stub is the canonical function address of an IFUNC. Its
+    // resolver's S is retained separately for the IRELATIVE relocation.
+    let s = i128::from(operands.iplt_address.unwrap_or(operands.symbol));
+    let a = i128::from(operands.addend);
+    let p = i128::from(operands.place);
+    let (width, signedness, value) = match ty {
+        None => (Width::None, Unsigned, 0),
+        R64 => (Bits64, Either, s + a),
+        R32 => (Bits32, Unsigned, s + a),
+        R32S => (Bits32, Signed, s + a),
+        Pc32 | Plt32 => (Bits32, Signed, s + a - p),
+        GotPcRel | GotPcRelX | RexGotPcRelX | GotTpOff => (
+            Bits32,
+            Signed,
+            i128::from(operands.got_slot.context("missing GOT slot address")?) + a - p,
+        ),
+        TpOff32 | TpOff64 => (
+            if ty == TpOff32 { Bits32 } else { Bits64 },
+            Signed,
+            i128::from(operands.tls_offset.context("missing TLS offset")?) + a,
+        ),
+        _ => bail!("unsupported relocation type: {ty:?}"),
+    };
+    Ok(RelocationValue {
+        width,
+        signedness,
+        value,
+    })
+}
+
+pub(super) struct RelocationSite<'a> {
+    pub(super) ty: X86_64RelocationType,
+    pub(super) symbol: &'a str,
+    pub(super) place: u64,
+}
+
+/// Check the psABI's extension rule before writing one little-endian field.
+pub(super) fn write_value(
+    data: &mut [u8],
+    offset: u64,
+    value: RelocationValue,
+    site: &RelocationSite,
+) -> Result<()> {
+    use Signedness::{Either, Signed, Unsigned};
+    use Width::*;
+    let (size, minimum, maximum) = match (value.width, value.signedness) {
+        (None, _) => return Ok(()),
+        (Bits32, Unsigned) => (4, 0, i128::from(u32::MAX)),
+        (Bits32, Signed) => (4, i128::from(i32::MIN), i128::from(i32::MAX)),
+        (Bits32, Either) => (4, i128::from(i32::MIN), i128::from(u32::MAX)),
+        (Bits64, Unsigned) => (8, 0, i128::from(u64::MAX)),
+        (Bits64, Either) => (8, i128::from(i64::MIN), i128::from(u64::MAX)),
+        (Bits64, Signed) => (8, i128::from(i64::MIN), i128::from(i64::MAX)),
+    };
+    let diagnostic = || {
+        format!(
+            "relocation {:?} for symbol '{}' at {:#x}",
+            site.ty, site.symbol, site.place
+        )
+    };
+    ensure!(
+        (minimum..=maximum).contains(&value.value),
+        "{} overflows {:?} {:?} field: value {:#x}",
+        diagnostic(),
+        value.signedness,
+        value.width,
+        value.value
+    );
+    let offset = usize::try_from(offset)
+        .with_context(|| format!("{}: write offset exceeds usize", diagnostic()))?;
+    let end = offset
+        .checked_add(size)
+        .with_context(|| format!("{}: write end exceeds usize", diagnostic()))?;
+    let target = data.get_mut(offset..end).with_context(|| {
+        format!(
+            "{}: write out of bounds at offset {offset:#x}",
+            diagnostic()
+        )
+    })?;
+    target.copy_from_slice(&value.value.to_le_bytes()[..size]);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_writer_accepts_boundaries_and_rejects_truncation_without_writing() {
+        use Signedness::{Signed, Unsigned};
+        use Width::{Bits32, Bits64};
+        use X86_64RelocationType::{R32, R32S, R64, TpOff64};
+        for (ty, width, signedness, size, minimum, maximum) in [
+            (R32, Bits32, Unsigned, 4, 0, i128::from(u32::MAX)),
+            (
+                R32S,
+                Bits32,
+                Signed,
+                4,
+                i128::from(i32::MIN),
+                i128::from(i32::MAX),
+            ),
+            (R64, Bits64, Unsigned, 8, 0, i128::from(u64::MAX)),
+            (
+                R64,
+                Bits64,
+                Signedness::Either,
+                8,
+                i128::from(i64::MIN),
+                i128::from(u64::MAX),
+            ),
+            (
+                TpOff64,
+                Bits64,
+                Signed,
+                8,
+                i128::from(i64::MIN),
+                i128::from(i64::MAX),
+            ),
+        ] {
+            let site = RelocationSite {
+                ty,
+                symbol: "target",
+                place: 0x401234,
+            };
+            for value in [minimum, maximum] {
+                let mut data = [0xa5; 10];
+                write_value(
+                    &mut data,
+                    1,
+                    RelocationValue {
+                        width,
+                        signedness,
+                        value,
+                    },
+                    &site,
+                )
+                .unwrap();
+                assert_eq!(&data[1..1 + size], &value.to_le_bytes()[..size]);
+                assert_eq!(data[0], 0xa5);
+                assert!(data[1 + size..].iter().all(|byte| *byte == 0xa5));
+            }
+            for value in [minimum - 1, maximum + 1] {
+                let mut data = [0xa5; 8];
+                let error = write_value(
+                    &mut data,
+                    0,
+                    RelocationValue {
+                        width,
+                        signedness,
+                        value,
+                    },
+                    &site,
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(error.contains(&format!("{ty:?}")));
+                assert!(error.contains("symbol 'target' at 0x401234"));
+                assert!(error.contains("overflows"));
+                assert_eq!(data, [0xa5; 8]);
+            }
+        }
+    }
+
+    #[test]
+    fn r64_writes_negative_values_as_twos_complement() {
+        // An undefined weak symbol has S = 0, so `.quad sym - 8` yields -8.
+        let value = compute(
+            X86_64RelocationType::R64,
+            &Operands {
+                symbol: 0,
+                addend: -8,
+                place: 0x401000,
+                got_slot: Option::None,
+                tls_offset: Option::None,
+                iplt_address: Option::None,
+            },
+        )
+        .unwrap();
+        let mut data = [0; 8];
+        write_value(
+            &mut data,
+            0,
+            value,
+            &RelocationSite {
+                ty: X86_64RelocationType::R64,
+                symbol: "weak",
+                place: 0x401000,
+            },
+        )
+        .unwrap();
+        assert_eq!(u64::from_le_bytes(data), (-8i64) as u64);
+    }
+
+    #[test]
+    fn checked_writer_reports_out_of_bounds_with_relocation_context() {
+        let site = RelocationSite {
+            ty: X86_64RelocationType::R64,
+            symbol: "target",
+            place: 0x401234,
+        };
+        for offset in [1, u64::MAX] {
+            let mut data = [0xa5; 8];
+            let error = write_value(
+                &mut data,
+                offset,
+                RelocationValue {
+                    width: Width::Bits64,
+                    signedness: Signedness::Unsigned,
+                    value: 0,
+                },
+                &site,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("relocation R64 for symbol 'target' at 0x401234"));
+            assert_eq!(data, [0xa5; 8]);
+        }
+    }
 }

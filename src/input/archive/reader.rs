@@ -44,6 +44,11 @@ pub(crate) fn check_magic(data: &[u8]) -> bool {
     data.starts_with(AR_MAGIC)
 }
 
+pub(crate) struct ArchiveSymbol<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) member_offset: usize,
+}
+
 #[derive(Debug)]
 pub(crate) struct ArchiveReader<'a> {
     data: &'a [u8],
@@ -87,6 +92,21 @@ impl<'a> ArchiveReader<'a> {
         Ok(found.map(|slice| self.slice(slice)))
     }
 
+    /// The GNU/SysV armap stores a big-endian count, member-header offsets,
+    /// and NUL-terminated names. Preserve its order, including duplicate names.
+    pub(crate) fn symbol_table(&self) -> Result<Option<Vec<ArchiveSymbol<'a>>>> {
+        for member in self.iter() {
+            let member = member?;
+            let width = match member.member_name()? {
+                MemberName::SymbolTable => 4,
+                MemberName::SymbolTable64 => 8,
+                _ => continue,
+            };
+            return parse_symbol_table(member.payload()?, width).map(Some);
+        }
+        Ok(None)
+    }
+
     fn find_long_name_table(&self) -> Result<Option<MemberSlice>> {
         for member in self.iter() {
             let member = member?;
@@ -113,6 +133,10 @@ pub(crate) struct ArchiveMember<'a> {
 }
 
 impl<'a> ArchiveMember<'a> {
+    pub(crate) fn header_offset(&self) -> usize {
+        self.offset
+    }
+
     pub(crate) fn size(&self) -> Result<usize> {
         Ok(to_decimal(self.header_field(AR_SIZE_OFFSET, AR_SIZE_LEN))? as usize)
     }
@@ -323,6 +347,46 @@ pub(crate) fn resolve_long_name(long_names: &[u8], offset: usize) -> Result<Stri
         .to_string())
 }
 
+fn parse_symbol_table(data: &[u8], width: usize) -> Result<Vec<ArchiveSymbol<'_>>> {
+    let read_word = |bytes: &[u8]| -> Result<usize> {
+        let value = if width == 4 {
+            u64::from(u32::from_be_bytes(bytes.try_into()?))
+        } else {
+            u64::from_be_bytes(bytes.try_into()?)
+        };
+        usize::try_from(value).context("archive symbol-table offset exceeds usize")
+    };
+    let count = read_word(
+        data.get(..width)
+            .context("truncated archive symbol-table count")?,
+    )?;
+    let names_offset = count
+        .checked_add(1)
+        .and_then(|count| count.checked_mul(width))
+        .context("archive symbol-table size exceeds usize")?;
+    let offsets = data
+        .get(width..names_offset)
+        .context("truncated archive symbol-table offsets")?;
+    let mut names = data
+        .get(names_offset..)
+        .context("missing archive symbol-table names")?;
+    let mut symbols = Vec::with_capacity(count);
+    for offset in offsets.chunks_exact(width) {
+        let end = names
+            .iter()
+            .position(|byte| *byte == 0)
+            .context("unterminated archive symbol-table name")?;
+        let name = std::str::from_utf8(&names[..end])
+            .context("archive symbol-table name is not valid UTF-8")?;
+        symbols.push(ArchiveSymbol {
+            name,
+            member_offset: read_word(offset)?,
+        });
+        names = &names[end + 1..];
+    }
+    Ok(symbols)
+}
+
 fn to_decimal(bytes: &[u8]) -> Result<u64> {
     let trimmed = std::str::from_utf8(bytes)
         .context("archive decimal field is not valid UTF-8")?
@@ -335,6 +399,44 @@ mod tests {
     use super::*;
     use crate::test_utils::{TestSymbol, build_archive, build_rel_object};
     use elf::{Elf64SymbolBinding, Elf64SymbolType};
+
+    #[test]
+    fn symbol_tables_preserve_order_and_duplicate_names_for_both_offset_widths() {
+        for width in [4, 8] {
+            let mut table = Vec::new();
+            for word in [3u64, 0x120, 0x80, 0x120] {
+                table.extend_from_slice(&word.to_be_bytes()[8 - width..]);
+            }
+            table.extend_from_slice(b"zeta\0alpha\0zeta\0");
+            let archive = build_archive(&[(if width == 4 { "/" } else { "/SYM64/" }, &table)]);
+            let reader = ArchiveReader::new(&archive).unwrap();
+            let symbols = reader.symbol_table().unwrap().unwrap();
+            assert_eq!(
+                symbols
+                    .iter()
+                    .map(|symbol| (symbol.name, symbol.member_offset))
+                    .collect::<Vec<_>>(),
+                [("zeta", 0x120), ("alpha", 0x80), ("zeta", 0x120)]
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_symbol_tables_are_errors() {
+        for table in [
+            b"".as_slice(),
+            &[0, 0, 0, 2, 0, 0, 0, 8],
+            &[0, 0, 0, 1, 0, 0, 0, 8, b'x'],
+        ] {
+            let archive = build_archive(&[("/", table)]);
+            assert!(
+                ArchiveReader::new(&archive)
+                    .unwrap()
+                    .symbol_table()
+                    .is_err()
+            );
+        }
+    }
 
     #[test]
     fn check_magic_only_accepts_archive_magic() {

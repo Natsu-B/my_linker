@@ -5,11 +5,11 @@ use elf::{Elf64ProgramHeaderFlags, Elf64SymbolSectionIdx, PF_R};
 
 use super::{OutputSection, PAGE_SIZE};
 use crate::{
-    input::FileId,
+    input::{FileId, object::InputSection},
     script::{
         ast::*,
         eval,
-        mapping::{MappedItem, MappedStatement, MappingInput},
+        mapping::{MappedItem, MappedOutputSection, MappedStatement, MappingInput},
     },
     symbols::{Definition, ResolvedSymbol, SymbolTable},
 };
@@ -137,8 +137,186 @@ impl<'s> SectionPlacer<'s> {
         inputs: &[MappingInput<'a>],
     ) -> Result<Vec<OutputSection<'a>>> {
         let mut sections = Vec::new();
-        let mut previous_flags = Elf64ProgramHeaderFlags::from_bits(PF_R);
-        let mut previous_end = 0;
+        let mut state = PlacementState::new(items);
+        for (item_index, item) in items.iter().enumerate() {
+            self.context.next_section_alignment =
+                next_section_alignment(&items[item_index + 1..], inputs);
+            match item {
+                MappedItem::Assignment(assignment) => self.assign(assignment)?,
+                MappedItem::Output(output) => {
+                    if output.statements.is_empty() {
+                        continue;
+                    }
+                    let section = self.place_output(output, inputs, sections.len(), &mut state)?;
+                    sections.push(section);
+                }
+            }
+        }
+        Ok(sections)
+    }
+
+    fn place_output<'a>(
+        &mut self,
+        output: &MappedOutputSection,
+        inputs: &[MappingInput<'a>],
+        output_index: usize,
+        state: &mut PlacementState,
+    ) -> Result<OutputSection<'a>> {
+        let output_align = state.output_alignment(output, inputs);
+        let address = self.output_address(output, inputs, output_align, state)?;
+        self.context.dot = address;
+        self.current_section = Some(output_index);
+        self.dot_section = self.current_section;
+        let mut section = OutputSection {
+            name: output.name.clone(),
+            flags: output.permissions(),
+            size: 0,
+            align: output_align,
+            address: OnceCell::from(address),
+            data: None,
+            inputs: Vec::new(),
+        };
+        for statement in &output.statements {
+            match statement {
+                MappedStatement::Assignment(assignment) => {
+                    self.assign_in_section(assignment, &section.name)?
+                }
+                MappedStatement::Input(index) => {
+                    self.place_input(&inputs[*index].section, &mut section, output_index)?
+                }
+            }
+        }
+        section.size = self.context.dot - address;
+        state.finish_output(&section, self.context.dot)?;
+        pr_debug!(
+            "Output section {} at {address:#x}, size {:#x}",
+            section.name,
+            section.size
+        );
+        self.current_section = None;
+        Ok(section)
+    }
+
+    fn assign_in_section(&mut self, assignment: &Assignment, name: &str) -> Result<()> {
+        let old_dot = self.context.dot;
+        self.assign(assignment)?;
+        ensure!(
+            self.context.dot >= old_dot,
+            "location counter moves backwards in output section {name}"
+        );
+        Ok(())
+    }
+
+    fn output_address(
+        &mut self,
+        output: &MappedOutputSection,
+        inputs: &[MappingInput],
+        alignment: u64,
+        state: &mut PlacementState,
+    ) -> Result<u64> {
+        let mut address = match output.address {
+            Some(expression) => eval::evaluate(expression, &self.context)?,
+            None => align(self.context.dot, alignment)?,
+        };
+        if self.header_vaddr.is_none() {
+            self.reserve_headers(address, state)?;
+        }
+        if output.has_contents(inputs) {
+            let minimum = state.minimum_address(output.permissions())?;
+            if output.address.is_some() {
+                ensure!(
+                    address >= minimum,
+                    "output section {} at {address:#x} overlaps a previous section or shares a page with different permissions",
+                    output.name
+                );
+            } else {
+                address = align(address.max(minimum), alignment)?;
+            }
+        }
+        Ok(address)
+    }
+
+    fn reserve_headers(&mut self, address: u64, state: &mut PlacementState) -> Result<()> {
+        let first_address = if self.context.dot >= self.context.sizeof_headers {
+            self.context.dot.min(address)
+        } else {
+            address
+        };
+        let base = first_address
+            .checked_sub(self.context.sizeof_headers)
+            .context("no space for mapped ELF headers before the first output section")?
+            / PAGE_SIZE
+            * PAGE_SIZE;
+        self.header_vaddr = Some(base);
+        state.previous_end = base + self.context.sizeof_headers;
+        Ok(())
+    }
+
+    fn place_input<'a>(
+        &mut self,
+        input: &InputSection<'a>,
+        section: &mut OutputSection<'a>,
+        output_index: usize,
+    ) -> Result<()> {
+        self.context.dot = align(self.context.dot, input.align.max(1))?;
+        let offset = self.context.dot - section.address.get().unwrap();
+        if let Some(data) = input.data.as_deref() {
+            ensure!(
+                data.len() as u64 == input.size,
+                "input section {} data length does not match size",
+                input.name
+            );
+            let output_data = section.data.get_or_insert_with(Vec::new);
+            output_data.resize(
+                usize::try_from(offset).context("output section too large")?,
+                0,
+            );
+            output_data.extend_from_slice(data);
+        }
+        self.record_input_symbols(input, output_index)?;
+        self.context.dot = self
+            .context
+            .dot
+            .checked_add(input.size)
+            .context("output section address exceeds u64")?;
+        section.inputs.push((input.clone(), offset));
+        Ok(())
+    }
+
+    fn record_input_symbols(&mut self, input: &InputSection, output_index: usize) -> Result<()> {
+        for symbol in self
+            .section_symbols
+            .get(&(input.file_id, input.idx))
+            .into_iter()
+            .flatten()
+        {
+            let Definition::Input { value, .. } = symbol.definition else {
+                unreachable!()
+            };
+            self.context.symbols.insert(
+                symbol.name.clone(),
+                self.context
+                    .dot
+                    .checked_add(value)
+                    .context("symbol address exceeds u64")?,
+            );
+            self.symbol_sections
+                .insert(symbol.name.clone(), output_index);
+        }
+        Ok(())
+    }
+}
+
+/// State shared by consecutive output sections, independent of script symbols.
+struct PlacementState {
+    previous_flags: Elf64ProgramHeaderFlags,
+    previous_end: u64,
+    tls_align: u64,
+    tls_started: bool,
+}
+
+impl PlacementState {
+    fn new(items: &[MappedItem]) -> Self {
         let tls_align = items
             .iter()
             .filter_map(|item| match item {
@@ -147,159 +325,63 @@ impl<'s> SectionPlacer<'s> {
             })
             .max()
             .unwrap_or(1);
-        let mut tls_started = false;
-        for (item_index, item) in items.iter().enumerate() {
-            self.context.next_section_alignment = items[item_index + 1..]
-                .iter()
-                .find_map(|item| match item {
-                    MappedItem::Output(output) if output.has_contents(inputs) => Some(output.align),
-                    _ => None,
-                })
-                .unwrap_or(1);
-            match item {
-                MappedItem::Assignment(assignment) => self.assign(assignment)?,
-                MappedItem::Output(output) => {
-                    let mut output_align = output.align;
-                    if !tls_started && output.is_tls() && output.has_contents(inputs) {
-                        output_align = output_align.max(tls_align);
-                        tls_started = true;
-                    }
-                    let mut address = match output.address {
-                        Some(address) => eval::evaluate(address, &self.context)?,
-                        None => align(self.context.dot, output_align)?,
-                    };
-                    if output.statements.is_empty() {
-                        continue;
-                    }
-                    if self.header_vaddr.is_none() {
-                        let first_address = if self.context.dot >= self.context.sizeof_headers {
-                            self.context.dot.min(address)
-                        } else {
-                            address
-                        };
-                        let base = first_address
-                            .checked_sub(self.context.sizeof_headers)
-                            .context(
-                                "no space for mapped ELF headers before the first output section",
-                            )?
-                            / PAGE_SIZE
-                            * PAGE_SIZE;
-                        self.header_vaddr = Some(base);
-                        previous_end = base + self.context.sizeof_headers;
-                    }
-                    let flags = output.permissions();
-                    if output.has_contents(inputs) {
-                        let minimum = if flags == previous_flags {
-                            previous_end
-                        } else {
-                            align(previous_end, PAGE_SIZE)?
-                        };
-                        if output.address.is_some() {
-                            ensure!(
-                                address >= minimum,
-                                "output section {} at {address:#x} overlaps a previous section or shares a page with different permissions",
-                                output.name
-                            );
-                        } else {
-                            address = align(address.max(minimum), output_align)?;
-                        }
-                    }
-                    self.context.dot = address;
-                    self.current_section = Some(sections.len());
-                    self.dot_section = self.current_section;
-                    let mut section = OutputSection {
-                        name: output.name.clone(),
-                        flags,
-                        size: 0,
-                        align: output_align,
-                        address: OnceCell::from(address),
-                        data: None,
-                        inputs: Vec::new(),
-                    };
-                    for statement in &output.statements {
-                        match statement {
-                            MappedStatement::Assignment(assignment) => {
-                                let old_dot = self.context.dot;
-                                self.assign(assignment)?;
-                                ensure!(
-                                    self.context.dot >= old_dot,
-                                    "location counter moves backwards in output section {}",
-                                    output.name
-                                );
-                            }
-                            MappedStatement::Input(index) => {
-                                let input = &inputs[*index].section;
-                                self.context.dot = align(self.context.dot, input.align.max(1))?;
-                                let offset = self.context.dot - address;
-                                if let Some(data) = input.data.as_deref() {
-                                    ensure!(
-                                        data.len() as u64 == input.size,
-                                        "input section {} data length does not match size",
-                                        input.name
-                                    );
-                                    let output_data = section.data.get_or_insert_with(Vec::new);
-                                    output_data.resize(
-                                        usize::try_from(offset)
-                                            .context("output section too large")?,
-                                        0,
-                                    );
-                                    output_data.extend_from_slice(data);
-                                }
-                                for symbol in self
-                                    .section_symbols
-                                    .get(&(input.file_id, input.idx))
-                                    .into_iter()
-                                    .flatten()
-                                {
-                                    let Definition::Input { value, .. } = symbol.definition else {
-                                        unreachable!()
-                                    };
-                                    self.context.symbols.insert(
-                                        symbol.name.clone(),
-                                        self.context
-                                            .dot
-                                            .checked_add(value)
-                                            .context("symbol address exceeds u64")?,
-                                    );
-                                    self.symbol_sections
-                                        .insert(symbol.name.clone(), sections.len());
-                                }
-                                self.context.dot = self
-                                    .context
-                                    .dot
-                                    .checked_add(input.size)
-                                    .context("output section address exceeds u64")?;
-                                section.inputs.push((input.clone(), offset));
-                            }
-                        }
-                    }
-                    section.size = self.context.dot - address;
-                    if section.size != 0 {
-                        ensure!(
-                            address >= previous_end,
-                            "output section {} overlaps a previous section",
-                            output.name
-                        );
-                        ensure!(
-                            flags == previous_flags || address >= align(previous_end, PAGE_SIZE)?,
-                            "output section {} shares a page with different permissions",
-                            output.name
-                        );
-                        previous_end = self.context.dot;
-                        previous_flags = flags;
-                    }
-                    pr_debug!(
-                        "Output section {} at {address:#x}, size {:#x}",
-                        section.name,
-                        section.size
-                    );
-                    sections.push(section);
-                    self.current_section = None;
-                }
-            }
+        Self {
+            previous_flags: Elf64ProgramHeaderFlags::from_bits(PF_R),
+            previous_end: 0,
+            tls_align,
+            tls_started: false,
         }
-        Ok(sections)
     }
+
+    fn output_alignment(&mut self, output: &MappedOutputSection, inputs: &[MappingInput]) -> u64 {
+        if !self.tls_started && output.is_tls() && output.has_contents(inputs) {
+            // The first TLS section anchors the whole PT_TLS template. Align
+            // it for every TLS input, including a more strictly aligned .tbss.
+            self.tls_started = true;
+            output.align.max(self.tls_align)
+        } else {
+            output.align
+        }
+    }
+
+    fn minimum_address(&self, flags: Elf64ProgramHeaderFlags) -> Result<u64> {
+        if flags == self.previous_flags {
+            Ok(self.previous_end)
+        } else {
+            // PT_LOAD permissions apply to pages, so a change of permissions
+            // starts a new page even when both sections would fit in one.
+            align(self.previous_end, PAGE_SIZE)
+        }
+    }
+
+    fn finish_output(&mut self, section: &OutputSection, end: u64) -> Result<()> {
+        if section.size != 0 {
+            let address = *section.address.get().unwrap();
+            ensure!(
+                address >= self.previous_end,
+                "output section {} overlaps a previous section",
+                section.name
+            );
+            ensure!(
+                address >= self.minimum_address(section.flags)?,
+                "output section {} shares a page with different permissions",
+                section.name
+            );
+            self.previous_end = end;
+            self.previous_flags = section.flags;
+        }
+        Ok(())
+    }
+}
+
+fn next_section_alignment(items: &[MappedItem], inputs: &[MappingInput]) -> u64 {
+    items
+        .iter()
+        .find_map(|item| match item {
+            MappedItem::Output(output) if output.has_contents(inputs) => Some(output.align),
+            _ => None,
+        })
+        .unwrap_or(1)
 }
 
 fn align(value: u64, alignment: u64) -> Result<u64> {
@@ -315,7 +397,7 @@ mod tests {
         input::object::InputSection,
         layout::{segments::load_segment_count, tls::TlsSegment},
         script::{
-            mapping::{MappedOutputSection, input_name, map_sections},
+            mapping::{input_name, map_inputs},
             parser,
         },
     };
@@ -381,7 +463,7 @@ mod tests {
             input("a.o", ".other", 2, 8),
         ];
         let script = parser::parse("SECTIONS { . = 0x400000 + SIZEOF_HEADERS; .text : { *(.text) } .rodata : { *(.rodata) } .data : { *(.data) } }").unwrap();
-        let items = map_sections(&script, &inputs).unwrap();
+        let items = map_inputs(&script, &inputs).unwrap();
         assert_eq!(
             names(&items),
             vec![".text", ".extra", ".rodata", ".other", ".data"]
@@ -414,7 +496,7 @@ mod tests {
             input("a.o", ".text", 6, 1),
         ];
         let script = parser::parse("SECTIONS { . = 0x401000; .debug_info 0 : { *(.debug_info) } .info 0 (INFO) : { *(.ignored) } /DISCARD/ : { *(.drop) } .text : { *(.text) } }").unwrap();
-        let items = map_sections(&script, &inputs).unwrap();
+        let items = map_inputs(&script, &inputs).unwrap();
         assert_eq!(names(&items), vec![".text"]);
         let symbols = SymbolTable::default();
         let mut layout = SectionPlacer::new(&symbols, 232);
@@ -426,7 +508,7 @@ mod tests {
     fn rejects_explicit_sections_sharing_a_page_with_different_permissions() {
         let inputs = vec![input("a.o", ".text", 6, 1), input("a.o", ".data", 3, 1)];
         let script = parser::parse("SECTIONS { . = 0x400000 + SIZEOF_HEADERS; .text 0x401000 : { *(.text) } .data 0x401001 : { *(.data) } }").unwrap();
-        let items = map_sections(&script, &inputs).unwrap();
+        let items = map_inputs(&script, &inputs).unwrap();
         let symbols = SymbolTable::default();
         let mut layout = SectionPlacer::new(&symbols, 232);
         let error = layout.place(&items, &inputs).err().unwrap();
@@ -444,7 +526,7 @@ mod tests {
             input("a.o", ".data", 3, 128),
         ];
         let script = parser::parse("SECTIONS { . = 0x400000 + SIZEOF_HEADERS; before = .; alignment = ALIGNOF(NEXT_SECTION); .rodata : { start = .; next_alignment = ALIGNOF(NEXT_SECTION); *(.rodata) . = ALIGN(16); finish = .; } after = .; .data : { *(.data) } }").unwrap();
-        let items = map_sections(&script, &inputs).unwrap();
+        let items = map_inputs(&script, &inputs).unwrap();
         let symbols = SymbolTable::default();
         let mut layout = SectionPlacer::new(&symbols, 176);
         let sections = layout.place(&items, &inputs).unwrap();
@@ -469,7 +551,7 @@ mod tests {
         let script = parser::parse(
             "SECTIONS { . = 0x401000; .prefix : { *(.prefix) . = ALIGN(16); } .tdata : { *(.tdata) } .tbss : { *(.tbss) } .data : { *(.data) } }",
         ).unwrap();
-        let items = map_sections(&script, &inputs).unwrap();
+        let items = map_inputs(&script, &inputs).unwrap();
         let symbols = SymbolTable::default();
         let mut layout = SectionPlacer::new(&symbols, 288);
         let sections = layout.place(&items, &inputs).unwrap();

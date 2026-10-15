@@ -207,3 +207,34 @@ fn push_member(out: &mut Vec<u8>, name: &str, payload: &[u8]) {
         out.push(b'\n');
     }
 }
+
+/// Build a GNU armap with a caller-selected symbol order, independent of the
+/// physical member order, so extraction tests exercise the on-disk index.
+pub(crate) fn build_indexed_archive(
+    members: &[(&str, &[u8])],
+    entries: &[(&str, usize)],
+) -> Vec<u8> {
+    let names_size = entries
+        .iter()
+        .map(|(name, _)| name.len() + 1)
+        .sum::<usize>();
+    let table_size = 4 + entries.len() * 4 + names_size;
+    let mut offset = AR_MAGIC.len() + 60 + table_size + table_size % 2;
+    let mut offsets = Vec::new();
+    for (_, bytes) in members {
+        offsets.push(offset as u32);
+        offset += 60 + bytes.len() + bytes.len() % 2;
+    }
+    let mut table = Vec::new();
+    table.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+    for (_, member_index) in entries {
+        table.extend_from_slice(&offsets[*member_index].to_be_bytes());
+    }
+    for (name, _) in entries {
+        table.extend_from_slice(name.as_bytes());
+        table.push(0);
+    }
+    let mut indexed_members = vec![("/", table.as_slice())];
+    indexed_members.extend_from_slice(members);
+    build_archive(&indexed_members)
+}

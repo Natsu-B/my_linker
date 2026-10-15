@@ -6,10 +6,17 @@ use elf::{Elf64SymbolBinding, Elf64SymbolInfo, Elf64SymbolSectionIdx, Elf64Symbo
 use super::table::{Definition, SymbolId, SymbolTable};
 use crate::{
     input::object::ObjectSymbol,
-    script::ast::{Assignment, AssignmentKind},
+    script::{
+        ast::{Assignment, AssignmentKind},
+        mapping::SectionMapping,
+    },
 };
 
-pub(crate) fn resolve(
+pub(crate) fn resolve(mapping: &SectionMapping) -> Result<SymbolTable> {
+    resolve_inputs(&mapping.symbols, &mapping.assignments())
+}
+
+pub(crate) fn resolve_inputs(
     symbols: &[ObjectSymbol],
     assignments: &[&Assignment],
 ) -> Result<SymbolTable> {
@@ -236,7 +243,7 @@ mod tests {
                 Elf64SymbolSectionIdx::AbsoluteSymbols,
             );
             input.info = input.info.set(Elf64SymbolInfo::st_bind, binding);
-            let error = resolve(&[input], &[]).err().unwrap().to_string();
+            let error = resolve_inputs(&[input], &[]).err().unwrap().to_string();
             assert!(error.contains(&format!("unsupported symbol binding {binding}")));
             assert!(error.contains("unsupported"));
             assert!(error.contains("file:"));
@@ -267,7 +274,7 @@ mod tests {
             Elf64SymbolSectionIdx::Undefined,
         );
         let symbols = vec![weak, strong, reference];
-        let table = resolve(&symbols, &[]).unwrap();
+        let table = resolve_inputs(&symbols, &[]).unwrap();
         let id = table
             .input(FileId::InputObject { input_index: 0 }, 1)
             .unwrap();
@@ -302,7 +309,7 @@ mod tests {
                 Elf64SymbolSectionIdx::Undefined,
             )
         });
-        let table = resolve(&symbols, &[]).unwrap();
+        let table = resolve_inputs(&symbols, &[]).unwrap();
         let id = table
             .input(FileId::InputObject { input_index: 0 }, 1)
             .unwrap();
@@ -337,7 +344,7 @@ mod tests {
                     )
                 })
                 .collect::<Vec<_>>();
-            let error = resolve(&symbols, &[]).err().unwrap();
+            let error = resolve_inputs(&symbols, &[]).err().unwrap();
             assert!(error.to_string().contains("undefined symbol: missing"));
         }
     }
@@ -353,7 +360,7 @@ mod tests {
                 Elf64SymbolSectionIdx::Index(1),
             )
         });
-        let error = resolve(&symbols, &[]).err().unwrap();
+        let error = resolve_inputs(&symbols, &[]).err().unwrap();
         assert!(
             error
                 .to_string()
@@ -382,7 +389,7 @@ mod tests {
                 assignment
             })
             .collect::<Vec<_>>();
-        let table = resolve(&symbols, &assignments).unwrap();
+        let table = resolve_inputs(&symbols, &assignments).unwrap();
         assert!(table.should_assign(assignments[0]));
         assert_eq!(table.should_assign(assignments[1]), false);
         let id = table
@@ -412,7 +419,7 @@ mod tests {
             Elf64SymbolType::STT_TLS,
             Elf64SymbolSectionIdx::Index(1),
         )];
-        let table = resolve(&symbols, &[]).unwrap();
+        let table = resolve_inputs(&symbols, &[]).unwrap();
         assert_eq!(
             table.named("tls").unwrap().ty,
             Some(Elf64SymbolType::STT_TLS)

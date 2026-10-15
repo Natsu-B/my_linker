@@ -1,12 +1,93 @@
-use std::path::Path;
+use std::{collections::HashSet, path::Path};
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use elf::{Elf64ProgramHeaderFlags, Elf64SectionFlags, PF_R, PF_W, PF_X, RawReg};
 
 use crate::{
-    input::{FileId, object::InputSection},
+    input::{
+        FileId,
+        object::{InputSection, ObjectRelocation, ObjectSymbol},
+    },
     script::{ast::*, pattern},
+    symbols::ExtractedObjects,
+    synthetic,
 };
+
+/// Mapping preserves script order and retains only relocations in kept inputs.
+pub(crate) struct SectionMapping<'a, 's> {
+    pub(crate) inputs: Vec<MappingInput<'a>>,
+    pub(crate) items: Vec<MappedItem<'s>>,
+    pub(crate) symbols: Vec<ObjectSymbol<'a>>,
+    pub(crate) relocations: Vec<ObjectRelocation>,
+}
+
+impl SectionMapping<'_, '_> {
+    pub(crate) fn assignments(&self) -> Vec<&Assignment> {
+        let mut assignments = Vec::new();
+        for item in &self.items {
+            match item {
+                MappedItem::Assignment(assignment) => assignments.push(*assignment),
+                MappedItem::Output(output) => {
+                    for statement in &output.statements {
+                        if let MappedStatement::Assignment(assignment) = statement {
+                            assignments.push(*assignment);
+                        }
+                    }
+                }
+            }
+        }
+        assignments
+    }
+}
+
+pub(crate) fn map_sections<'a, 's>(
+    script: &'s Script,
+    objects: ExtractedObjects<'a>,
+) -> Result<SectionMapping<'a, 's>> {
+    ensure!(!objects.files.is_empty(), "no object files to link");
+    let mut inputs = Vec::new();
+    let mut symbols = Vec::new();
+    let mut relocations = Vec::new();
+    for object in objects.files {
+        let file_name = input_name(&object.file_name, object.file_id);
+        for section in object.sections {
+            ensure!(
+                section.align == 0 || section.align.is_power_of_two(),
+                "invalid alignment for section {} in {}",
+                section.name,
+                object.file_name
+            );
+            inputs.push(MappingInput {
+                file_name: file_name.to_string(),
+                section,
+            });
+        }
+        symbols.extend(object.symbols);
+        relocations.extend(object.relocations);
+    }
+    // Script patterns must see linker-generated inputs, even though their
+    // final sizes depend on the definitions chosen during symbol resolution.
+    synthetic::reserve_inputs(&mut inputs, &symbols, &relocations);
+    let items = map_inputs(script, &inputs)?;
+    let mut kept = HashSet::new();
+    for item in &items {
+        if let MappedItem::Output(output) = item {
+            for statement in &output.statements {
+                if let MappedStatement::Input(index) = statement {
+                    let section = &inputs[*index].section;
+                    kept.insert((section.file_id, u32::from(section.idx)));
+                }
+            }
+        }
+    }
+    relocations.retain(|relocation| kept.contains(&(relocation.file_id, relocation.target_idx)));
+    Ok(SectionMapping {
+        inputs,
+        items,
+        symbols,
+        relocations,
+    })
+}
 
 pub(crate) struct MappingInput<'a> {
     pub(crate) file_name: String,
@@ -91,7 +172,7 @@ pub(crate) fn input_name(file_name: &str, file_id: FileId) -> &str {
         .unwrap_or(name)
 }
 
-pub(crate) fn map_sections<'s>(
+pub(crate) fn map_inputs<'s>(
     script: &'s Script,
     inputs: &[MappingInput],
 ) -> Result<Vec<MappedItem<'s>>> {
@@ -462,7 +543,7 @@ mod tests {
         )
         .unwrap();
         // An exclusion only affects the subsequent patterns in its list.
-        let items = map_sections(&script, &inputs).unwrap();
+        let items = map_inputs(&script, &inputs).unwrap();
         let MappedItem::Output(first) = &items[0] else {
             panic!()
         };
@@ -472,7 +553,7 @@ mod tests {
             "SECTIONS { .first : { *(EXCLUDE_FILE(last.o) .text) } .rest : { last.o(.text) } }",
         )
         .unwrap();
-        let items = map_sections(&script, &inputs).unwrap();
+        let items = map_inputs(&script, &inputs).unwrap();
         let MappedItem::Output(first) = &items[0] else {
             panic!()
         };
@@ -492,7 +573,7 @@ mod tests {
             input("last.o", ".text.extra", 6, 1),
         ];
         let script = parser::parse("SECTIONS { .text : { *(.text .text.*) } }").unwrap();
-        let items = map_sections(&script, &inputs).unwrap();
+        let items = map_inputs(&script, &inputs).unwrap();
         let MappedItem::Output(output) = &items[0] else {
             panic!()
         };
@@ -516,7 +597,7 @@ mod tests {
                 "SECTIONS {{ .init_array : {{ KEEP(*({sort}(.init_array.*))) *(.init_array) }} }}"
             ))
             .unwrap();
-            let items = map_sections(&script, &inputs).unwrap();
+            let items = map_inputs(&script, &inputs).unwrap();
             let MappedItem::Output(output) = &items[0] else {
                 panic!()
             };
@@ -532,7 +613,7 @@ mod tests {
             "SECTIONS { .ro : ONLY_IF_RO { *(.data) } .rw : ONLY_IF_RW { *(.data) } }",
         )
         .unwrap();
-        let items = map_sections(&script, &inputs).unwrap();
+        let items = map_inputs(&script, &inputs).unwrap();
         assert_eq!(names(&items), vec![".rw"]);
     }
 }

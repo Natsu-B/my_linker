@@ -11,15 +11,27 @@ use elf::{
 };
 
 use crate::{
-    input::{FileId, object::InputSection},
-    script::mapping::{MappedItem, MappingInput},
+    input::{
+        FileId,
+        object::{InputSection, ObjectRelocation},
+    },
     symbols::SymbolTable,
+    synthetic::{Got, Iplt, SyntheticSections},
 };
 use place::SectionPlacer;
 use segments::load_segment_count;
 use tls::TlsSegment;
 
 pub(crate) const PAGE_SIZE: u64 = 0x1000;
+
+pub(crate) struct LinkedImage<'a> {
+    pub(crate) layout: Layout<'a>,
+    pub(crate) symbols: SymbolTable,
+    pub(crate) relocations: Vec<ObjectRelocation>,
+    pub(crate) got: Got,
+    pub(crate) iplt: Iplt,
+    pub(crate) entry: u64,
+}
 
 pub(crate) struct OutputSection<'a> {
     pub(crate) name: String,
@@ -75,17 +87,20 @@ fn index_sections(sections: &[OutputSection]) -> SectionIndex {
 }
 
 pub(crate) fn assign_addresses<'a>(
-    items: &[MappedItem],
-    inputs: &[MappingInput<'a>],
-    symbols: &SymbolTable,
-) -> Result<Layout<'a>> {
-    // PT_LOAD groups, PT_GNU_STACK and optional PT_TLS. Reevaluate
-    // SIZEOF_HEADERS when the count differs from the initial estimate.
+    synthetic: SyntheticSections<'a, '_>,
+    symbols: SymbolTable,
+    entry_name: &str,
+) -> Result<LinkedImage<'a>> {
+    let SyntheticSections { mapping, got, iplt } = synthetic;
+    // SIZEOF_HEADERS includes the program-header table, whose length depends
+    // on PT_LOAD groups and optional PT_TLS. Script expressions using that size
+    // can move sections and change the groups again, so repeat placement until
+    // the program-header count agrees with the size used to evaluate the script.
     let mut phnum = 2;
     for _ in 0..8 {
         let sizeof_headers = ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE * phnum;
-        let mut layout = SectionPlacer::new(symbols, sizeof_headers);
-        let sections = layout.place(items, inputs)?;
+        let mut layout = SectionPlacer::new(&symbols, sizeof_headers);
+        let sections = layout.place(&mapping.items, &mapping.inputs)?;
         let tls = TlsSegment::from_sections(&sections)?;
         let actual_phnum = load_segment_count(&sections) + 1 + u64::from(tls.is_some());
         if actual_phnum == phnum {
@@ -101,12 +116,23 @@ pub(crate) fn assign_addresses<'a>(
             };
             let section_index = index_sections(&sections);
             symbols.assign_addresses(&sections, &section_index, &script_symbols.values)?;
-            return Ok(Layout {
-                sections,
-                section_index,
-                headers,
-                script_symbols,
-                tls,
+            let entry = symbols
+                .named(entry_name)
+                .and_then(|symbol| symbol.address.get().copied())
+                .context("Failed to find entry point")?;
+            return Ok(LinkedImage {
+                layout: Layout {
+                    sections,
+                    section_index,
+                    headers,
+                    script_symbols,
+                    tls,
+                },
+                symbols,
+                entry,
+                relocations: mapping.relocations,
+                got,
+                iplt,
             });
         }
         phnum = actual_phnum;

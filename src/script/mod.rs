@@ -5,6 +5,8 @@ pub(crate) mod mapping;
 pub(crate) mod parser;
 pub(crate) mod pattern;
 
+pub(crate) use mapping::map_sections;
+
 use anyhow::{Context, Result};
 
 use ast::{Script, Statement};

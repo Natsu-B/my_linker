@@ -13,8 +13,7 @@ use elf::{
 use memmap2::MmapMut;
 
 use crate::{
-    layout::{HeaderInfo, OutputSection, segments::load_segments, tls::TlsSegment},
-    link::LinkedImage,
+    layout::{HeaderInfo, LinkedImage, OutputSection, segments::load_segments, tls::TlsSegment},
     symbols::{Definition, ResolvedSymbol},
     synthetic::SyntheticSection,
 };
@@ -303,7 +302,7 @@ fn executable_writer(
     Ok(writer)
 }
 
-pub(crate) fn write(linked: LinkedImage, output_file: String, entry: u64) -> Result<()> {
+pub(crate) fn write(linked: LinkedImage, output_file: String) -> Result<()> {
     pr_debug!("Write output file: {}", output_file);
     let indices = SectionHeaderIndices::new(&linked.layout.sections)?;
     let tables = symbol_table_sections(&linked, &indices)?;
@@ -311,7 +310,7 @@ pub(crate) fn write(linked: LinkedImage, output_file: String, entry: u64) -> Res
         linked.layout.sections,
         &linked.layout.headers,
         linked.layout.tls,
-        entry,
+        linked.entry,
     )?;
     writer.sections.extend(tables);
     let file_size = writer.file_size()?;

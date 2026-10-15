@@ -16,6 +16,7 @@ pub fn assert_linux_host() {
     );
 }
 
+#[allow(dead_code)]
 pub fn write_asm_source(dir: &TempDir, file_name: &str, source: &str) -> PathBuf {
     let path = dir.path().join(file_name);
     fs::write(&path, source).unwrap_or_else(|err| {
@@ -24,6 +25,7 @@ pub fn write_asm_source(dir: &TempDir, file_name: &str, source: &str) -> PathBuf
     path
 }
 
+#[allow(dead_code)]
 pub fn assemble_object(dir: &TempDir, stem: &str, source: &str) -> PathBuf {
     assert_linux_host();
 
@@ -137,6 +139,7 @@ fn require_file(path: PathBuf) -> PathBuf {
     path
 }
 
+#[allow(dead_code)]
 pub fn create_archive(dir: &TempDir, stem: &str, members: &[&Path]) -> PathBuf {
     assert_linux_host();
 

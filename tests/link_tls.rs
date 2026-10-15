@@ -293,5 +293,7 @@ value:
         .arg(input)
         .assert()
         .failure()
-        .stderr(contains("TPOFF32 calculation failed"));
+        .stderr(contains("relocation TpOff32"))
+        .stderr(contains("symbol 'value' at 0x401000"))
+        .stderr(contains("overflows Signed Bits32 field"));
 }
