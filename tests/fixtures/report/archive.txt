@@ -1,0 +1,4 @@
+[archive]
+MEMBER <- FILE (SYMBOL)
+lib.a(helper.o) <- root.o (helper)
+lib.a(second.o) <- lib.a(helper.o) (second)

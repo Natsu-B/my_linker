@@ -1,0 +1,7 @@
+[got]
+INPUT+OFFSET KIND SYMBOL CONTENTS
+.got+0x0 address datum address(datum)
+.got+0x8 tpoff tlsvar tpoff(tlsvar)
+.got+0x10 ifunc indirect 0 (filled at startup)
+.iplt+0x0 stub indirect jmp *.got+0x10
+.rela.iplt+0x0 R_X86_64_IRELATIVE indirect offset=.got+0x10 addend=address(indirect)

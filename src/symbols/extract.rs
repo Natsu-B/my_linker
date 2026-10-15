@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 
@@ -10,7 +10,7 @@ use crate::input::{
 fn update_symbol_sets(
     object: &ObjectFile<'_>,
     defined: &mut HashSet<String>,
-    unresolved: &mut HashSet<String>,
+    unresolved: &mut HashMap<String, Option<FileId>>,
 ) {
     for symbol in &object.symbols {
         if symbol.name.is_empty() {
@@ -30,7 +30,9 @@ fn update_symbol_sets(
                     == Some(elf::Elf64SymbolBinding::STB_GLOBAL)
                     && !defined.contains(symbol.name)
                 {
-                    unresolved.insert(symbol.name.to_string());
+                    unresolved
+                        .entry(symbol.name.to_string())
+                        .or_insert(Some(object.file_id));
                 }
             }
             _ => {
@@ -46,8 +48,18 @@ fn update_symbol_sets(
     }
 }
 
+/// Why a member entered the link, in armap extraction order.
+#[derive(Clone)]
+pub(crate) struct ArchiveExtraction {
+    pub(crate) member: String,
+    pub(crate) symbol: String,
+    // ENTRY can request a member without a referencing object.
+    pub(crate) referencer: Option<FileId>,
+}
+
 pub(crate) struct ExtractedObjects<'a> {
     pub(crate) files: Vec<ObjectFile<'a>>,
+    pub(crate) extractions: Vec<ArchiveExtraction>,
 }
 
 pub(crate) fn extract_archive_members<'a>(
@@ -55,9 +67,10 @@ pub(crate) fn extract_archive_members<'a>(
     entry_name: &str,
 ) -> Result<ExtractedObjects<'a>> {
     let mut files = Vec::new();
+    let mut extractions = Vec::new();
     let mut defined = HashSet::new();
     // ENTRY is an archive extraction root, like GNU ld's -u option.
-    let mut unresolved = HashSet::from([entry_name.to_string()]);
+    let mut unresolved = HashMap::from([(entry_name.to_string(), None)]);
     for input in inputs.files {
         match input {
             InputFile::Object(object) => {
@@ -72,7 +85,8 @@ pub(crate) fn extract_archive_members<'a>(
                     let mut loaded = false;
                     for entry in &archive.entries {
                         let member_index = entry.member_index;
-                        if archive.extracted[member_index] || !unresolved.contains(entry.symbol) {
+                        if archive.extracted[member_index] || !unresolved.contains_key(entry.symbol)
+                        {
                             continue;
                         }
                         let member = &archive.members[member_index];
@@ -85,7 +99,11 @@ pub(crate) fn extract_archive_members<'a>(
                             .with_context(|| {
                                 format!("failed to parse archive member {display_name}")
                             })?;
-                        pr_info!("archive: {display_name} ({})", entry.symbol);
+                        extractions.push(ArchiveExtraction {
+                            member: display_name,
+                            symbol: entry.symbol.to_string(),
+                            referencer: unresolved[entry.symbol],
+                        });
                         archive.extracted[member_index] = true;
                         update_symbol_sets(&object, &mut defined, &mut unresolved);
                         files.push(object);
@@ -98,7 +116,7 @@ pub(crate) fn extract_archive_members<'a>(
             }
         }
     }
-    Ok(ExtractedObjects { files })
+    Ok(ExtractedObjects { files, extractions })
 }
 
 #[cfg(test)]
@@ -291,11 +309,14 @@ mod tests {
         )
         .unwrap();
         let mut defined = HashSet::new();
-        let mut unresolved = HashSet::new();
+        let mut unresolved = HashMap::new();
         update_symbol_sets(&weak, &mut defined, &mut unresolved);
-        assert_eq!(unresolved, HashSet::new());
+        assert_eq!(unresolved, HashMap::new());
         update_symbol_sets(&strong, &mut defined, &mut unresolved);
         update_symbol_sets(&weak, &mut defined, &mut unresolved);
-        assert_eq!(unresolved, HashSet::from(["optional".to_string()]));
+        assert_eq!(
+            unresolved,
+            HashMap::from([("optional".to_string(), Some(strong.file_id))])
+        );
     }
 }

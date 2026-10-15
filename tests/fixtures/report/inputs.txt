@@ -1,0 +1,5 @@
+[inputs]
+KIND     MEMBERS FILE
+object         0 root.o
+object         0 winner.o
+archive        3 lib.a

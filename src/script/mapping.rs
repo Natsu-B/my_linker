@@ -100,7 +100,7 @@ pub(crate) struct MappedOutputSection<'s> {
     pub(crate) statements: Vec<MappedStatement<'s>>,
     flags: u64,
     pub(crate) align: u64,
-    orphan: bool,
+    pub(crate) orphan: bool,
 }
 
 pub(crate) enum MappedStatement<'s> {

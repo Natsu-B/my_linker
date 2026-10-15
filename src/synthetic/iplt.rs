@@ -14,6 +14,12 @@ use super::{Got, GotEntry, SyntheticSection};
 const STUB_SIZE: u64 = 16;
 const RELA_SIZE: u64 = 24;
 
+pub(crate) struct IpltEntry {
+    pub(crate) symbol: SymbolId,
+    pub(crate) stub_offset: u64,
+    pub(crate) relocation_offset: u64,
+}
+
 #[derive(Default)]
 pub(crate) struct Iplt {
     entries: Vec<SymbolId>,
@@ -35,6 +41,17 @@ impl Iplt {
             .map(|(index, id)| (*id, index as u64 * STUB_SIZE))
             .collect();
         Self { entries, offsets }
+    }
+
+    pub(crate) fn entries(&self) -> impl Iterator<Item = IpltEntry> + '_ {
+        self.entries
+            .iter()
+            .enumerate()
+            .map(|(index, id)| IpltEntry {
+                symbol: *id,
+                stub_offset: index as u64 * STUB_SIZE,
+                relocation_offset: index as u64 * RELA_SIZE,
+            })
     }
 
     pub(crate) fn sections(&self) -> [InputSection<'static>; 2] {
@@ -68,18 +85,19 @@ impl Iplt {
         }
         let iplt_va = SyntheticSection::Iplt.address(sections, index)?;
         let got_va = SyntheticSection::Got.address(sections, index)?;
-        for (entry, id) in self.entries.iter().enumerate() {
-            let offset = entry as u64 * STUB_SIZE;
-            let slot = got_va + got.offset(GotEntry::Ifunc(*id))?;
-            let resolver = *symbols.get(*id).address.get().with_context(|| {
+        for entry in self.entries() {
+            let id = entry.symbol;
+            let offset = entry.stub_offset;
+            let slot = got_va + got.offset(GotEntry::Ifunc(id))?;
+            let resolver = *symbols.get(id).address.get().with_context(|| {
                 format!(
                     "IFUNC resolver has no output address: {}",
-                    symbols.get(*id).name
+                    symbols.get(id).name
                 )
             })?;
             pr_debug!(
                 "IFUNC {}: resolver {resolver:#x}, stub {:#x}, GOT slot {slot:#x}",
-                symbols.get(*id).name,
+                symbols.get(id).name,
                 iplt_va + offset
             );
             SyntheticSection::Iplt.write(
@@ -91,7 +109,7 @@ impl Iplt {
             SyntheticSection::RelaIplt.write(
                 sections,
                 index,
-                entry as u64 * RELA_SIZE,
+                entry.relocation_offset,
                 &Self::irelative(slot, resolver),
             )?;
         }

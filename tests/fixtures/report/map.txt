@@ -1,0 +1,51 @@
+Archive member included to satisfy reference by file (symbol)
+
+lib.a(helper.o)               root.o (helper)
+lib.a(second.o)               lib.a(helper.o) (second)
+
+Linker script and memory map
+
+.rela.iplt 0x0000000000400158 0x18
+ .rela.iplt 0x0000000000400158 0x18 <linker>
+.mystery 0x0000000000400170 0x1
+ .mystery 0x0000000000400170 0x1 root.o
+.text 0x0000000000401000 0x53
+ .text 0x0000000000401000 0x4a root.o
+ .text 0x000000000040104a 0x2 winner.o
+ .text 0x000000000040104c 0x6 lib.a(helper.o)
+ .text 0x0000000000401052 0x1 lib.a(second.o)
+.iplt 0x0000000000401060 0x10
+ .iplt 0x0000000000401060 0x10 <linker>
+.tdata 0x0000000000402000 0x8
+ .tdata 0x0000000000402000 0x8 root.o
+.tbss 0x0000000000402010 0x8
+ .tbss 0x0000000000402010 0x8 root.o
+.data 0x0000000000402018 0x28
+ .data 0x0000000000402018 0x28 root.o
+ .data 0x0000000000402040 0x0 winner.o
+ .data 0x0000000000402040 0x0 lib.a(helper.o)
+ .data 0x0000000000402040 0x0 lib.a(second.o)
+.got 0x0000000000402040 0x18
+ .got 0x0000000000402040 0x18 <linker>
+.bss 0x0000000000402058 0x0
+ .bss 0x0000000000402058 0x0 root.o
+ .bss 0x0000000000402058 0x0 winner.o
+ .bss 0x0000000000402058 0x0 lib.a(helper.o)
+ .bss 0x0000000000402058 0x0 lib.a(second.o)
+
+Symbol addresses
+
+ 0x0000000000000000 absent
+ 0x0000000000001234 provided
+ 0x0000000000004321 hidden
+ 0x0000000000400158 marker
+ 0x0000000000401000 _start
+ 0x0000000000401049 optional
+ 0x000000000040104a chosen
+ 0x000000000040104b indirect
+ 0x000000000040104c helper
+ 0x0000000000401052 second
+ 0x0000000000402000 tlsvar
+ 0x0000000000402010 tlszero
+ 0x0000000000402018 datum
+ 0x0000000000402040 _GLOBAL_OFFSET_TABLE_

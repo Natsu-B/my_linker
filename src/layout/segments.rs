@@ -15,29 +15,37 @@ pub(crate) fn load_segment_count(sections: &[OutputSection]) -> u64 {
     count
 }
 
-// Output-section data remains separate until relocations have been applied.
+/// The PT_LOAD fields that can be known before assembling file bytes.
+pub(crate) struct LoadSegmentLayout {
+    pub(crate) flags: Elf64ProgramHeaderFlags,
+    pub(crate) address: u64,
+    pub(crate) file_size: u64,
+    pub(crate) mem_size: u64,
+    pub(crate) align: u64,
+}
+
 // Consecutive output sections with the same permissions share one PT_LOAD.
-pub(crate) fn load_segments(
-    sections: Vec<OutputSection>,
+// Reporting and output use the same description, including internal zero fill.
+pub(crate) fn load_segment_layouts(
+    sections: &[OutputSection],
     headers: &HeaderInfo,
     tls: Option<TlsSegment>,
-) -> Result<Vec<LoadSegment>> {
-    let mut segments = vec![LoadSegment {
+) -> Result<Vec<LoadSegmentLayout>> {
+    let mut segments = vec![LoadSegmentLayout {
         flags: Elf64ProgramHeaderFlags::from_bits(PF_R),
-        vaddr: headers.address,
-        paddr: headers.address,
+        address: headers.address,
         align: PAGE_SIZE,
-        data: vec![0; usize::try_from(headers.size).context("headers too large")?],
+        file_size: headers.size,
         mem_size: headers.size,
     }];
-    for section in sections.into_iter().filter(|section| section.size != 0) {
+    for section in sections.iter().filter(|section| section.size != 0) {
         let address = *section
             .address
             .get()
             .context("output section has no address")?;
         let previous = segments.last().unwrap();
         let previous_end = previous
-            .vaddr
+            .address
             .checked_add(previous.mem_size)
             .context("segment address exceeds u64")?;
         ensure!(address >= previous_end, "output sections overlap");
@@ -46,60 +54,81 @@ pub(crate) fn load_segments(
                 address / PAGE_SIZE >= previous_end.div_ceil(PAGE_SIZE),
                 "load segments with different permissions share a virtual page"
             );
-            segments.push(LoadSegment {
+            segments.push(LoadSegmentLayout {
                 flags: section.flags,
-                vaddr: address,
-                paddr: address,
+                address,
                 align: PAGE_SIZE.max(section.align),
-                data: Vec::new(),
+                file_size: 0,
                 mem_size: 0,
             });
         }
         let segment = segments.last_mut().unwrap();
-        // For the header load p_offset is fixed at zero; PAGE_SIZE is its
-        // alignment even if an input section happens to be more aligned.
-        if segment.vaddr != headers.address {
+        // The header load has p_offset zero and PAGE_SIZE alignment.
+        if segment.address != headers.address {
             segment.align = segment.align.max(section.align);
         }
-        let offset = address - segment.vaddr;
-        if let Some(data) = section.data {
+        segment.mem_size = (address - segment.address)
+            .checked_add(section.size)
+            .context("segment size exceeds u64")?;
+        if let Some(data) = &section.data {
             ensure!(
                 data.len() as u64 <= section.size,
                 "output section file size exceeds memory size"
             );
-            if !data.is_empty() {
-                segment
-                    .data
-                    .resize(usize::try_from(offset).context("segment too large")?, 0);
-                segment.data.extend(data);
-            }
-            segment.data.resize(
-                usize::try_from(offset + section.size).context("segment too large")?,
-                0,
-            );
+            segment.file_size = segment.mem_size;
         }
-        segment.mem_size = offset
-            .checked_add(section.size)
-            .context("segment size exceeds u64")?;
     }
     if let Some(tls) = tls.filter(|tls| tls.file_size != 0) {
         let segment = segments
             .iter_mut()
             .find(|segment| {
-                tls.vaddr.checked_sub(segment.vaddr).is_some_and(|offset| {
-                    offset
-                        .checked_add(tls.mem_size)
-                        .is_some_and(|end| end <= segment.mem_size)
-                })
+                tls.vaddr
+                    .checked_sub(segment.address)
+                    .is_some_and(|offset| {
+                        offset
+                            .checked_add(tls.mem_size)
+                            .is_some_and(|end| end <= segment.mem_size)
+                    })
             })
             .context("TLS template must be contained in one PT_LOAD segment")?;
-        let end = tls.vaddr - segment.vaddr + tls.file_size;
         // A script may reserve trailing padding in .tdata with assignments.
-        let file_size = segment
-            .data
-            .len()
-            .max(usize::try_from(end).context("TLS template too large")?);
-        segment.data.resize(file_size, 0);
+        segment.file_size = segment
+            .file_size
+            .max(tls.vaddr - segment.address + tls.file_size);
+    }
+    Ok(segments)
+}
+
+// Output-section data remains separate until relocations have been applied.
+pub(crate) fn load_segments(
+    sections: Vec<OutputSection>,
+    headers: &HeaderInfo,
+    tls: Option<TlsSegment>,
+) -> Result<Vec<LoadSegment>> {
+    let mut segments = load_segment_layouts(&sections, headers, tls)?
+        .into_iter()
+        .map(|segment| {
+            Ok(LoadSegment {
+                flags: segment.flags,
+                vaddr: segment.address,
+                paddr: segment.address,
+                align: segment.align,
+                data: vec![0; usize::try_from(segment.file_size).context("segment too large")?],
+                mem_size: segment.mem_size,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut index = 0;
+    for section in sections.into_iter().filter(|section| section.size != 0) {
+        if section.flags != segments[index].flags {
+            index += 1;
+        }
+        if let Some(data) = section.data {
+            let segment = &mut segments[index];
+            let offset = usize::try_from(section.address.get().unwrap() - segment.vaddr)
+                .context("section offset exceeds usize")?;
+            segment.data[offset..offset + data.len()].copy_from_slice(&data);
+        }
     }
     Ok(segments)
 }

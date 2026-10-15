@@ -1,0 +1,29 @@
+[mapping]
+OUTPUT <- FILE(SECTION)
+.rela.iplt
+  <linker>(.rela.iplt)
+.mystery [orphan]
+  root.o(.mystery)
+.text
+  root.o(.text)
+  winner.o(.text)
+  lib.a(helper.o)(.text)
+  lib.a(second.o)(.text)
+.iplt
+  <linker>(.iplt)
+.tdata
+  root.o(.tdata)
+.tbss
+  root.o(.tbss)
+.data
+  root.o(.data)
+  winner.o(.data)
+  lib.a(helper.o)(.data)
+  lib.a(second.o)(.data)
+.got
+  <linker>(.got)
+.bss
+  root.o(.bss)
+  winner.o(.bss)
+  lib.a(helper.o)(.bss)
+  lib.a(second.o)(.bss)

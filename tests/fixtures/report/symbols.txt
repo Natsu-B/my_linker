@@ -1,0 +1,15 @@
+[symbols]
+SYMBOL BINDING TYPE DEFINITION
+_GLOBAL_OFFSET_TABLE_ STB_GLOBAL STT_NOTYPE <script>
+_start STB_GLOBAL STT_FUNC root.o
+absent STB_WEAK STT_NOTYPE undefined weak -> 0
+chosen STB_GLOBAL STT_FUNC winner.o
+datum STB_GLOBAL STT_OBJECT root.o
+helper STB_GLOBAL STT_NOTYPE lib.a(helper.o)
+hidden STB_LOCAL STT_NOTYPE <script> PROVIDE_HIDDEN
+indirect STB_GLOBAL STT_GNU_IFUNC winner.o
+marker STB_GLOBAL STT_NOTYPE <script>
+optional STB_WEAK STT_FUNC root.o
+provided STB_GLOBAL STT_NOTYPE <script> PROVIDE
+second STB_GLOBAL STT_NOTYPE lib.a(second.o)
+tlsvar STB_GLOBAL STT_TLS root.o

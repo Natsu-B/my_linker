@@ -4,13 +4,32 @@ use anyhow::{Context, Result};
 use elf::x86_64::X86_64RelocationType;
 
 use crate::{
+    input::FileId,
     layout::{Layout, LinkedImage},
-    symbols::SymbolTable,
+    symbols::{SymbolId, SymbolTable},
     synthetic::{Got, GotEntry, SyntheticSection},
 };
 use x86_64::{Operands, RelocationSite};
 
-pub(crate) fn apply(image: &mut LinkedImage) -> Result<()> {
+/// A computed relocation, retained only when its trace is requested.
+pub(crate) struct AppliedRelocation {
+    pub(crate) file_id: FileId,
+    pub(crate) symbol: Option<SymbolId>,
+    pub(crate) ty: X86_64RelocationType,
+    pub(crate) place: u64,
+    pub(crate) address: u64,
+    pub(crate) addend: i64,
+    pub(crate) value: i128,
+    pub(crate) got_slot: Option<u64>,
+    pub(crate) tls_offset: Option<i64>,
+    pub(crate) iplt_address: Option<u64>,
+}
+
+pub(crate) fn apply(
+    image: &mut LinkedImage,
+    trace_symbols: Option<&[String]>,
+) -> Result<Vec<AppliedRelocation>> {
+    let mut applied = Vec::new();
     pr_debug!("Relocating sections...");
     initialize_got(&mut image.layout, &image.got, &image.symbols)?;
     let LinkedImage {
@@ -36,6 +55,35 @@ pub(crate) fn apply(image: &mut LinkedImage) -> Result<()> {
             .context("relocation input section has no output location")?;
         let ty = X86_64RelocationType::try_from(relocation.info)?;
         if ty == X86_64RelocationType::None {
+            // NONE ignores its operands. A trace can name a valid symbol,
+            // but must not require the ignored symbol index to be valid.
+            if let Some(names) = trace_symbols {
+                let symbol_id = symbols.input(relocation.file_id, relocation.info.sym).ok();
+                let symbol = symbol_id.map(|id| symbols.get(id));
+                if names.is_empty() || symbol.is_some_and(|symbol| names.contains(&symbol.name)) {
+                    let place = sections[location.output_idx]
+                        .address
+                        .get()
+                        .unwrap()
+                        .checked_add(location.offset)
+                        .and_then(|place| place.checked_add(relocation.offset))
+                        .context("relocation place exceeds u64")?;
+                    applied.push(AppliedRelocation {
+                        file_id: relocation.file_id,
+                        symbol: symbol_id,
+                        ty,
+                        place,
+                        address: symbol
+                            .and_then(|symbol| symbol.address.get().copied())
+                            .unwrap_or(0),
+                        addend: relocation.addend,
+                        value: 0,
+                        got_slot: None,
+                        tls_offset: None,
+                        iplt_address: None,
+                    });
+                }
+            }
             continue;
         }
         let symbol_id = symbols.input(relocation.file_id, relocation.info.sym)?;
@@ -126,9 +174,24 @@ pub(crate) fn apply(image: &mut LinkedImage) -> Result<()> {
             .data
             .as_mut()
             .context("relocation output section has no data")?;
+        let computed = value.value;
         x86_64::write_value(data, offset, value, &site)?;
+        if trace_symbols.is_some_and(|names| names.is_empty() || names.contains(&symbol.name)) {
+            applied.push(AppliedRelocation {
+                file_id: relocation.file_id,
+                symbol: Some(symbol_id),
+                ty,
+                place,
+                address,
+                addend: relocation.addend,
+                value: computed,
+                got_slot,
+                tls_offset,
+                iplt_address,
+            });
+        }
     }
-    Ok(())
+    Ok(applied)
 }
 
 fn initialize_got(layout: &mut Layout, got: &Got, symbols: &SymbolTable) -> Result<()> {
