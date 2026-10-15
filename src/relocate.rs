@@ -1,7 +1,6 @@
 use crate::{
     link::{ElfData, SectionPlacement},
     parse::{ObjectRelocation, ObjectSymbol},
-    script,
 };
 
 use anyhow::{Context, Ok, Result, bail};
@@ -13,6 +12,7 @@ pub fn relocate(
     symbols: Vec<ObjectSymbol>,
     relocations: Vec<ObjectRelocation>,
     elf_data: &ElfData,
+    entry_name: &str,
 ) -> Result<u64 /* start address */> {
     pr_debug!("Relocating sections...");
 
@@ -83,9 +83,6 @@ pub fn relocate(
         let addend = relocation.addend;
         // P
         let place_addr = section_va + target_offset + relocation.offset;
-        // B
-        // let base_addr = script::LINKER_DATA.read().unwrap().vart_addr;
-
         let reloc_type = X86_64RelocationType::try_from(relocation.info)?;
         pr_debug!("Relocation type: {:?}", reloc_type);
         match reloc_type {
@@ -165,15 +162,10 @@ pub fn relocate(
         }
     }
 
-    let start_name = script::LINKER_DATA.read().unwrap();
-    let start_name = start_name
-        ._start_name
-        .get()
-        .context("Failed to get _start symbol name from script data")?;
     let entry = symbols
         .iter()
         .find_map(|x| {
-            if x.name == *start_name {
+            if x.name == entry_name {
                 Some(x.va.get().unwrap())
             } else {
                 None

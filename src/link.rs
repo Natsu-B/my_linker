@@ -1,9 +1,6 @@
 use std::cell::OnceCell;
 
-use crate::{
-    parse::{ObjectFile, ObjectRelocation, ObjectSection, ObjectSymbol},
-    script,
-};
+use crate::parse::{ObjectFile, ObjectRelocation, ObjectSection, ObjectSymbol};
 use anyhow::{Context, Result, ensure};
 use elf::{Elf64ProgramHeaderFlags, Elf64SectionFlags, Elf64SectionType, ElfEndian};
 use num::integer::lcm;
@@ -29,6 +26,7 @@ pub struct ElfData {
 
 pub fn link(
     object_files: Vec<ObjectFile>,
+    header_vaddr: u64,
 ) -> Result<(
     Vec<SectionPlacement>,
     Vec<ObjectSymbol>,
@@ -227,8 +225,6 @@ pub fn link(
     sections.sort_unstable_by_key(|x| x.out_idx);
 
     pr_debug!("Section virtual addresses:");
-    let va_guard = script::LINKER_DATA.read().unwrap();
-    let header_vaddr = va_guard.vart_addr;
     // One page holds the ELF header and all six possible program headers:
     // the header PT_LOAD, four section PT_LOADs, and PT_GNU_STACK.
     let mut current_va = header_vaddr
@@ -304,7 +300,8 @@ mod tests {
             size: 2,
         };
 
-        let (sections, _, _, elf_data) = link(vec![object_file(vec![text, rodata])]).unwrap();
+        let (sections, _, _, elf_data) =
+            link(vec![object_file(vec![text, rodata])], 0x400000).unwrap();
         let text = sections
             .iter()
             .find(|section| section.name == ".text")

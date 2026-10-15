@@ -30,6 +30,10 @@ struct Args {
     #[clap(short, long, required = true)]
     output: String,
 
+    /// Linker script (replaces the built-in static x86-64 script)
+    #[clap(short = 'T', long, value_name = "FILE")]
+    script: Option<String>,
+
     /// Input file
     #[clap(value_name = "InputFile", required = true)]
     input: Vec<String>,
@@ -52,7 +56,8 @@ fn main() -> anyhow::Result<()> {
 
     pr_debug!("Arguments: {:?}", args);
 
-    script::parse_script()?;
+    let script = script::parse_script(args.script.as_deref())?;
+    let base_address = script.initial_address()?;
 
     let mmaps_result = args
         .input
@@ -94,12 +99,18 @@ fn main() -> anyhow::Result<()> {
         })
         .collect::<Vec<Result<_>>>();
 
-    let parsed = input_symbol::resolve_symbols(parse_result)?;
+    let parsed = input_symbol::resolve_symbols(parse_result, script.entry_name())?;
 
     pr_debug!("Start linking files...");
-    let mut linked = link::link(parsed)?;
+    let mut linked = link::link(parsed, base_address)?;
     resolve::resolve(&linked.0, &mut linked.1)?;
-    let entry = relocate::relocate(&mut linked.0, linked.1, linked.2, &linked.3)?;
+    let entry = relocate::relocate(
+        &mut linked.0,
+        linked.1,
+        linked.2,
+        &linked.3,
+        script.entry_name(),
+    )?;
     write::output(linked.0, linked.3, args.output, entry)?;
 
     Ok(())

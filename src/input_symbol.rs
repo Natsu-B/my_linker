@@ -49,11 +49,15 @@ fn update_symbol_sets(
     }
 }
 
-pub fn resolve_symbols(parse_result: Vec<Result<FileType<'_>>>) -> Result<Vec<ObjectFile<'_>>> {
+pub fn resolve_symbols<'a>(
+    parse_result: Vec<Result<FileType<'a>>>,
+    entry_name: &str,
+) -> Result<Vec<ObjectFile<'a>>> {
     let mut has_err = 0;
     let mut parsed = Vec::new();
     let mut defined = HashSet::new();
-    let mut unresolved = HashSet::new();
+    // ENTRY is an archive extraction root, like GNU ld's -u option.
+    let mut unresolved = HashSet::from([entry_name.to_string()]);
 
     for parse_result in parse_result {
         match parse_result {
