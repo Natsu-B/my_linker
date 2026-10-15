@@ -4,7 +4,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use elf::{Elf64SymbolBinding, Elf64SymbolInfo, Elf64SymbolSectionIdx, Elf64SymbolType};
+use elf::{
+    Elf64SymbolBinding, Elf64SymbolInfo, Elf64SymbolSectionIdx, Elf64SymbolType,
+    x86_64::X86_64RelocationType,
+};
 
 use crate::{
     input_id::FileId,
@@ -35,6 +38,43 @@ pub struct ResolvedSymbol {
     pub ty: Option<Elf64SymbolType>,
     pub definition: Definition,
     pub va: OnceCell<u64>,
+}
+
+impl ResolvedSymbol {
+    pub fn validate_relocation(&self, ty: X86_64RelocationType) -> Result<()> {
+        use X86_64RelocationType::*;
+        ensure!(
+            !matches!(
+                ty,
+                TlsGd
+                    | TlsLd
+                    | DtpMod64
+                    | DtpOff32
+                    | DtpOff64
+                    | GotPc32TlsDesc
+                    | TlsDescCall
+                    | TlsDesc
+            ),
+            "unsupported TLS model: {ty:?} for symbol: {} (only local-exec and initial-exec are supported)",
+            self.name
+        );
+        let tls = matches!(ty, TpOff32 | TpOff64 | GotTpOff);
+        ensure!(
+            tls || self.ty != Some(Elf64SymbolType::STT_TLS),
+            "non-TLS relocation {ty:?} references TLS symbol: {}",
+            self.name
+        );
+        // Local TLS variables may be referenced through their TLS section symbol.
+        ensure!(
+            !tls || matches!(
+                self.ty,
+                Some(Elf64SymbolType::STT_TLS | Elf64SymbolType::STT_SECTION)
+            ),
+            "TLS relocation {ty:?} references non-TLS symbol: {}",
+            self.name
+        );
+        Ok(())
+    }
 }
 
 #[derive(Default)]

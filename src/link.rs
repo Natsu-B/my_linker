@@ -17,6 +17,7 @@ use crate::{
     parse::{ObjectFile, ObjectRelocation, ObjectSection},
     resolve::{self, Definition, ResolvedSymbol, SymbolTable},
     script::{ast::*, eval, pattern},
+    tls::TlsSegment,
 };
 
 pub(crate) const PAGE_SIZE: u64 = 0x1000;
@@ -36,6 +37,7 @@ pub struct ElfData {
     pub header_vaddr: u64,
     pub sizeof_headers: u64,
     pub script_symbols: HashMap<String, u64>,
+    pub tls: Option<TlsSegment>,
 }
 
 pub struct Linked<'a> {
@@ -97,6 +99,10 @@ enum MappedItem<'s> {
 }
 
 impl MappedOutput<'_> {
+    fn is_tls(&self) -> bool {
+        Elf64SectionFlags::from_bits(self.flags).get(Elf64SectionFlags::SHF_TLS) != 0
+    }
+
     fn permissions(&self) -> Elf64ProgramHeaderFlags {
         let flags = Elf64SectionFlags::from_bits(self.flags);
         Elf64ProgramHeaderFlags::from_bits(
@@ -194,14 +200,15 @@ pub fn link<'a>(object_files: Vec<ObjectFile<'a>>, script: &Script) -> Result<Li
     if let Some(index) = got_input {
         inputs[index].section = got.section();
     }
-    // PT_LOAD groups plus PT_GNU_STACK. Reevaluate SIZEOF_HEADERS when the
-    // actual number of groups differs from the initial estimate.
+    // PT_LOAD groups, PT_GNU_STACK and optional PT_TLS. Reevaluate
+    // SIZEOF_HEADERS when the count differs from the initial estimate.
     let mut phnum = 2;
     for _ in 0..8 {
         let sizeof_headers = ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE * phnum;
         let mut layout = Layout::new(&symbols, sizeof_headers);
         let sections = layout.place(&items, &inputs)?;
-        let actual_phnum = load_segment_count(&sections) + 1;
+        let tls = TlsSegment::from_sections(&sections)?;
+        let actual_phnum = load_segment_count(&sections) + 1 + u64::from(tls.is_some());
         if actual_phnum == phnum {
             let elf_data = ElfData {
                 endianness: endianness.context("no object files to link")?,
@@ -210,6 +217,7 @@ pub fn link<'a>(object_files: Vec<ObjectFile<'a>>, script: &Script) -> Result<Li
                     .context("script places no allocatable output sections")?,
                 sizeof_headers,
                 script_symbols: layout.script_symbols,
+                tls,
             };
             let section_index = index_sections(&sections);
             symbols.assign_addresses(&sections, &section_index, &elf_data.script_symbols)?;
@@ -544,6 +552,15 @@ impl<'s> Layout<'s> {
         let mut sections = Vec::new();
         let mut previous_flags = Elf64ProgramHeaderFlags::from_bits(PF_R);
         let mut previous_end = 0;
+        let tls_align = items
+            .iter()
+            .filter_map(|item| match item {
+                MappedItem::Output(output) if output.is_tls() => Some(output.align),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(1);
+        let mut tls_started = false;
         for (item_index, item) in items.iter().enumerate() {
             self.context.next_section_alignment = items[item_index + 1..]
                 .iter()
@@ -555,9 +572,14 @@ impl<'s> Layout<'s> {
             match item {
                 MappedItem::Assignment(assignment) => self.assign(assignment)?,
                 MappedItem::Output(output) => {
+                    let mut output_align = output.align;
+                    if !tls_started && output.is_tls() && output.has_contents(inputs) {
+                        output_align = output_align.max(tls_align);
+                        tls_started = true;
+                    }
                     let mut va = match output.address {
                         Some(address) => eval::evaluate(address, &self.context)?,
-                        None => align(self.context.dot, output.align)?,
+                        None => align(self.context.dot, output_align)?,
                     };
                     if output.statements.is_empty() {
                         continue;
@@ -592,7 +614,7 @@ impl<'s> Layout<'s> {
                                 output.name
                             );
                         } else {
-                            va = align(va.max(minimum), output.align)?;
+                            va = align(va.max(minimum), output_align)?;
                         }
                     }
                     self.context.dot = va;
@@ -600,7 +622,7 @@ impl<'s> Layout<'s> {
                         name: output.name.clone(),
                         flags,
                         size: 0,
-                        align: output.align,
+                        align: output_align,
                         va: OnceCell::from(va),
                         data: None,
                         sections_data: Vec::new(),
@@ -958,5 +980,36 @@ mod tests {
         assert_eq!(layout.script_symbols["finish"], 0x4000d0);
         assert_eq!(layout.script_symbols["after"], 0x4000d0);
         assert_eq!(sections[0].size, 16);
+    }
+
+    #[test]
+    fn tls_start_uses_maximum_alignment_and_tbss_reserves_address_space() {
+        let mut inputs = vec![
+            input("a.o", ".prefix", 3, 1),
+            input("a.o", ".tdata", 0x403, 8),
+            input("a.o", ".tbss", 0x403, 32),
+            input("a.o", ".data", 3, 8),
+        ];
+        inputs[2].section.ty = Elf64SectionType::SHT_NOBITS;
+        inputs[2].section.data = None;
+        let script = parser::parse(
+            "SECTIONS { . = 0x401000; .prefix : { *(.prefix) . = ALIGN(16); } .tdata : { *(.tdata) } .tbss : { *(.tbss) } .data : { *(.data) } }",
+        ).unwrap();
+        let items = map_sections(&script, &inputs).unwrap();
+        let symbols = SymbolTable::default();
+        let mut layout = Layout::new(&symbols, 288);
+        let sections = layout.place(&items, &inputs).unwrap();
+        assert_eq!(*sections[1].va.get().unwrap(), 0x401020);
+        assert_eq!(*sections[2].va.get().unwrap(), 0x401040);
+        assert_eq!(*sections[3].va.get().unwrap(), 0x401048);
+        assert_eq!(
+            TlsSegment::from_sections(&sections).unwrap(),
+            Some(TlsSegment {
+                vaddr: 0x401020,
+                file_size: 1,
+                mem_size: 33,
+                align: 32,
+            })
+        );
     }
 }

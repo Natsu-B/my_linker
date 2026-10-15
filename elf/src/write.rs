@@ -188,6 +188,27 @@ impl ExecElf64Writer {
         Ok(self.layout()?.file_size)
     }
 
+    /// Translate an address in a PT_LOAD to its corresponding file offset.
+    /// Add all program headers first, since they affect segment file offsets.
+    /// An address in a zero-fill tail may correspond to an offset past EOF.
+    pub fn file_offset(&self, vaddr: u64) -> Result<u64> {
+        let layout = self.layout()?;
+        let segment = layout
+            .header_segment
+            .iter()
+            .chain(&layout.segments)
+            .find(|segment| {
+                vaddr
+                    .checked_sub(segment.vaddr)
+                    .is_some_and(|offset| offset < segment.mem_size)
+            })
+            .context("virtual address is outside the PT_LOAD segments")?;
+        segment
+            .offset
+            .checked_add(vaddr - segment.vaddr)
+            .context("file offset exceeds u64")
+    }
+
     pub fn write_into(&self, out: &mut [u8]) -> Result<()> {
         self.validate_writer()?;
         let layout = self.layout()?;

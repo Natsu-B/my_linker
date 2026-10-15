@@ -21,6 +21,7 @@ mod resolve;
 pub mod script;
 #[cfg(test)]
 mod test_utils;
+mod tls;
 mod write;
 
 #[derive(Parser, Debug)]

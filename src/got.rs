@@ -12,11 +12,11 @@ use crate::{
 pub const SECTION_IDX: u16 = 0;
 const ENTRY_SIZE: u64 = 8;
 
-// TLS offsets (M5) need a separate entry kind from absolute addresses. IPLT
-// stubs (M6) can reserve their slots here before section layout as well.
+// IPLT stubs (M6) can reserve their slots here before section layout as well.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GotEntry {
     Address(SymbolId),
+    TpOff(SymbolId),
 }
 
 #[derive(Default)]
@@ -31,16 +31,27 @@ impl Got {
             X86_64RelocationType::try_from(ty),
             Ok(X86_64RelocationType::GotPcRel
                 | X86_64RelocationType::GotPcRelX
-                | X86_64RelocationType::RexGotPcRelX)
+                | X86_64RelocationType::RexGotPcRelX
+                | X86_64RelocationType::GotTpOff)
         )
     }
 
     pub fn collect(relocations: &[ObjectRelocation], symbols: &SymbolTable) -> Result<Self> {
         let mut got = Self::default();
         for relocation in relocations {
+            let ty = X86_64RelocationType::try_from(relocation.info)?;
+            if ty == X86_64RelocationType::None {
+                continue;
+            }
+            let symbol = symbols.input(relocation.file_id, relocation.info.sym)?;
+            symbols.get(symbol).validate_relocation(ty)?;
             if Self::needs_entry(relocation.info.ty) {
-                let symbol = symbols.input(relocation.file_id, relocation.info.sym)?;
-                got.allocate(GotEntry::Address(symbol));
+                let entry = if ty == X86_64RelocationType::GotTpOff {
+                    GotEntry::TpOff(symbol)
+                } else {
+                    GotEntry::Address(symbol)
+                };
+                got.allocate(entry);
                 pr_debug!(
                     "GOT entry for {} ({:?})",
                     symbols.get(symbol).name,
@@ -66,9 +77,9 @@ impl Got {
             .map(|(index, entry)| (*entry, index as u64 * ENTRY_SIZE))
     }
 
-    pub fn offset(&self, symbol: SymbolId) -> Result<u64> {
+    pub fn offset(&self, entry: GotEntry) -> Result<u64> {
         self.offsets
-            .get(&GotEntry::Address(symbol))
+            .get(&entry)
             .copied()
             .context("missing GOT entry for resolved symbol")
     }
@@ -145,8 +156,10 @@ mod tests {
         assert_eq!(flags.get(Elf64SectionFlags::SHF_WRITE), 1);
         for file in 0..3 {
             assert_eq!(
-                got.offset(symbols.input(FileId::Object(file), 1).unwrap())
-                    .unwrap(),
+                got.offset(GotEntry::Address(
+                    symbols.input(FileId::Object(file), 1).unwrap()
+                ))
+                .unwrap(),
                 0
             );
         }
@@ -180,14 +193,34 @@ mod tests {
         assert_eq!(got.entries().count(), 2);
         assert_eq!(got.section().size, 16);
         assert_eq!(
-            got.offset(symbols.input(FileId::Object(0), 1).unwrap())
-                .unwrap(),
+            got.offset(GotEntry::Address(
+                symbols.input(FileId::Object(0), 1).unwrap()
+            ))
+            .unwrap(),
             0
         );
         assert_eq!(
-            got.offset(symbols.input(FileId::Object(1), 1).unwrap())
-                .unwrap(),
+            got.offset(GotEntry::Address(
+                symbols.input(FileId::Object(1), 1).unwrap()
+            ))
+            .unwrap(),
             8
         );
+    }
+
+    #[test]
+    fn tls_offsets_are_deduplicated_separately_from_addresses() {
+        let bytes = build_rel_object(&[symbol(Elf64SymbolBinding::STB_GLOBAL, 2)], &[]);
+        let object = parse::parse(&bytes, "a.o".to_string(), FileId::Object(0)).unwrap();
+        let symbols = resolve::resolve_names(&object.symbols, &[]).unwrap();
+        let id = symbols.input(FileId::Object(0), 1).unwrap();
+        let mut got = Got::default();
+        for _ in 0..2 {
+            got.allocate(GotEntry::Address(id));
+            got.allocate(GotEntry::TpOff(id));
+        }
+        assert_eq!(got.offset(GotEntry::Address(id)).unwrap(), 0);
+        assert_eq!(got.offset(GotEntry::TpOff(id)).unwrap(), 8);
+        assert_eq!(got.section().size, 16);
     }
 }

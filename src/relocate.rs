@@ -24,16 +24,32 @@ pub fn relocate(linked: &mut Linked, entry_name: &str) -> Result<u64 /* start ad
         .map(|location| sections[location.output_idx].va.get().unwrap() + location.offset);
     for (entry, offset) in got.entries() {
         let location = got_location.context("synthetic GOT input section was discarded")?;
-        let value = match entry {
-            GotEntry::Address(id) => *symbols.get(id).va.get().with_context(|| {
-                format!("GOT target has no output address: {}", symbols.get(id).name)
-            })?,
-        };
+        let (GotEntry::Address(id) | GotEntry::TpOff(id)) = entry;
+        let address = *symbols.get(id).va.get().with_context(|| {
+            format!("GOT target has no output address: {}", symbols.get(id).name)
+        })?;
         let data = sections[location.output_idx]
             .data
             .as_mut()
             .context("GOT output section has no data")?;
-        write_data(data, location.offset + offset, value, endianness)?;
+        match entry {
+            GotEntry::Address(_) => {
+                write_data(data, location.offset + offset, address, endianness)?;
+            }
+            GotEntry::TpOff(_) => {
+                let tpoff = elf_data
+                    .tls
+                    .context("TLS GOT entry has no TLS segment")?
+                    .tpoff(address)
+                    .with_context(|| {
+                        format!(
+                            "invalid TLS GOT target: {} at {address:#x}",
+                            symbols.get(id).name
+                        )
+                    })?;
+                write_data(data, location.offset + offset, tpoff, endianness)?;
+            }
+        }
     }
 
     for relocation in relocations {
@@ -98,14 +114,19 @@ pub fn relocate(linked: &mut Linked, entry_name: &str) -> Result<u64 /* start ad
             }
             X86_64RelocationType::GotPcRel
             | X86_64RelocationType::GotPcRelX
-            | X86_64RelocationType::RexGotPcRelX => {
+            | X86_64RelocationType::RexGotPcRelX
+            | X86_64RelocationType::GotTpOff => {
                 // G + GOT + A - P. Keep the original instruction unchanged.
-                let slot_addr =
-                    got_va.context("GOT has no output address")? + got.offset(symbol_id)?;
+                let entry = if reloc_type == X86_64RelocationType::GotTpOff {
+                    GotEntry::TpOff(symbol_id)
+                } else {
+                    GotEntry::Address(symbol_id)
+                };
+                let slot_addr = got_va.context("GOT has no output address")? + got.offset(entry)?;
                 let value = (slot_addr as i128) + (addend as i128) - (place_addr as i128);
                 let addr: i32 = value.try_into().with_context(|| {
                     format!(
-                        "Relocation GOTPCREL calculation failed: slot_addr={slot_addr:#x}, addend={addend:#x}, place_addr={place_addr:#x}"
+                        "Relocation {reloc_type:?} calculation failed: slot_addr={slot_addr:#x}, addend={addend:#x}, place_addr={place_addr:#x}"
                     )
                 })?;
                 write_data(
@@ -114,6 +135,35 @@ pub fn relocate(linked: &mut Linked, entry_name: &str) -> Result<u64 /* start ad
                     addr,
                     endianness,
                 )?;
+            }
+            X86_64RelocationType::TpOff32 | X86_64RelocationType::TpOff64 => {
+                let tpoff = elf_data
+                    .tls
+                    .context("TLS relocation has no TLS segment")?
+                    .tpoff(symbol_addr)
+                    .with_context(|| {
+                        format!(
+                            "invalid TLS relocation target: {} at {symbol_addr:#x}",
+                            target_symbol.name
+                        )
+                    })?;
+                let value = i128::from(tpoff) + i128::from(addend);
+                let offset = target_offset + relocation.offset;
+                if reloc_type == X86_64RelocationType::TpOff32 {
+                    let value = i32::try_from(value).with_context(|| {
+                        format!(
+                            "Relocation TPOFF32 calculation failed: tpoff={tpoff}, addend={addend}"
+                        )
+                    })?;
+                    write_data(target_data, offset, value, endianness)?;
+                } else {
+                    let value = i64::try_from(value).with_context(|| {
+                        format!(
+                            "Relocation TPOFF64 calculation failed: tpoff={tpoff}, addend={addend}"
+                        )
+                    })?;
+                    write_data(target_data, offset, value, endianness)?;
+                }
             }
             X86_64RelocationType::Rel32 => {
                 // S + A
