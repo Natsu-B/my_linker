@@ -41,6 +41,102 @@ pub fn assemble_object(dir: &TempDir, stem: &str, source: &str) -> PathBuf {
     object_path
 }
 
+#[allow(dead_code)]
+pub fn compile_c_object(dir: &TempDir, stem: &str, source: &str) -> PathBuf {
+    assert_linux_host();
+
+    let c_path = dir.path().join(format!("{stem}.c"));
+    fs::write(&c_path, source).unwrap_or_else(|err| {
+        panic!("failed to write C source {}: {err}", c_path.display());
+    });
+    let object_path = dir.path().join(format!("{stem}.o"));
+
+    let mut command = StdCommand::new("gcc");
+    command
+        .arg("-c")
+        .arg("-O2")
+        .arg("-fno-pie")
+        .arg("-static")
+        .arg("-fno-stack-protector")
+        .arg("-isystem")
+        .arg(require_env_dir("GLIBC_INCLUDE_DIR"))
+        .arg("-o")
+        .arg(&object_path)
+        .arg(&c_path);
+    run_tool(command, &format!("compile {}", object_path.display()));
+
+    object_path
+}
+
+#[allow(dead_code)]
+pub struct GlibcStaticToolchain {
+    pub crt1: PathBuf,
+    pub crti: PathBuf,
+    pub crtn: PathBuf,
+    pub crtbegin_t: PathBuf,
+    pub crtend: PathBuf,
+    pub libc: PathBuf,
+    pub libgcc: PathBuf,
+    pub libgcc_eh: PathBuf,
+}
+
+#[allow(dead_code)]
+impl GlibcStaticToolchain {
+    /// Inputs in the same order `gcc -static` passes them to the linker.
+    /// libc.a appears twice to resolve its circular dependency on libgcc.
+    pub fn link_inputs<'a>(&'a self, objects: &[&'a Path]) -> Vec<&'a Path> {
+        let mut inputs = vec![
+            self.crt1.as_path(),
+            self.crti.as_path(),
+            self.crtbegin_t.as_path(),
+        ];
+        inputs.extend_from_slice(objects);
+        inputs.extend([
+            self.libc.as_path(),
+            self.libgcc.as_path(),
+            self.libgcc_eh.as_path(),
+            self.libc.as_path(),
+            self.crtend.as_path(),
+            self.crtn.as_path(),
+        ]);
+        inputs
+    }
+}
+
+#[allow(dead_code)]
+pub fn glibc_static_toolchain() -> GlibcStaticToolchain {
+    let lib_dir = require_env_dir("GLIBC_STATIC_LIB_DIR");
+    let crt_dir = require_env_dir("GLIBC_CRT_DIR");
+    let libgcc_dir = require_env_dir("LIBGCC_DIR");
+
+    GlibcStaticToolchain {
+        crt1: require_file(crt_dir.join("crt1.o")),
+        crti: require_file(crt_dir.join("crti.o")),
+        crtn: require_file(crt_dir.join("crtn.o")),
+        crtbegin_t: require_file(libgcc_dir.join("crtbeginT.o")),
+        crtend: require_file(libgcc_dir.join("crtend.o")),
+        libc: require_file(lib_dir.join("libc.a")),
+        libgcc: require_file(libgcc_dir.join("libgcc.a")),
+        libgcc_eh: require_file(libgcc_dir.join("libgcc_eh.a")),
+    }
+}
+
+fn require_env_dir(name: &str) -> PathBuf {
+    let value = std::env::var_os(name).unwrap_or_else(|| {
+        panic!("{name} is not set; run the tests inside `nix develop`");
+    });
+    PathBuf::from(value)
+}
+
+fn require_file(path: PathBuf) -> PathBuf {
+    assert!(
+        path.is_file(),
+        "{} does not exist; run the tests inside `nix develop`",
+        path.display(),
+    );
+    path
+}
+
 pub fn create_archive(dir: &TempDir, stem: &str, members: &[&Path]) -> PathBuf {
     assert_linux_host();
 
