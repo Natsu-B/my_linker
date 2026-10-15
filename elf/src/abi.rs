@@ -169,13 +169,6 @@ bitregs! {
     }
 }
 
-impl Elf64SectionFlags {
-    /// Raw `sh_flags` bits for crates that do not depend on `typestate::RawReg`.
-    pub fn raw(self) -> u64 {
-        self.to_raw()
-    }
-}
-
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct Elf64SymbolTable {

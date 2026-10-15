@@ -1,20 +1,40 @@
 use crate::{
-    link::{ElfData, SectionPlacement},
-    parse::{ObjectRelocation, ObjectSymbol},
+    got::{self, GotEntry},
+    input_id::FileId,
+    link::Linked,
 };
 
-use anyhow::{Context, Ok, Result, bail};
+use anyhow::{Context, Result, bail};
 use elf::{ElfEndian, x86_64::X86_64RelocationType};
 use num::traits::ToBytes;
 
-pub fn relocate(
-    section_placements: &mut Vec<SectionPlacement>,
-    symbols: Vec<ObjectSymbol>,
-    relocations: Vec<ObjectRelocation>,
-    elf_data: &ElfData,
-    entry_name: &str,
-) -> Result<u64 /* start address */> {
+pub fn relocate(linked: &mut Linked, entry_name: &str) -> Result<u64 /* start address */> {
     pr_debug!("Relocating sections...");
+    let Linked {
+        sections,
+        symbols,
+        relocations,
+        section_index,
+        got,
+        elf_data,
+    } = linked;
+    let endianness = elf_data.endianness;
+    let got_location = section_index.get(&(FileId::Synthetic, got::SECTION_IDX));
+    let got_va = got_location
+        .map(|location| sections[location.output_idx].va.get().unwrap() + location.offset);
+    for (entry, offset) in got.entries() {
+        let location = got_location.context("synthetic GOT input section was discarded")?;
+        let value = match entry {
+            GotEntry::Address(id) => *symbols.get(id).va.get().with_context(|| {
+                format!("GOT target has no output address: {}", symbols.get(id).name)
+            })?,
+        };
+        let data = sections[location.output_idx]
+            .data
+            .as_mut()
+            .context("GOT output section has no data")?;
+        write_data(data, location.offset + offset, value, endianness)?;
+    }
 
     for relocation in relocations {
         pr_debug!(
@@ -24,66 +44,40 @@ pub fn relocate(
             relocation.offset,
             relocation.reloc_section_idx
         );
-        // find the symbol and target
-        let target_idx: u16 = relocation
-            .target_idx
-            .try_into()
-            .context("Failed to convert target index")?;
-        let target_symbol_idx: u16 = relocation
-            .info
-            .sym
-            .try_into()
-            .context("Failed to convert symbol index")?;
-        let mut section_va = None;
-        let mut target_offset = None;
-        let mut target_symbol = None;
-        let mut target_data = None;
-        for section_placement in section_placements.iter_mut() {
-            for (object_section, offset) in section_placement.sections_data.iter_mut() {
-                if object_section.file_id == relocation.file_id && object_section.idx == target_idx
-                {
-                    pr_debug!(
-                        "  Found target section: {} in file id: {} at offset: {:#x}",
-                        object_section.name,
-                        object_section.file_id,
-                        offset
-                    );
-                    section_va = Some(*section_placement.va.get().unwrap());
-                    target_offset = Some(*offset);
-                    target_data = section_placement.data.as_mut();
-                    break;
-                }
-            }
-        }
-        for symbol in &symbols {
-            if symbol.file_id == relocation.file_id && target_symbol_idx == symbol.idx {
-                pr_debug!(
-                    "  Found target symbol: {} in file id: {} at offset: {:#x}",
-                    symbol.name,
-                    symbol.file_id,
-                    symbol.value
-                );
-                target_symbol = Some(symbol);
-                break;
-            }
-        }
-
-        let Some(section_va) = section_va else {
+        let target_idx =
+            u16::try_from(relocation.target_idx).context("Failed to convert target index")?;
+        let Some(location) = section_index.get(&(relocation.file_id, target_idx)) else {
             continue;
         };
-        let target_symbol = target_symbol.context("Failed to find target symbol for relocation")?;
-        let target_offset = target_offset.context("Failed to find target offset for relocation")?;
-        let target_data = target_data.context("Failed to find target data for relocation")?;
-        let endianness = elf_data.endianness;
-
-        // S
-        let symbol_addr = *target_symbol.va.get().unwrap();
+        let reloc_type = X86_64RelocationType::try_from(relocation.info)?;
+        if reloc_type == X86_64RelocationType::None {
+            continue;
+        }
+        let symbol_id = symbols.input(relocation.file_id, relocation.info.sym)?;
+        let target_symbol = symbols.get(symbol_id);
+        let section = &mut sections[location.output_idx];
+        let section_va = *section
+            .va
+            .get()
+            .context("relocation section has no address")?;
+        let target_offset = location.offset;
+        let target_data = section
+            .data
+            .as_mut()
+            .context("Failed to find target data for relocation")?;
+        // S comes from the winning definition, including references within
+        // an object whose weak definition was replaced by a strong one.
+        let symbol_addr = *target_symbol.va.get().with_context(|| {
+            format!(
+                "relocation target has no output address: {}",
+                target_symbol.name
+            )
+        })?;
 
         // A
         let addend = relocation.addend;
         // P
         let place_addr = section_va + target_offset + relocation.offset;
-        let reloc_type = X86_64RelocationType::try_from(relocation.info)?;
         pr_debug!("Relocation type: {:?}", reloc_type);
         match reloc_type {
             X86_64RelocationType::None => {}
@@ -95,6 +89,25 @@ pub fn relocate(
                     .with_context(|| format!("Relocation PC32 calculation failed: symbol_addr={:#x}, addend={:#x}, place_addr={:#x}", symbol_addr, addend, place_addr))?;
                 pr_debug!("Relocation PC32: {:#x}", addr);
 
+                write_data(
+                    target_data,
+                    target_offset + relocation.offset,
+                    addr,
+                    endianness,
+                )?;
+            }
+            X86_64RelocationType::GotPcRel
+            | X86_64RelocationType::GotPcRelX
+            | X86_64RelocationType::RexGotPcRelX => {
+                // G + GOT + A - P. Keep the original instruction unchanged.
+                let slot_addr =
+                    got_va.context("GOT has no output address")? + got.offset(symbol_id)?;
+                let value = (slot_addr as i128) + (addend as i128) - (place_addr as i128);
+                let addr: i32 = value.try_into().with_context(|| {
+                    format!(
+                        "Relocation GOTPCREL calculation failed: slot_addr={slot_addr:#x}, addend={addend:#x}, place_addr={place_addr:#x}"
+                    )
+                })?;
                 write_data(
                     target_data,
                     target_offset + relocation.offset,
@@ -163,15 +176,8 @@ pub fn relocate(
     }
 
     symbols
-        .iter()
-        .find_map(|symbol| {
-            if symbol.name == entry_name {
-                symbol.va.get().copied()
-            } else {
-                None
-            }
-        })
-        .or_else(|| elf_data.script_symbols.get(entry_name).copied())
+        .named(entry_name)
+        .and_then(|symbol| symbol.va.get().copied())
         .context("Failed to find entry point")
 }
 

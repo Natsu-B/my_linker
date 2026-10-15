@@ -3,6 +3,9 @@ pub mod read;
 pub mod write;
 pub mod x86_64;
 
+/// Lets callers read raw bits (`to_raw`) from the bit-register types below.
+pub use typestate::RawReg;
+
 pub use abi::{
     Elf64RelaInfo, Elf64SectionFlags, Elf64SectionType, Elf64SymbolBinding, Elf64SymbolInfo,
     Elf64SymbolSectionIdx, Elf64SymbolType, ElfEndian, ElfFileType, ElfMachineType,

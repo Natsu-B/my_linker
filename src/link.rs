@@ -6,14 +6,16 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use elf::{
-    Elf64ProgramHeaderFlags, Elf64SectionFlags, Elf64SymbolBinding, Elf64SymbolInfo,
-    Elf64SymbolSectionIdx, ElfEndian, PF_R, PF_W, PF_X,
+    Elf64ProgramHeaderFlags, Elf64SectionFlags, Elf64SymbolSectionIdx, ElfEndian, PF_R, PF_W, PF_X,
+    RawReg,
     write::{ELF_HEADER_SIZE, PROGRAM_HEADER_SIZE},
 };
 
 use crate::{
+    got::Got,
     input_id::FileId,
-    parse::{ObjectFile, ObjectRelocation, ObjectSection, ObjectSymbol},
+    parse::{ObjectFile, ObjectRelocation, ObjectSection},
+    resolve::{self, Definition, ResolvedSymbol, SymbolTable},
     script::{ast::*, eval, pattern},
 };
 
@@ -34,6 +36,40 @@ pub struct ElfData {
     pub header_vaddr: u64,
     pub sizeof_headers: u64,
     pub script_symbols: HashMap<String, u64>,
+}
+
+pub struct Linked<'a> {
+    pub sections: Vec<SectionPlacement<'a>>,
+    pub symbols: SymbolTable,
+    pub relocations: Vec<ObjectRelocation>,
+    pub section_index: SectionIndex,
+    pub got: Got,
+    pub elf_data: ElfData,
+}
+
+pub struct SectionLocation {
+    pub output_idx: usize,
+    pub offset: u64,
+}
+
+pub type SectionIndex = HashMap<(FileId, u16), SectionLocation>;
+
+fn index_sections(sections: &[SectionPlacement]) -> SectionIndex {
+    sections
+        .iter()
+        .enumerate()
+        .flat_map(|(output_idx, section)| {
+            section.sections_data.iter().map(move |(input, offset)| {
+                (
+                    (input.file_id, input.idx),
+                    SectionLocation {
+                        output_idx,
+                        offset: *offset,
+                    },
+                )
+            })
+        })
+        .collect()
 }
 
 struct Input<'a> {
@@ -85,21 +121,13 @@ impl MappedOutput<'_> {
 
     fn add_input(&mut self, index: usize, inputs: &[Input]) {
         let section = &inputs[index].section;
-        self.flags |= section.flags.raw();
+        self.flags |= section.flags.to_raw();
         self.align = self.align.max(section.align.max(1));
         self.statements.push(MappedStatement::Input(index));
     }
 }
 
-pub fn link<'a>(
-    object_files: Vec<ObjectFile<'a>>,
-    script: &Script,
-) -> Result<(
-    Vec<SectionPlacement<'a>>,
-    Vec<ObjectSymbol<'a>>,
-    Vec<ObjectRelocation>,
-    ElfData,
-)> {
+pub fn link<'a>(object_files: Vec<ObjectFile<'a>>, script: &Script) -> Result<Linked<'a>> {
     pr_debug!("Linking {} object files", object_files.len());
     let mut inputs = Vec::new();
     let mut symbols = Vec::new();
@@ -126,7 +154,46 @@ pub fn link<'a>(
         symbols.extend(object.symbols);
         relocations.extend(object.relocations);
     }
+    // Reserve the synthetic input's identity and attributes before mapping.
+    // Its byte count is filled in after names have been resolved, before layout.
+    let got_input = if relocations
+        .iter()
+        .any(|relocation| Got::needs_entry(relocation.info.ty))
+    {
+        let index = inputs.len();
+        inputs.push(Input {
+            file_name: "<linker>".to_string(),
+            section: Got::default().section(),
+        });
+        Some(index)
+    } else {
+        None
+    };
     let items = map_sections(script, &inputs)?;
+    let mut assignments = Vec::new();
+    let mut placed = HashSet::new();
+    for item in &items {
+        match item {
+            MappedItem::Assignment(assignment) => assignments.push(*assignment),
+            MappedItem::Output(output) => {
+                for statement in &output.statements {
+                    match statement {
+                        MappedStatement::Assignment(assignment) => assignments.push(*assignment),
+                        MappedStatement::Input(index) => {
+                            let section = &inputs[*index].section;
+                            placed.insert((section.file_id, u32::from(section.idx)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let symbols = resolve::resolve_names(&symbols, &assignments)?;
+    relocations.retain(|relocation| placed.contains(&(relocation.file_id, relocation.target_idx)));
+    let got = Got::collect(&relocations, &symbols)?;
+    if let Some(index) = got_input {
+        inputs[index].section = got.section();
+    }
     // PT_LOAD groups plus PT_GNU_STACK. Reevaluate SIZEOF_HEADERS when the
     // actual number of groups differs from the initial estimate.
     let mut phnum = 2;
@@ -144,7 +211,16 @@ pub fn link<'a>(
                 sizeof_headers,
                 script_symbols: layout.script_symbols,
             };
-            return Ok((sections, symbols, relocations, elf_data));
+            let section_index = index_sections(&sections);
+            symbols.assign_addresses(&sections, &section_index, &elf_data.script_symbols)?;
+            return Ok(Linked {
+                sections,
+                symbols,
+                relocations,
+                section_index,
+                got,
+                elf_data,
+            });
         }
         phnum = actual_phnum;
     }
@@ -250,7 +326,7 @@ fn map_sections<'s>(script: &'s Script, inputs: &[Input]) -> Result<Vec<MappedIt
         if assigned[index] || input.section.flags.get(Elf64SectionFlags::SHF_ALLOC) == 0 {
             continue;
         }
-        let flags = input.section.flags.raw();
+        let flags = input.section.flags.to_raw();
         // Combine orphan fragments with the same name and attributes.
         let existing = items.iter_mut().find_map(|item| match item {
             MappedItem::Output(output)
@@ -401,72 +477,55 @@ fn init_priority(name: &str) -> u32 {
     }
 }
 
-struct Layout<'a, 's> {
+struct Layout<'s> {
     context: eval::Context,
-    section_symbols: HashMap<(FileId, u16), Vec<&'s ObjectSymbol<'a>>>,
-    definitions: HashSet<&'a str>,
-    references: HashSet<&'a str>,
+    symbols: &'s SymbolTable,
+    section_symbols: HashMap<(FileId, u16), Vec<&'s ResolvedSymbol>>,
     script_symbols: HashMap<String, u64>,
     header_vaddr: Option<u64>,
 }
 
-impl<'a, 's> Layout<'a, 's> {
-    fn new(symbols: &'s [ObjectSymbol<'a>], sizeof_headers: u64) -> Self {
+impl<'s> Layout<'s> {
+    fn new(symbols: &'s SymbolTable, sizeof_headers: u64) -> Self {
         let mut section_symbols: HashMap<_, Vec<_>> = HashMap::new();
-        let mut definitions = HashSet::new();
-        let mut references = HashSet::new();
         let mut context = eval::Context {
             sizeof_headers,
             ..Default::default()
         };
-        for symbol in symbols {
-            if symbol.name.is_empty()
-                || symbol.info.get_enum(Elf64SymbolInfo::st_bind)
-                    == Some(Elf64SymbolBinding::STB_LOCAL)
+        for symbol in symbols.named_symbols() {
+            if let Definition::Input {
+                file_id,
+                section_idx,
+                value,
+            } = symbol.definition
             {
-                continue;
-            }
-            if let Elf64SymbolSectionIdx::Index(idx) = symbol.section_idx {
-                section_symbols
-                    .entry((symbol.file_id, idx))
-                    .or_default()
-                    .push(symbol);
-            }
-            if symbol.section_idx == Elf64SymbolSectionIdx::Undefined {
-                references.insert(symbol.name);
-            } else {
-                definitions.insert(symbol.name);
-                if symbol.section_idx == Elf64SymbolSectionIdx::AbsoluteSymbols {
-                    context
-                        .symbols
-                        .insert(symbol.name.to_string(), symbol.value);
+                match section_idx {
+                    Elf64SymbolSectionIdx::Index(idx) => {
+                        section_symbols
+                            .entry((file_id, idx))
+                            .or_default()
+                            .push(symbol);
+                    }
+                    Elf64SymbolSectionIdx::AbsoluteSymbols => {
+                        context.symbols.insert(symbol.name.clone(), value);
+                    }
+                    _ => {}
                 }
             }
         }
         Self {
             context,
+            symbols,
             section_symbols,
-            definitions,
-            references,
             script_symbols: HashMap::new(),
             header_vaddr: None,
         }
     }
 
     fn assign(&mut self, assignment: &Assignment) -> Result<()> {
-        if assignment.kind != AssignmentKind::Define
-            && (self.definitions.contains(assignment.name.as_str())
-                || !self.references.contains(assignment.name.as_str())
-                || self.script_symbols.contains_key(&assignment.name))
-        {
+        if !self.symbols.should_assign(assignment) {
             return Ok(());
         }
-        ensure!(
-            assignment.name == "." || !self.definitions.contains(assignment.name.as_str()),
-            "{}: multiple definition of symbol: {} in input and linker script",
-            assignment.location,
-            assignment.name
-        );
         let value = eval::evaluate(&assignment.value, &self.context)?;
         if assignment.name == "." {
             self.context.dot = value;
@@ -477,7 +536,7 @@ impl<'a, 's> Layout<'a, 's> {
         Ok(())
     }
 
-    fn place(
+    fn place<'a>(
         &mut self,
         items: &[MappedItem],
         inputs: &[Input<'a>],
@@ -561,7 +620,7 @@ impl<'a, 's> Layout<'a, 's> {
                                 let input = &inputs[*index].section;
                                 self.context.dot = align(self.context.dot, input.align.max(1))?;
                                 let offset = self.context.dot - va;
-                                if let Some(data) = input.data {
+                                if let Some(data) = input.data.as_deref() {
                                     ensure!(
                                         data.len() as u64 == input.size,
                                         "input section {} data length does not match size",
@@ -581,11 +640,14 @@ impl<'a, 's> Layout<'a, 's> {
                                     .into_iter()
                                     .flatten()
                                 {
+                                    let Definition::Input { value, .. } = symbol.definition else {
+                                        unreachable!()
+                                    };
                                     self.context.symbols.insert(
-                                        symbol.name.to_string(),
+                                        symbol.name.clone(),
                                         self.context
                                             .dot
-                                            .checked_add(symbol.value)
+                                            .checked_add(value)
                                             .context("symbol address exceeds u64")?,
                                     );
                                 }
@@ -671,7 +733,7 @@ mod tests {
                 ty: Elf64SectionType::SHT_PROGBITS,
                 flags: Elf64SectionFlags::from_bits(flags),
                 align,
-                data: Some(&[1]),
+                data: Some(std::borrow::Cow::Borrowed(&[1])),
                 size: 1,
             },
         }
@@ -831,7 +893,8 @@ mod tests {
             panic!()
         };
         assert_eq!(members(extra), vec![3, 4]);
-        let mut layout = Layout::new(&[], 64 + 56 * 5);
+        let symbols = SymbolTable::default();
+        let mut layout = Layout::new(&symbols, 64 + 56 * 5);
         let sections = layout.place(&items, &inputs).unwrap();
         let text = &sections[0];
         let extra = &sections[1];
@@ -856,7 +919,8 @@ mod tests {
         let script = parser::parse("SECTIONS { . = 0x401000; .debug_info 0 : { *(.debug_info) } .info 0 (INFO) : { *(.ignored) } /DISCARD/ : { *(.drop) } .text : { *(.text) } }").unwrap();
         let items = map_sections(&script, &inputs).unwrap();
         assert_eq!(names(&items), vec![".text"]);
-        let mut layout = Layout::new(&[], 232);
+        let symbols = SymbolTable::default();
+        let mut layout = Layout::new(&symbols, 232);
         let sections = layout.place(&items, &inputs).unwrap();
         assert_eq!(*sections[0].va.get().unwrap(), 0x401000);
     }
@@ -866,7 +930,8 @@ mod tests {
         let inputs = vec![input("a.o", ".text", 6, 1), input("a.o", ".data", 3, 1)];
         let script = parser::parse("SECTIONS { . = 0x400000 + SIZEOF_HEADERS; .text 0x401000 : { *(.text) } .data 0x401001 : { *(.data) } }").unwrap();
         let items = map_sections(&script, &inputs).unwrap();
-        let mut layout = Layout::new(&[], 232);
+        let symbols = SymbolTable::default();
+        let mut layout = Layout::new(&symbols, 232);
         let error = layout.place(&items, &inputs).err().unwrap();
         assert!(
             error
@@ -883,7 +948,8 @@ mod tests {
         ];
         let script = parser::parse("SECTIONS { . = 0x400000 + SIZEOF_HEADERS; before = .; alignment = ALIGNOF(NEXT_SECTION); .rodata : { start = .; next_alignment = ALIGNOF(NEXT_SECTION); *(.rodata) . = ALIGN(16); finish = .; } after = .; .data : { *(.data) } }").unwrap();
         let items = map_sections(&script, &inputs).unwrap();
-        let mut layout = Layout::new(&[], 176);
+        let symbols = SymbolTable::default();
+        let mut layout = Layout::new(&symbols, 176);
         let sections = layout.place(&items, &inputs).unwrap();
         assert_eq!(layout.script_symbols["before"], 0x4000b0);
         assert_eq!(layout.script_symbols["alignment"], 64);

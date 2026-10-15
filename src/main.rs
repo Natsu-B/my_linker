@@ -10,6 +10,7 @@ use crate::{input_id::FileId, input_symbol::FileType};
 pub mod debug;
 mod archive;
 mod archive_index;
+mod got;
 mod input_id;
 mod input_symbol;
 mod link;
@@ -100,15 +101,8 @@ fn main() -> anyhow::Result<()> {
 
     pr_debug!("Start linking files...");
     let mut linked = link::link(parsed, &script)?;
-    resolve::resolve(&linked.0, &linked.1, &linked.3.script_symbols)?;
-    let entry = relocate::relocate(
-        &mut linked.0,
-        linked.1,
-        linked.2,
-        &linked.3,
-        script.entry_name(),
-    )?;
-    write::output(linked.0, linked.3, args.output, entry)?;
+    let entry = relocate::relocate(&mut linked, script.entry_name())?;
+    write::output(linked.sections, linked.elf_data, args.output, entry)?;
 
     Ok(())
 }

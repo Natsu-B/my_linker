@@ -71,6 +71,10 @@ pub enum X86_64RelocationType {
     TlsDesc = 36,
     /// R_X86_64_IRELATIVE
     IRelative = 37,
+    /// R_X86_64_GOTPCRELX
+    GotPcRelX = 41,
+    /// R_X86_64_REX_GOTPCRELX
+    RexGotPcRelX = 42,
 }
 
 impl TryFrom<u32> for X86_64RelocationType {
@@ -111,6 +115,8 @@ impl TryFrom<u32> for X86_64RelocationType {
             35 => Ok(Self::TlsDescCall),
             36 => Ok(Self::TlsDesc),
             37 => Ok(Self::IRelative),
+            41 => Ok(Self::GotPcRelX),
+            42 => Ok(Self::RexGotPcRelX),
             _ => Err(anyhow!("unknown relocation type: {}", ty)),
         }
     }

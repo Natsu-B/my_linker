@@ -32,7 +32,10 @@ fn update_symbol_sets(
 
         match symbol.section_idx {
             elf::Elf64SymbolSectionIdx::Undefined => {
-                if !defined.contains(symbol.name) {
+                if symbol.info.get_enum(elf::Elf64SymbolInfo::st_bind)
+                    == Some(elf::Elf64SymbolBinding::STB_GLOBAL)
+                    && !defined.contains(symbol.name)
+                {
                     unresolved.insert(symbol.name.to_string());
                 }
             }
@@ -139,4 +142,39 @@ pub fn resolve_symbols<'a>(
 
     anyhow::ensure!(has_err == 0, "{} file(s) failed to parse", has_err);
     Ok(parsed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::{TestSymbol, build_rel_object};
+    use elf::{Elf64SymbolBinding, Elf64SymbolType};
+
+    #[test]
+    fn weak_references_do_not_add_or_remove_archive_extraction_roots() {
+        let object = |binding| {
+            build_rel_object(
+                &[TestSymbol {
+                    name: "optional",
+                    binding,
+                    ty: Elf64SymbolType::STT_NOTYPE,
+                    section_idx: 0,
+                    value: 0,
+                    size: 0,
+                }],
+                &[],
+            )
+        };
+        let weak = object(Elf64SymbolBinding::STB_WEAK);
+        let strong = object(Elf64SymbolBinding::STB_GLOBAL);
+        let weak = parse::parse(&weak, "weak.o".to_string(), FileId::Object(0)).unwrap();
+        let strong = parse::parse(&strong, "strong.o".to_string(), FileId::Object(1)).unwrap();
+        let mut defined = HashSet::new();
+        let mut unresolved = HashSet::new();
+        update_symbol_sets(&weak, &mut defined, &mut unresolved);
+        assert_eq!(unresolved, HashSet::new());
+        update_symbol_sets(&strong, &mut defined, &mut unresolved);
+        update_symbol_sets(&weak, &mut defined, &mut unresolved);
+        assert_eq!(unresolved, HashSet::from(["optional".to_string()]));
+    }
 }
