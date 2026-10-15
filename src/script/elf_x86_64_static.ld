@@ -24,7 +24,9 @@ SECTIONS
   .rodata : { *(.rodata .rodata.*) }
   .eh_frame : { KEEP(*(.eh_frame)) *(.eh_frame.*) }
   .gcc_except_table : { *(.gcc_except_table .gcc_except_table.*) }
-  .note.gnu.property : { *(.note.gnu.property) }
+  /* GNU property notes require per-property merging; concatenation would
+     misrepresent the executable's features. Discard them until merging exists. */
+  /DISCARD/ : { *(.note.gnu.property) }
   .note.ABI-tag : { *(.note.ABI-tag) }
   . = DATA_SEGMENT_ALIGN(CONSTANT(MAXPAGESIZE), CONSTANT(COMMONPAGESIZE));
   .tdata : { *(.tdata .tdata.*) }

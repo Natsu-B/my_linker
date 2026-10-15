@@ -5,7 +5,7 @@ use crate::abi::{
     Elf64Header, Elf64ProgramHeader as RawElf64ProgramHeader, Elf64RelaInfo, Elf64RelaTable,
     Elf64SectionFlags, Elf64SectionHeaderData, Elf64SectionType, Elf64SymbolInfo,
     Elf64SymbolSectionIdx, Elf64SymbolTable, ElfEndian, ElfFileType, ElfMachineType,
-    ElfProgramHeaderType,
+    ElfProgramHeaderType, SHN_ABS, SHN_COMMON, SHN_UNDEF,
 };
 
 pub struct Elf64<'a> {
@@ -342,6 +342,26 @@ impl<'elf, 'data> Elf64Section<'elf, 'data> {
         }
     }
 
+    pub fn address(&self) -> u64 {
+        self.header.sh_addr.read(self.elf.endian)
+    }
+
+    pub fn offset(&self) -> u64 {
+        self.header.sh_offset.read(self.elf.endian)
+    }
+
+    pub fn link(&self) -> u32 {
+        self.header.sh_link.read(self.elf.endian)
+    }
+
+    pub fn info(&self) -> u32 {
+        self.header.sh_info.read(self.elf.endian)
+    }
+
+    pub fn entry_size(&self) -> u64 {
+        self.header.sh_entsize.read(self.elf.endian)
+    }
+
     pub fn size(&self) -> u64 {
         self.header.sh_size.read(self.elf.endian)
     }
@@ -494,9 +514,9 @@ impl<'elf, 'data> Elf64Symbol<'elf, 'data> {
 
     pub fn section_idx(&self) -> Elf64SymbolSectionIdx {
         match self.header.st_shndx.read(self.section.elf.endian) {
-            0 => Elf64SymbolSectionIdx::Undefined,
-            0xFFF1 => Elf64SymbolSectionIdx::AbsoluteSymbols,
-            0xFFF2 => Elf64SymbolSectionIdx::Common,
+            SHN_UNDEF => Elf64SymbolSectionIdx::Undefined,
+            SHN_ABS => Elf64SymbolSectionIdx::AbsoluteSymbols,
+            SHN_COMMON => Elf64SymbolSectionIdx::Common,
             idx => Elf64SymbolSectionIdx::Index(idx),
         }
     }
@@ -507,6 +527,10 @@ impl<'elf, 'data> Elf64Symbol<'elf, 'data> {
 
     pub fn size(&self) -> u64 {
         self.header.st_size.read(self.section.elf.endian)
+    }
+
+    pub fn other(&self) -> u8 {
+        self.header.st_other
     }
 
     pub fn info(&self) -> Elf64SymbolInfo {

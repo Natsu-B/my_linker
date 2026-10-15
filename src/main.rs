@@ -105,7 +105,7 @@ fn main() -> anyhow::Result<()> {
     pr_debug!("Start linking files...");
     let mut linked = link::link(parsed, &script)?;
     let entry = relocate::relocate(&mut linked, script.entry_name())?;
-    write::output(linked.sections, linked.elf_data, args.output, entry)?;
+    write::output(linked, args.output, entry)?;
 
     Ok(())
 }

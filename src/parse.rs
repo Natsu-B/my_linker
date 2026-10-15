@@ -48,6 +48,12 @@ pub struct ObjectSection<'a> {
     /// ELF section flags such as alloc, write, or execute.
     pub flags: Elf64SectionFlags,
 
+    /// ELF section type, retained for the output section header.
+    pub section_type: Elf64SectionType,
+
+    /// Size of each fixed-size entry, or zero for unstructured contents.
+    pub entry_size: u64,
+
     /// Required alignment of the section in bytes.
     pub align: u64,
 
@@ -85,6 +91,12 @@ pub struct ObjectSymbol<'a> {
 
     /// ELF symbol metadata, including binding and type.
     pub info: Elf64SymbolInfo,
+
+    /// Size of the function or object in bytes, as declared by the input.
+    pub size: u64,
+
+    /// Raw st_other metadata, including the symbol visibility.
+    pub other: u8,
 
     /// Symbol value as stored in the object file.
     ///
@@ -167,6 +179,8 @@ pub fn parse<'a>(mmap: &'a [u8], file_name: String, file_id: FileId) -> Result<O
                     idx: section.idx(),
                     name: section.name()?,
                     flags: section.flags(),
+                    section_type: section.section_type(),
+                    entry_size: section.entry_size(),
                     align: section.align(),
                     data: section.data().map(Cow::Borrowed),
                     size: section.size(),
@@ -183,6 +197,8 @@ pub fn parse<'a>(mmap: &'a [u8], file_name: String, file_id: FileId) -> Result<O
                         section_idx: symbol.section_idx(),
                         name: symbol.name()?,
                         info: symbol.info(),
+                        size: symbol.size(),
+                        other: symbol.other(),
                         value: symbol.value(),
                     };
                     object_file.symbols.push(symbol);

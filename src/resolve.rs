@@ -37,6 +37,9 @@ pub struct ResolvedSymbol {
     pub name: String,
     pub ty: Option<Elf64SymbolType>,
     pub definition: Definition,
+    pub binding: Elf64SymbolBinding,
+    pub size: u64,
+    pub other: u8,
     pub va: OnceCell<u64>,
 }
 
@@ -103,6 +106,9 @@ impl SymbolTable {
         &mut self,
         name: &str,
         ty: Option<Elf64SymbolType>,
+        binding: Elf64SymbolBinding,
+        size: u64,
+        other: u8,
         definition: Definition,
     ) -> SymbolId {
         let id = SymbolId(self.symbols.len());
@@ -110,6 +116,9 @@ impl SymbolTable {
             name: name.to_string(),
             ty,
             definition,
+            binding,
+            size,
+            other,
             va: OnceCell::new(),
         });
         id
@@ -129,6 +138,10 @@ impl SymbolTable {
 
     pub fn named(&self, name: &str) -> Option<&ResolvedSymbol> {
         self.by_name.get(name).map(|id| self.get(*id))
+    }
+
+    pub fn all_symbols(&self) -> impl Iterator<Item = &ResolvedSymbol> {
+        self.symbols.iter()
     }
 
     pub fn named_symbols(&self) -> impl Iterator<Item = &ResolvedSymbol> {
@@ -196,15 +209,14 @@ pub fn resolve_names(symbols: &[ObjectSymbol], assignments: &[&Assignment]) -> R
     let mut definitions: HashMap<&str, &ObjectSymbol> = HashMap::new();
     let mut references = HashSet::new();
     for symbol in symbols {
+        let binding = symbol_binding(symbol)?;
         ensure!(
             symbol.section_idx != Elf64SymbolSectionIdx::Common,
             "unsupported common symbol: {} in file: {}",
             symbol.name,
             symbol.file_id
         );
-        if symbol.name.is_empty()
-            || symbol.info.get_enum(Elf64SymbolInfo::st_bind) == Some(Elf64SymbolBinding::STB_LOCAL)
-        {
+        if symbol.name.is_empty() || binding == Elf64SymbolBinding::STB_LOCAL {
             continue;
         }
         if symbol.section_idx == Elf64SymbolSectionIdx::Undefined {
@@ -236,7 +248,7 @@ pub fn resolve_names(symbols: &[ObjectSymbol], assignments: &[&Assignment]) -> R
             .get(symbol.name)
             .is_some_and(|winner| std::ptr::eq(*winner, symbol))
         {
-            let id = insert_input(&mut table, symbol);
+            let id = insert_input(&mut table, symbol)?;
             table.by_name.insert(symbol.name.to_string(), id);
         }
     }
@@ -256,6 +268,9 @@ pub fn resolve_names(symbols: &[ObjectSymbol], assignments: &[&Assignment]) -> R
             let id = table.insert(
                 &assignment.name,
                 Some(Elf64SymbolType::STT_NOTYPE),
+                Elf64SymbolBinding::STB_GLOBAL,
+                0,
+                0,
                 Definition::Script { provide: None },
             );
             table.by_name.insert(assignment.name.clone(), id);
@@ -266,9 +281,19 @@ pub fn resolve_names(symbols: &[ObjectSymbol], assignments: &[&Assignment]) -> R
             && references.contains(assignment.name.as_str())
             && !table.by_name.contains_key(&assignment.name)
         {
+            // Static output has no dynamic lookup for hidden script symbols.
+            // Like GNU ld, publish them as local symbols in .symtab.
+            let binding = if assignment.kind == AssignmentKind::ProvideHidden {
+                Elf64SymbolBinding::STB_LOCAL
+            } else {
+                Elf64SymbolBinding::STB_GLOBAL
+            };
             let id = table.insert(
                 &assignment.name,
                 Some(Elf64SymbolType::STT_NOTYPE),
+                binding,
+                0,
+                0,
                 Definition::Script {
                     provide: Some(assignment.location),
                 },
@@ -301,6 +326,9 @@ pub fn resolve_names(symbols: &[ObjectSymbol], assignments: &[&Assignment]) -> R
                 let id = table.insert(
                     symbol.name,
                     symbol.info.get_enum(Elf64SymbolInfo::st_type),
+                    Elf64SymbolBinding::STB_WEAK,
+                    symbol.size,
+                    symbol.other,
                     Definition::UndefinedWeak,
                 );
                 table.by_name.insert(symbol.name.to_string(), id);
@@ -314,25 +342,51 @@ pub fn resolve_names(symbols: &[ObjectSymbol], assignments: &[&Assignment]) -> R
             }
         } else if symbol.section_idx == Elf64SymbolSectionIdx::Undefined {
             // The null symbol (index zero) denotes the absolute value zero.
-            table.insert("", None, Definition::UndefinedWeak)
+            table.insert(
+                "",
+                None,
+                Elf64SymbolBinding::STB_LOCAL,
+                0,
+                0,
+                Definition::UndefinedWeak,
+            )
         } else {
-            insert_input(&mut table, symbol)
+            insert_input(&mut table, symbol)?
         };
         table.by_input.insert((symbol.file_id, symbol.idx), id);
     }
     Ok(table)
 }
 
-fn insert_input(table: &mut SymbolTable, symbol: &ObjectSymbol) -> SymbolId {
-    table.insert(
+fn symbol_binding(symbol: &ObjectSymbol) -> Result<Elf64SymbolBinding> {
+    match symbol.info.get_enum(Elf64SymbolInfo::st_bind) {
+        Some(
+            binding @ (Elf64SymbolBinding::STB_LOCAL
+            | Elf64SymbolBinding::STB_GLOBAL
+            | Elf64SymbolBinding::STB_WEAK),
+        ) => Ok(binding),
+        _ => bail!(
+            "unsupported symbol binding {} for symbol: {} in file: {} (expected LOCAL, GLOBAL, or WEAK)",
+            symbol.info.get(Elf64SymbolInfo::st_bind),
+            symbol.name,
+            symbol.file_id
+        ),
+    }
+}
+
+fn insert_input(table: &mut SymbolTable, symbol: &ObjectSymbol) -> Result<SymbolId> {
+    Ok(table.insert(
         symbol.name,
         symbol.info.get_enum(Elf64SymbolInfo::st_type),
+        symbol_binding(symbol)?,
+        symbol.size,
+        symbol.other,
         Definition::Input {
             file_id: symbol.file_id,
             section_idx: symbol.section_idx,
             value: symbol.value,
         },
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -354,6 +408,26 @@ mod tests {
             info: Elf64SymbolInfo::from_bits(((binding as u8) << 4) | ty as u8),
             section_idx,
             value: 42,
+            size: 0,
+            other: 0,
+        }
+    }
+
+    #[test]
+    fn unsupported_bindings_report_an_error_instead_of_panicking() {
+        for binding in [3, Elf64SymbolBinding::STB_LOOS as u8] {
+            let mut input = symbol(
+                0,
+                "unsupported",
+                Elf64SymbolBinding::STB_GLOBAL,
+                Elf64SymbolType::STT_OBJECT,
+                Elf64SymbolSectionIdx::AbsoluteSymbols,
+            );
+            input.info = input.info.set(Elf64SymbolInfo::st_bind, binding);
+            let error = resolve_names(&[input], &[]).err().unwrap().to_string();
+            assert!(error.contains(&format!("unsupported symbol binding {binding}")));
+            assert!(error.contains("unsupported"));
+            assert!(error.contains("file:"));
         }
     }
 

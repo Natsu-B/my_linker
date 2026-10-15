@@ -163,11 +163,24 @@ bitregs! {
         pub SHF_WRITE@[0:0],
         pub SHF_ALLOC@[1:1],
         pub SHF_EXECINSTR@[2:2],
-        reserved_low@[9:3],
+        reserved@[3:3] [ignore],
+        pub SHF_MERGE@[4:4],
+        pub SHF_STRINGS@[5:5],
+        pub SHF_INFO_LINK@[6:6],
+        reserved@[9:7] [ignore],
         pub SHF_TLS@[10:10],
-        reserved@[63:11],
+        reserved@[63:11] [ignore],
     }
 }
+
+/// Section index for undefined symbols and absent section references.
+pub const SHN_UNDEF: u16 = 0;
+/// First reserved index; larger section tables require extended indices.
+pub const SHN_LORESERVE: u16 = 0xff00;
+/// Section index for symbols whose values are absolute.
+pub const SHN_ABS: u16 = 0xfff1;
+/// Section index for common symbols awaiting allocation.
+pub const SHN_COMMON: u16 = 0xfff2;
 
 #[repr(C)]
 #[derive(Clone, Copy)]

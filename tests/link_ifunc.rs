@@ -201,9 +201,59 @@ SECTIONS {
             .arg(if custom_script { &archive } else { &resolvers })
             .assert()
             .success();
+        if !custom_script {
+            let bytes = read_output_bytes(&output);
+            let executable = parse_elf64(&bytes);
+            let rela = executable
+                .sections()
+                .find(|section| section.name().unwrap() == ".rela.plt")
+                .unwrap();
+            assert_eq!(rela.section_type(), elf::Elf64SectionType::SHT_RELA);
+            assert_eq!(rela.entry_size(), 24);
+            let relocations = rela.rela().unwrap().collect::<Vec<_>>();
+            assert_eq!(relocations.len(), 3);
+            assert!(
+                relocations
+                    .iter()
+                    .all(|relocation| relocation.info().sym == 0 && relocation.info().ty == 37)
+            );
+            let target = executable
+                .sections()
+                .find(|section| u32::from(section.idx()) == rela.info())
+                .unwrap();
+            assert_eq!(target.name().unwrap(), ".got");
+            let table = executable
+                .sections()
+                .find(|section| section.name().unwrap() == ".symtab")
+                .unwrap();
+            let got = table
+                .symbols()
+                .unwrap()
+                .find(|symbol| symbol.name().unwrap() == "_GLOBAL_OFFSET_TABLE_")
+                .unwrap();
+            assert_eq!(got.value(), target.address());
+            assert_eq!(
+                got.section_idx(),
+                elf::Elf64SymbolSectionIdx::Index(target.idx())
+            );
+            assert_eq!(
+                got.info().get_enum(elf::Elf64SymbolInfo::st_type),
+                Some(elf::Elf64SymbolType::STT_NOTYPE)
+            );
+        }
         if custom_script {
             let bytes = read_output_bytes(&output);
             let executable = parse_elf64(&bytes);
+            let rela = executable
+                .sections()
+                .find(|section| section.name().unwrap() == ".records")
+                .unwrap();
+            assert_eq!(rela.flags().get(elf::Elf64SectionFlags::SHF_INFO_LINK), 1);
+            let target = executable
+                .sections()
+                .find(|section| u32::from(section.idx()) == rela.info())
+                .unwrap();
+            assert_eq!(target.name().unwrap(), ".storage");
             let records = executable
                 .program_headers()
                 .find(|header| header.flags() == elf::PF_R)

@@ -5,13 +5,236 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use elf::{
-    Elf64ProgramHeaderFlags, ElfProgramHeaderType, ExecElf64Writer, LoadSegment, PF_R, PF_W,
-    ProgramHeader,
-    write::{ELF_HEADER_SIZE, PROGRAM_HEADER_SIZE},
+    Elf64ProgramHeaderFlags, Elf64SectionFlags, Elf64SectionType, Elf64SymbolSectionIdx,
+    Elf64SymbolType, ElfProgramHeaderType, ExecElf64Writer, LoadSegment, PF_R, PF_W, ProgramHeader,
+    SHN_ABS, SHN_LORESERVE, SHN_UNDEF,
+    write::{ELF_HEADER_SIZE, Elf64SymbolEntry, PROGRAM_HEADER_SIZE, Section, SymbolTableBuilder},
 };
 use memmap2::MmapMut;
 
-use crate::link::{ElfData, PAGE_SIZE, SectionPlacement};
+use crate::{
+    link::{ElfData, Linked, PAGE_SIZE, SectionPlacement},
+    resolve::{Definition, ResolvedSymbol},
+    synthetic::SyntheticSection,
+};
+
+/// Translate layout indices to ELF section indices without emitting empty sections.
+struct SectionHeaderIndices {
+    by_output: Vec<Option<u16>>,
+    kept_count: usize,
+}
+
+impl SectionHeaderIndices {
+    fn new(sections: &[SectionPlacement]) -> Result<Self> {
+        let mut by_output = Vec::with_capacity(sections.len());
+        let mut kept_count = 0;
+        for section in sections {
+            let index = if section.size == 0 {
+                None
+            } else {
+                kept_count += 1;
+                let index = u16::try_from(kept_count).context("too many output sections")?;
+                ensure!(
+                    index < SHN_LORESERVE,
+                    "output section requires an extended index"
+                );
+                Some(index)
+            };
+            by_output.push(index);
+        }
+        Ok(Self {
+            by_output,
+            kept_count,
+        })
+    }
+
+    fn get(&self, output_index: usize) -> Result<u16> {
+        self.by_output
+            .get(output_index)
+            .copied()
+            .flatten()
+            .context("output section has no section header")
+    }
+
+    fn for_symbol(&self, output_index: usize) -> Result<u16> {
+        let following = self
+            .by_output
+            .get(output_index..)
+            .context("symbol output section index is out of range")?;
+        // An empty section's markers retain their values. Associate them with
+        // the following kept section, or the preceding one at the end of the
+        // image. This also makes empty preinit-array markers name .init_array.
+        Ok(following
+            .iter()
+            .find_map(|index| *index)
+            .or_else(|| {
+                self.by_output[..output_index]
+                    .iter()
+                    .rev()
+                    .find_map(|index| *index)
+            })
+            .unwrap_or(SHN_ABS))
+    }
+}
+
+fn contains_synthetic(section: &SectionPlacement, synthetic: SyntheticSection) -> bool {
+    section
+        .sections_data
+        .iter()
+        .any(|(input, _)| synthetic.is_input(input))
+}
+
+fn output_sections(
+    sections: &[SectionPlacement],
+    indices: &SectionHeaderIndices,
+) -> Result<Vec<Section>> {
+    sections
+        .iter()
+        .filter(|section| section.size != 0)
+        .map(|section| {
+            let first = section.sections_data.first().map(|(input, _)| input);
+            let section_type = if section.data.is_none() {
+                Elf64SectionType::SHT_NOBITS
+            } else {
+                first.map_or(Elf64SectionType::SHT_PROGBITS, |input| input.section_type)
+            };
+            let mut entry_size = first.map_or(0, |input| input.entry_size);
+            if section
+                .sections_data
+                .iter()
+                .any(|(input, _)| input.entry_size != entry_size)
+            {
+                entry_size = 0;
+            }
+            let has_tls = section
+                .sections_data
+                .iter()
+                .any(|(input, _)| input.flags.get(Elf64SectionFlags::SHF_TLS) != 0);
+            // MERGE/STRINGS describe the whole output only when every input has
+            // that attribute and their fixed-size entries agree.
+            let merge = entry_size != 0
+                && section
+                    .sections_data
+                    .iter()
+                    .all(|(input, _)| input.flags.get(Elf64SectionFlags::SHF_MERGE) != 0);
+            let strings = entry_size != 0
+                && section
+                    .sections_data
+                    .iter()
+                    .all(|(input, _)| input.flags.get(Elf64SectionFlags::SHF_STRINGS) != 0);
+            let mut flags = Elf64SectionFlags::new()
+                .set(Elf64SectionFlags::SHF_ALLOC, 1)
+                .set(
+                    Elf64SectionFlags::SHF_WRITE,
+                    u64::from(section.flags.get(Elf64ProgramHeaderFlags::writable)),
+                )
+                .set(
+                    Elf64SectionFlags::SHF_EXECINSTR,
+                    u64::from(section.flags.get(Elf64ProgramHeaderFlags::executable)),
+                )
+                .set(Elf64SectionFlags::SHF_TLS, u64::from(has_tls))
+                .set(Elf64SectionFlags::SHF_MERGE, u64::from(merge))
+                .set(Elf64SectionFlags::SHF_STRINGS, u64::from(strings));
+            let info = if contains_synthetic(section, SyntheticSection::RelaIplt) {
+                // IRELATIVE records write the synthetic GOT slots. SHF_INFO_LINK
+                // makes sh_info identify that output section, even under a custom name.
+                let target = sections
+                    .iter()
+                    .position(|candidate| contains_synthetic(candidate, SyntheticSection::Got))
+                    .context("IRELATIVE records have no GOT output section")?;
+                flags = flags.set(Elf64SectionFlags::SHF_INFO_LINK, 1);
+                u32::from(indices.get(target)?)
+            } else {
+                0
+            };
+            Ok(Section {
+                name: section.name.clone(),
+                section_type,
+                flags,
+                address: *section.va.get().context("output section has no address")?,
+                size: section.size,
+                link: u32::from(SHN_UNDEF),
+                info,
+                align: section.align,
+                entry_size,
+                data: None,
+            })
+        })
+        .collect()
+}
+
+fn output_symbol<'a>(
+    symbol: &'a ResolvedSymbol,
+    linked: &Linked,
+    indices: &SectionHeaderIndices,
+) -> Result<Elf64SymbolEntry<'a>> {
+    let output_index = match symbol.definition {
+        Definition::Input {
+            file_id,
+            section_idx: Elf64SymbolSectionIdx::Index(index),
+            ..
+        } => Some(
+            linked
+                .section_index
+                .get(&(file_id, index))
+                .context("symbol section was not placed")?
+                .output_idx,
+        ),
+        Definition::Script { .. } => linked
+            .elf_data
+            .script_symbol_sections
+            .get(&symbol.name)
+            .copied(),
+        _ => None,
+    };
+    let section_index = if let Some(index) = output_index {
+        indices.for_symbol(index)?
+    } else if matches!(symbol.definition, Definition::UndefinedWeak) {
+        SHN_UNDEF
+    } else {
+        SHN_ABS
+    };
+    let mut value = *symbol.va.get().context("output symbol has no value")?;
+    if symbol.ty == Some(Elf64SymbolType::STT_TLS) && output_index.is_some() {
+        // Executable TLS st_value is an offset in the TLS template, whereas
+        // relocation evaluation keeps using the symbol's virtual address.
+        value = value
+            .checked_sub(
+                linked
+                    .elf_data
+                    .tls
+                    .context("TLS symbol without PT_TLS")?
+                    .vaddr,
+            )
+            .context("TLS symbol precedes the TLS template")?;
+    }
+    Ok(Elf64SymbolEntry {
+        name: &symbol.name,
+        binding: symbol.binding,
+        ty: symbol.ty.unwrap_or(Elf64SymbolType::STT_NOTYPE),
+        other: symbol.other,
+        section_index,
+        value,
+        size: symbol.size,
+    })
+}
+
+fn symbol_table_sections(linked: &Linked, indices: &SectionHeaderIndices) -> Result<[Section; 2]> {
+    let mut builder = SymbolTableBuilder::new();
+    for symbol in linked.symbols.all_symbols().filter(|symbol| {
+        !symbol.name.is_empty()
+            && symbol.va.get().is_some()
+            && !matches!(
+                symbol.ty,
+                Some(Elf64SymbolType::STT_SECTION | Elf64SymbolType::STT_FILE)
+            )
+    }) {
+        builder.add(output_symbol(symbol, linked, indices)?);
+    }
+    // The allocated headers follow section zero, then .symtab and .strtab.
+    let strtab_index = u32::try_from(indices.kept_count + 2).context("too many sections")?;
+    builder.build(strtab_index)
+}
 
 // Output-section data remains separate until relocations have been applied.
 // Consecutive output sections with the same permissions share one PT_LOAD.
@@ -64,6 +287,10 @@ fn load_segments(sections: Vec<SectionPlacement>, elf_data: &ElfData) -> Result<
                     .resize(usize::try_from(offset).context("segment too large")?, 0);
                 segment.data.extend(data);
             }
+            segment.data.resize(
+                usize::try_from(offset + section.size).context("segment too large")?,
+                0,
+            );
         }
         segment.mem_size = offset
             .checked_add(section.size)
@@ -96,6 +323,8 @@ fn executable_writer(
     elf_data: &ElfData,
     entry: u64,
 ) -> Result<ExecElf64Writer> {
+    let indices = SectionHeaderIndices::new(&section_placements)?;
+    let sections = output_sections(&section_placements, &indices)?;
     let mut writer = ExecElf64Writer::new_x86_64_executable(entry);
     let mut segments = load_segments(section_placements, elf_data)?.into_iter();
     writer.header_segment = segments.next();
@@ -142,17 +371,16 @@ fn executable_writer(
             .context("PT_TLS header was not added")?;
         header.offset = offset;
     }
+    writer.sections = sections;
     Ok(writer)
 }
 
-pub fn output(
-    section_placements: Vec<SectionPlacement>,
-    elf_data: ElfData,
-    output_file: String,
-    entry: u64,
-) -> Result<()> {
+pub fn output(linked: Linked, output_file: String, entry: u64) -> Result<()> {
     pr_debug!("Write output file: {}", output_file);
-    let writer = executable_writer(section_placements, &elf_data, entry)?;
+    let indices = SectionHeaderIndices::new(&linked.sections)?;
+    let tables = symbol_table_sections(&linked, &indices)?;
+    let mut writer = executable_writer(linked.sections, &linked.elf_data, entry)?;
+    writer.sections.extend(tables);
     let file_size = writer.file_size()?;
     let file = OpenOptions::new()
         .read(true)
@@ -194,6 +422,7 @@ mod tests {
             header_vaddr: 0x400000,
             sizeof_headers: 232,
             script_symbols: HashMap::new(),
+            script_symbol_sections: HashMap::new(),
             tls: None,
         };
         let segments = load_segments(
@@ -227,7 +456,16 @@ mod tests {
             file_id: FileId::Object(0),
             idx: 1,
             name,
-            flags: Elf64SectionFlags::from_bits(0x403),
+            flags: Elf64SectionFlags::new()
+                .set(Elf64SectionFlags::SHF_ALLOC, 1)
+                .set(Elf64SectionFlags::SHF_WRITE, 1)
+                .set(Elf64SectionFlags::SHF_TLS, 1),
+            section_type: if data.is_some() {
+                elf::Elf64SectionType::SHT_PROGBITS
+            } else {
+                elf::Elf64SectionType::SHT_NOBITS
+            },
+            entry_size: 0,
             align,
             size,
             data: data.clone().map(Cow::Owned),
@@ -284,6 +522,7 @@ mod tests {
                     header_vaddr: 0x400000,
                     sizeof_headers: ELF_HEADER_SIZE + 4 * PROGRAM_HEADER_SIZE,
                     script_symbols: HashMap::new(),
+                    script_symbol_sections: HashMap::new(),
                     tls,
                 };
                 let writer = executable_writer(sections, &elf_data, 0x400000).unwrap();
@@ -338,6 +577,7 @@ mod tests {
             header_vaddr: 0x400000,
             sizeof_headers: ELF_HEADER_SIZE + 4 * PROGRAM_HEADER_SIZE,
             script_symbols: HashMap::new(),
+            script_symbol_sections: HashMap::new(),
             tls: Some(tls),
         };
         let writer = executable_writer(sections, &elf_data, 0x400000).unwrap();

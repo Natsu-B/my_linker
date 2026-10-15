@@ -3,11 +3,16 @@ use typestate::{RawReg, bitregs};
 
 use crate::{
     PF_R, PF_W, PF_X,
-    abi::{ElfEndian, ElfFileType, ElfMachineType, ElfProgramHeaderType},
+    abi::{
+        Elf64SectionFlags, Elf64SectionType, Elf64SymbolBinding, Elf64SymbolInfo, Elf64SymbolType,
+        ElfEndian, ElfFileType, ElfMachineType, ElfProgramHeaderType, SHN_LORESERVE, SHN_UNDEF,
+    },
 };
 
 pub const ELF_HEADER_SIZE: u64 = 64;
 pub const PROGRAM_HEADER_SIZE: u64 = 56;
+pub const SECTION_HEADER_SIZE: u64 = 64;
+pub const SYMBOL_ENTRY_SIZE: u64 = 24;
 const ELF_VERSION_CURRENT: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -18,6 +23,120 @@ pub struct ExecElf64Writer {
     pub segments: Vec<LoadSegment>,
     pub program_headers: Vec<ProgramHeader>,
     pub header_segment: Option<LoadSegment>,
+    /// Sections in index order, excluding the implicit null section and the
+    /// automatically generated final .shstrtab. Empty means no section table.
+    pub sections: Vec<Section>,
+}
+
+/// An allocated section describes bytes already present in a PT_LOAD.
+/// Non-allocated section data is appended after all load segments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Section {
+    pub name: String,
+    pub section_type: Elf64SectionType,
+    pub flags: Elf64SectionFlags,
+    pub address: u64,
+    pub size: u64,
+    pub link: u32,
+    pub info: u32,
+    pub align: u64,
+    pub entry_size: u64,
+    pub data: Option<Vec<u8>>,
+}
+
+/// One ELF64 symbol, with its final value and section index supplied by a caller.
+pub struct Elf64SymbolEntry<'a> {
+    pub name: &'a str,
+    pub binding: Elf64SymbolBinding,
+    pub ty: Elf64SymbolType,
+    pub other: u8,
+    pub section_index: u16,
+    pub value: u64,
+    pub size: u64,
+}
+
+impl Elf64SymbolEntry<'_> {
+    fn encode_into(&self, bytes: &mut Vec<u8>, name_offset: u32) {
+        let info = Elf64SymbolInfo::new()
+            .set(Elf64SymbolInfo::st_bind, self.binding as u8)
+            .set(Elf64SymbolInfo::st_type, self.ty as u8);
+        bytes.extend_from_slice(&name_offset.to_le_bytes());
+        bytes.push(info.to_raw());
+        bytes.push(self.other);
+        bytes.extend_from_slice(&self.section_index.to_le_bytes());
+        bytes.extend_from_slice(&self.value.to_le_bytes());
+        bytes.extend_from_slice(&self.size.to_le_bytes());
+    }
+}
+
+/// Build a little-endian ELF64 .symtab and its associated .strtab.
+/// The caller selects symbols; this builder handles ELF ordering and encoding.
+#[derive(Default)]
+pub struct SymbolTableBuilder<'a> {
+    symbols: Vec<Elf64SymbolEntry<'a>>,
+}
+
+impl<'a> SymbolTableBuilder<'a> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add(&mut self, symbol: Elf64SymbolEntry<'a>) {
+        self.symbols.push(symbol);
+    }
+
+    /// Supply the section index at which the returned .strtab will be placed.
+    pub fn build(mut self, strtab_index: u32) -> Result<[Section; 2]> {
+        ensure!(
+            strtab_index != u32::from(SHN_UNDEF),
+            "symbol string table requires a section index"
+        );
+        // Symbol zero is the null entry, and sh_info identifies the first
+        // non-local entry. Stable sorting preserves order within each group.
+        self.symbols
+            .sort_by_key(|symbol| symbol.binding != Elf64SymbolBinding::STB_LOCAL);
+        let first_global = 1 + self
+            .symbols
+            .iter()
+            .take_while(|symbol| symbol.binding == Elf64SymbolBinding::STB_LOCAL)
+            .count();
+        let mut symtab = vec![0; SYMBOL_ENTRY_SIZE as usize];
+        let mut strtab = vec![0];
+        for symbol in self.symbols {
+            ensure!(!symbol.name.contains('\0'), "symbol name contains NUL");
+            let name_offset =
+                u32::try_from(strtab.len()).context("symbol string table too large")?;
+            strtab.extend_from_slice(symbol.name.as_bytes());
+            strtab.push(0);
+            symbol.encode_into(&mut symtab, name_offset);
+        }
+        Ok([
+            Section {
+                name: ".symtab".to_string(),
+                section_type: Elf64SectionType::SHT_SYMTAB,
+                flags: Elf64SectionFlags::new(),
+                address: 0,
+                size: symtab.len() as u64,
+                link: strtab_index,
+                info: u32::try_from(first_global).context("too many local symbols")?,
+                align: 8,
+                entry_size: SYMBOL_ENTRY_SIZE,
+                data: Some(symtab),
+            },
+            Section {
+                name: ".strtab".to_string(),
+                section_type: Elf64SectionType::SHT_STRTAB,
+                flags: Elf64SectionFlags::new(),
+                address: 0,
+                size: strtab.len() as u64,
+                link: u32::from(SHN_UNDEF),
+                info: 0,
+                align: 1,
+                entry_size: 0,
+                data: Some(strtab),
+            },
+        ])
+    }
 }
 
 /// Non-PT_LOAD program header that refers to bytes already placed by load segments.
@@ -48,7 +167,7 @@ bitregs! {
         pub executable@[0:0],
         pub writable@[1:1],
         pub readable@[2:2],
-        _reserved@[31:3],
+        reserved@[31:3] [ignore],
     }
 }
 
@@ -59,6 +178,15 @@ struct ElfLayout {
     phnum: u16,
     header_segment: Option<SegmentLayout>,
     segments: Vec<SegmentLayout>,
+    sections: Vec<SectionLayout>,
+    shoff: u64,
+    shstrtab: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SectionLayout {
+    name: u32,
+    offset: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,6 +209,7 @@ impl ExecElf64Writer {
             segments: Vec::new(),
             program_headers: Vec::new(),
             header_segment: None,
+            sections: Vec::new(),
         }
     }
 
@@ -175,13 +304,91 @@ impl ExecElf64Writer {
             self.validate_program_header(header, cursor)?;
         }
 
-        Ok(ElfLayout {
+        let mut layout = ElfLayout {
             file_size: cursor,
             phoff,
             phnum,
             header_segment,
             segments: layouts,
-        })
+            sections: Vec::new(),
+            shoff: 0,
+            shstrtab: Vec::new(),
+        };
+        self.layout_sections(&mut layout)?;
+        Ok(layout)
+    }
+
+    fn layout_sections(&self, layout: &mut ElfLayout) -> Result<()> {
+        if self.sections.is_empty() {
+            return Ok(());
+        }
+        // Extended section indices (SHN_XINDEX) are outside this writer's subset.
+        ensure!(
+            self.sections.len() + 2 < usize::from(SHN_LORESERVE),
+            "too many section headers"
+        );
+        layout.shstrtab.push(0);
+        let mut cursor = layout.file_size;
+        for section in &self.sections {
+            self.validate_section(section)?;
+            let name = u32::try_from(layout.shstrtab.len()).context("section names too large")?;
+            layout.shstrtab.extend_from_slice(section.name.as_bytes());
+            layout.shstrtab.push(0);
+            let offset = if section.flags.get(Elf64SectionFlags::SHF_ALLOC) != 0 {
+                let segment = layout
+                    .header_segment
+                    .iter()
+                    .chain(&layout.segments)
+                    .find(|segment| {
+                        section
+                            .address
+                            .checked_sub(segment.vaddr)
+                            .is_some_and(|offset| {
+                                offset.checked_add(section.size).is_some_and(|end| {
+                                    end <= segment.mem_size
+                                        && (section.section_type == Elf64SectionType::SHT_NOBITS
+                                            || end <= segment.file_size)
+                                })
+                            })
+                    })
+                    .with_context(|| {
+                        format!("allocated section {} is outside its PT_LOAD", section.name)
+                    })?;
+                segment
+                    .offset
+                    .checked_add(section.address - segment.vaddr)
+                    .context("section offset exceeds u64")?
+            } else {
+                cursor = cursor
+                    .checked_next_multiple_of(section.align.max(1))
+                    .context("section alignment exceeds u64")?;
+                let offset = cursor;
+                if section.section_type != Elf64SectionType::SHT_NOBITS {
+                    cursor = cursor
+                        .checked_add(section.size)
+                        .context("section data exceeds u64")?;
+                }
+                offset
+            };
+            layout.sections.push(SectionLayout { name, offset });
+        }
+        let name = u32::try_from(layout.shstrtab.len()).context("section names too large")?;
+        layout.shstrtab.extend_from_slice(b".shstrtab\0");
+        layout.sections.push(SectionLayout {
+            name,
+            offset: cursor,
+        });
+        cursor = cursor
+            .checked_add(layout.shstrtab.len() as u64)
+            .context("section names exceed u64")?;
+        layout.shoff = cursor
+            .checked_next_multiple_of(8)
+            .context("section table alignment exceeds u64")?;
+        layout.file_size = layout
+            .shoff
+            .checked_add((layout.sections.len() as u64 + 1) * SECTION_HEADER_SIZE)
+            .context("section table exceeds u64")?;
+        Ok(())
     }
 
     pub fn file_size(&self) -> Result<u64> {
@@ -251,14 +458,28 @@ impl ExecElf64Writer {
         write_u32(out, 20, ELF_VERSION_CURRENT, self.endian)?;
         write_u64(out, 24, self.entry, self.endian)?;
         write_u64(out, 32, layout.phoff, self.endian)?;
-        write_u64(out, 40, 0, self.endian)?;
+        write_u64(out, 40, layout.shoff, self.endian)?;
         write_u32(out, 48, 0, self.endian)?;
         write_u16(out, 52, ELF_HEADER_SIZE as u16, self.endian)?;
         write_u16(out, 54, PROGRAM_HEADER_SIZE as u16, self.endian)?;
         write_u16(out, 56, layout.phnum, self.endian)?;
-        write_u16(out, 58, 0, self.endian)?;
-        write_u16(out, 60, 0, self.endian)?;
-        write_u16(out, 62, 0, self.endian)?;
+        let shnum = if layout.sections.is_empty() {
+            0
+        } else {
+            layout.sections.len() as u16 + 1
+        };
+        write_u16(
+            out,
+            58,
+            if shnum == 0 {
+                0
+            } else {
+                SECTION_HEADER_SIZE as u16
+            },
+            self.endian,
+        )?;
+        write_u16(out, 60, shnum, self.endian)?;
+        write_u16(out, 62, shnum.saturating_sub(1), self.endian)?;
 
         let mut phdr_idx = 0;
         if let Some(header_segment) = &layout.header_segment {
@@ -314,6 +535,94 @@ impl ExecElf64Writer {
             phdr_idx += 1;
         }
 
+        self.write_sections(out, &layout)?;
+        Ok(())
+    }
+
+    fn write_sections(&self, out: &mut [u8], layout: &ElfLayout) -> Result<()> {
+        if self.sections.is_empty() {
+            return Ok(());
+        }
+        let names = Section {
+            name: ".shstrtab".to_string(),
+            section_type: Elf64SectionType::SHT_STRTAB,
+            flags: Elf64SectionFlags::new(),
+            address: 0,
+            size: layout.shstrtab.len() as u64,
+            link: u32::from(SHN_UNDEF),
+            info: 0,
+            align: 1,
+            entry_size: 0,
+            data: None,
+        };
+        for (index, (section, placed)) in self
+            .sections
+            .iter()
+            .chain([&names])
+            .zip(&layout.sections)
+            .enumerate()
+        {
+            let header = usize::try_from(layout.shoff + (index as u64 + 1) * SECTION_HEADER_SIZE)
+                .context("section header offset too large")?;
+            write_u32(out, header, placed.name, self.endian)?;
+            write_u32(out, header + 4, section.section_type.raw(), self.endian)?;
+            write_u64(out, header + 8, section.flags.to_raw(), self.endian)?;
+            write_u64(out, header + 16, section.address, self.endian)?;
+            write_u64(out, header + 24, placed.offset, self.endian)?;
+            write_u64(out, header + 32, section.size, self.endian)?;
+            write_u32(out, header + 40, section.link, self.endian)?;
+            write_u32(out, header + 44, section.info, self.endian)?;
+            write_u64(out, header + 48, section.align, self.endian)?;
+            write_u64(out, header + 56, section.entry_size, self.endian)?;
+            let data = if index == self.sections.len() {
+                Some(layout.shstrtab.as_slice())
+            } else {
+                section.data.as_deref()
+            };
+            if let Some(data) = data {
+                write_bytes(
+                    out,
+                    usize::try_from(placed.offset).context("section offset too large")?,
+                    data,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_section(&self, section: &Section) -> Result<()> {
+        ensure!(!section.name.contains('\0'), "section name contains NUL");
+        ensure!(
+            section.align == 0 || section.align.is_power_of_two(),
+            "section alignment must be 0 or a power of two"
+        );
+        ensure!(
+            section.link < self.sections.len() as u32 + 2,
+            "section link index is out of range"
+        );
+        if section.flags.get(Elf64SectionFlags::SHF_ALLOC) != 0 {
+            ensure!(
+                section.data.is_none(),
+                "allocated section data must come from PT_LOAD"
+            );
+            ensure!(
+                section.address.is_multiple_of(section.align.max(1)),
+                "allocated section address is misaligned"
+            );
+        } else if section.section_type == Elf64SectionType::SHT_NOBITS {
+            ensure!(
+                section.data.is_none(),
+                "NOBITS section cannot have file data"
+            );
+        } else {
+            ensure!(
+                section
+                    .data
+                    .as_ref()
+                    .is_some_and(|data| data.len() as u64 == section.size),
+                "non-allocated section size does not match data"
+            );
+        }
         Ok(())
     }
 
@@ -480,9 +789,172 @@ fn write_bytes(out: &mut [u8], offset: usize, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        Elf64, Elf64ProgramHeaderFlags, ElfFileType, ElfProgramHeaderType, PF_R, PF_W, PF_X,
-        write::{ExecElf64Writer, LoadSegment, ProgramHeader},
+        Elf64, Elf64ProgramHeaderFlags, Elf64SectionFlags, Elf64SectionType, ElfFileType,
+        ElfProgramHeaderType, PF_R, PF_W, PF_X, SHN_UNDEF,
+        write::{ExecElf64Writer, LoadSegment, ProgramHeader, Section},
     };
+
+    #[test]
+    fn symbol_table_builder_orders_locals_and_round_trips_metadata() {
+        use super::{Elf64SymbolEntry, SYMBOL_ENTRY_SIZE, SymbolTableBuilder};
+        use crate::{
+            Elf64SymbolBinding, Elf64SymbolInfo, Elf64SymbolSectionIdx, Elf64SymbolType, SHN_ABS,
+            SHN_UNDEF,
+        };
+
+        let mut builder = SymbolTableBuilder::new();
+        for (name, binding, value, size) in [
+            ("global", Elf64SymbolBinding::STB_GLOBAL, 0x1234, 16),
+            ("local_first", Elf64SymbolBinding::STB_LOCAL, 0x2345, 8),
+            ("weak", Elf64SymbolBinding::STB_WEAK, 0, 0),
+            ("local_second", Elf64SymbolBinding::STB_LOCAL, 0x3456, 4),
+        ] {
+            builder.add(Elf64SymbolEntry {
+                name,
+                binding,
+                ty: Elf64SymbolType::STT_OBJECT,
+                other: 0,
+                section_index: if binding == Elf64SymbolBinding::STB_WEAK {
+                    SHN_UNDEF
+                } else {
+                    SHN_ABS
+                },
+                value,
+                size,
+            });
+        }
+        let mut writer = ExecElf64Writer::new_x86_64_executable(0x401000);
+        writer.add_load_segment(LoadSegment {
+            flags: Elf64ProgramHeaderFlags::from_bits(PF_R),
+            vaddr: 0x401000,
+            paddr: 0x401000,
+            align: 0x1000,
+            data: vec![0],
+            mem_size: 1,
+        });
+        // Only the symbol tables follow section zero; .strtab has index two.
+        writer.sections.extend(builder.build(2).unwrap());
+        let mut bytes = vec![0; writer.file_size().unwrap() as usize];
+        writer.write_into(&mut bytes).unwrap();
+        let elf = Elf64::new(&bytes).unwrap();
+        let table = elf
+            .sections()
+            .find(|section| section.name().unwrap() == ".symtab")
+            .unwrap();
+        let symbols = table.symbols().unwrap().collect::<Vec<_>>();
+        assert_eq!(table.info(), 3);
+        assert_eq!(table.entry_size(), SYMBOL_ENTRY_SIZE);
+        assert_eq!(
+            symbols
+                .iter()
+                .map(|symbol| symbol.name().unwrap())
+                .collect::<Vec<_>>(),
+            ["", "local_first", "local_second", "global", "weak"]
+        );
+        assert_eq!(symbols[0].section_idx(), Elf64SymbolSectionIdx::Undefined);
+        assert_eq!(symbols[3].value(), 0x1234);
+        assert_eq!(symbols[3].size(), 16);
+        assert_eq!(
+            symbols[3].section_idx(),
+            Elf64SymbolSectionIdx::AbsoluteSymbols
+        );
+        assert_eq!(
+            symbols[4].info().get_enum(Elf64SymbolInfo::st_bind),
+            Some(Elf64SymbolBinding::STB_WEAK)
+        );
+        assert_eq!(symbols[4].section_idx(), Elf64SymbolSectionIdx::Undefined);
+    }
+
+    #[test]
+    fn section_table_reuses_load_data_and_appends_non_allocated_bytes() {
+        let mut writer = ExecElf64Writer::new_x86_64_executable(0x401000);
+        writer.add_load_segment(LoadSegment {
+            flags: Elf64ProgramHeaderFlags::from_bits(PF_R | PF_W),
+            vaddr: 0x401000,
+            paddr: 0x401000,
+            align: 0x1000,
+            data: vec![1, 2, 3],
+            mem_size: 0x100,
+        });
+        let data_end = writer.file_size().unwrap();
+        writer.sections = vec![
+            Section {
+                name: ".data".to_string(),
+                section_type: Elf64SectionType::SHT_PROGBITS,
+                flags: Elf64SectionFlags::new()
+                    .set(Elf64SectionFlags::SHF_ALLOC, 1)
+                    .set(Elf64SectionFlags::SHF_WRITE, 1),
+                address: 0x401000,
+                size: 3,
+                link: u32::from(SHN_UNDEF),
+                info: 0,
+                align: 1,
+                entry_size: 0,
+                data: None,
+            },
+            Section {
+                name: ".bss".to_string(),
+                section_type: Elf64SectionType::SHT_NOBITS,
+                flags: Elf64SectionFlags::new()
+                    .set(Elf64SectionFlags::SHF_ALLOC, 1)
+                    .set(Elf64SectionFlags::SHF_WRITE, 1),
+                address: 0x401010,
+                size: 0xf0,
+                link: u32::from(SHN_UNDEF),
+                info: 0,
+                align: 16,
+                entry_size: 0,
+                data: None,
+            },
+            Section {
+                name: ".strtab".to_string(),
+                section_type: Elf64SectionType::SHT_STRTAB,
+                flags: Elf64SectionFlags::new(),
+                address: 0,
+                size: 5,
+                link: u32::from(SHN_UNDEF),
+                info: 0,
+                align: 8,
+                entry_size: 0,
+                data: Some(b"\0foo\0".to_vec()),
+            },
+        ];
+        let mut bytes = vec![0; writer.file_size().unwrap() as usize + 1];
+        writer.write_into(&mut bytes[1..]).unwrap();
+        let elf = Elf64::new(&bytes[1..]).unwrap();
+        let load = elf.program_headers().next().unwrap();
+        let sections = elf.sections().collect::<Vec<_>>();
+        assert_eq!(sections.len(), 5);
+        assert_eq!(sections[0].section_type(), Elf64SectionType::SHT_NULL);
+        assert_eq!(sections[1].data().unwrap(), &[1, 2, 3]);
+        assert_eq!(sections[1].offset(), load.offset());
+        assert_eq!(sections[2].offset(), load.offset() + 16);
+        assert_eq!(sections[2].data(), None);
+        assert_eq!(sections[3].offset(), data_end.next_multiple_of(8));
+        assert_eq!(sections[3].data().unwrap(), b"\0foo\0");
+        assert_eq!(sections[4].name().unwrap(), ".shstrtab");
+        assert_eq!(load.file_size(), 3);
+        assert_eq!(load.mem_size(), 0x100);
+        // Reject PROGBITS in a load's zero-fill tail, and inconsistent trailing
+        // section sizes, before touching an output buffer.
+        writer.sections[1].section_type = Elf64SectionType::SHT_PROGBITS;
+        assert!(
+            writer
+                .file_size()
+                .unwrap_err()
+                .to_string()
+                .contains("outside its PT_LOAD")
+        );
+        writer.sections[1].section_type = Elf64SectionType::SHT_NOBITS;
+        writer.sections[2].size = 6;
+        assert!(
+            writer
+                .file_size()
+                .unwrap_err()
+                .to_string()
+                .contains("size does not match data")
+        );
+    }
 
     #[test]
     fn write_into_preserves_offset_alignment_relation() {

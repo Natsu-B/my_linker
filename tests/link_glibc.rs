@@ -2,11 +2,16 @@
 
 mod common;
 
+use std::collections::BTreeSet;
+
 use common::toolchain::{
     cargo_linker_with_debug, compile_c_object, glibc_static_toolchain,
     link_static_executable_input, parse_elf64, read_output_bytes, run_executable,
 };
-use elf::{ElfFileType, ElfMachineType, ElfProgramHeaderType};
+use elf::{
+    Elf64SymbolBinding, Elf64SymbolInfo, Elf64SymbolSectionIdx, Elf64SymbolType, ElfFileType,
+    ElfMachineType, ElfProgramHeaderType,
+};
 use tempfile::tempdir;
 
 const HELLO_SOURCE: &str = r#"
@@ -50,8 +55,105 @@ fn links_static_glibc_hello_world() {
     let elf = parse_elf64(&bytes);
     assert_eq!(elf.elf_type(), ElfFileType::ET_EXEC);
     assert_eq!(elf.arch(), ElfMachineType::EM_X86_64);
+    assert!(
+        elf.sections()
+            .filter(|section| section.flags().get(elf::Elf64SectionFlags::SHF_ALLOC) != 0)
+            .all(|section| section.size() != 0)
+    );
+    assert!(
+        !elf.sections()
+            .any(|section| section.name().unwrap() == ".note.gnu.property")
+    );
+    assert!(
+        elf.sections()
+            .any(|section| section.name().unwrap() == ".note.ABI-tag")
+    );
 
     run_executable(&output).success().stdout(HELLO_STDOUT);
+    let baseline =
+        link_static_executable_input(&temp, "hello_ld", &toolchain.link_inputs(&[main.as_path()]));
+    let baseline_bytes = read_output_bytes(&baseline);
+    let baseline_elf = parse_elf64(&baseline_bytes);
+    let table = elf
+        .sections()
+        .find(|section| section.name().unwrap() == ".symtab")
+        .unwrap();
+    let init_array = elf
+        .sections()
+        .find(|section| section.name().unwrap() == ".init_array")
+        .unwrap();
+    for marker in ["__preinit_array_start", "__preinit_array_end"] {
+        let symbol = table
+            .symbols()
+            .unwrap()
+            .find(|symbol| symbol.name().unwrap() == marker)
+            .unwrap();
+        assert_eq!(
+            symbol.section_idx(),
+            Elf64SymbolSectionIdx::Index(init_array.idx())
+        );
+        assert_eq!(symbol.value(), init_array.address());
+    }
+    let globals = |elf: &elf::Elf64| {
+        let table = elf
+            .sections()
+            .find(|section| section.name().unwrap() == ".symtab")
+            .unwrap();
+        table
+            .symbols()
+            .unwrap()
+            .filter(|symbol| {
+                symbol.info().get_enum(Elf64SymbolInfo::st_bind)
+                    != Some(Elf64SymbolBinding::STB_LOCAL)
+                    && symbol.section_idx() != Elf64SymbolSectionIdx::Undefined
+            })
+            .map(|symbol| symbol.name().unwrap().to_string())
+            .collect::<BTreeSet<_>>()
+    };
+    assert_eq!(globals(&elf), globals(&baseline_elf));
+    for image in [&elf, &baseline_elf] {
+        let relocations = image
+            .sections()
+            .find(|section| section.name().unwrap() == ".rela.plt")
+            .unwrap();
+        assert_eq!(relocations.entry_size(), 24);
+        assert!(
+            relocations
+                .rela()
+                .unwrap()
+                .all(|relocation| relocation.info().ty == 37)
+        );
+        let table = image
+            .sections()
+            .find(|section| section.name().unwrap() == ".symtab")
+            .unwrap();
+        let symbols = table
+            .symbols()
+            .unwrap()
+            .map(|symbol| (symbol.name().unwrap().to_string(), symbol.value()))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            symbols["__init_array_end"] - symbols["__init_array_start"],
+            16
+        );
+        assert_eq!(
+            symbols["__fini_array_end"] - symbols["__fini_array_start"],
+            16
+        );
+        assert_eq!(
+            symbols["__rela_iplt_end"] - symbols["__rela_iplt_start"],
+            relocations.size()
+        );
+    }
+    let relocation_count = |image: &elf::Elf64| {
+        image
+            .sections()
+            .find(|section| section.name().unwrap() == ".rela.plt")
+            .unwrap()
+            .size()
+            / 24
+    };
+    assert_eq!(relocation_count(&elf), relocation_count(&baseline_elf));
 }
 
 #[test]
@@ -125,6 +227,7 @@ int main(void) {
         "thread TLS changed: 101 200\n",
         "main TLS unchanged: 31 7\n",
     );
+    let mut aligned_tls_sizes = Vec::new();
     for executable in [&baseline, &output] {
         let bytes = read_output_bytes(executable);
         let elf = parse_elf64(&bytes);
@@ -135,8 +238,54 @@ int main(void) {
         assert!(tls.file_size() > 0);
         assert!(tls.mem_size() > tls.file_size());
         assert_eq!(tls.align(), 64);
+        let tdata = elf
+            .sections()
+            .find(|section| section.name().unwrap() == ".tdata")
+            .unwrap();
+        let tbss = elf
+            .sections()
+            .find(|section| section.name().unwrap() == ".tbss")
+            .unwrap();
+        assert_eq!(tdata.address(), tls.vaddr());
+        assert_eq!(tdata.size(), tls.file_size());
+        assert_eq!(
+            tbss.address(),
+            (tdata.address() + tdata.size()).next_multiple_of(tbss.align())
+        );
+        assert_eq!(tbss.address() + tbss.size(), tls.vaddr() + tls.mem_size());
+        let table = elf
+            .sections()
+            .find(|section| section.name().unwrap() == ".symtab")
+            .unwrap();
+        let mut max_tls_end = 0;
+        for symbol in table.symbols().unwrap().filter(|symbol| {
+            symbol.info().get_enum(Elf64SymbolInfo::st_type) == Some(Elf64SymbolType::STT_TLS)
+        }) {
+            let Elf64SymbolSectionIdx::Index(index) = symbol.section_idx() else {
+                continue;
+            };
+            let section = elf
+                .sections()
+                .find(|section| section.idx() == index)
+                .unwrap();
+            let address = tls.vaddr() + symbol.value();
+            assert!(address >= section.address());
+            assert!(address + symbol.size() <= section.address() + section.size());
+            let align = match symbol.name().unwrap() {
+                "initialized" => 64,
+                "zero_initialized" | "errno" | "__libc_errno" => 4,
+                _ => 8,
+            };
+            assert_eq!(symbol.value() % align, 0);
+            max_tls_end = max_tls_end.max(symbol.value() + symbol.size());
+        }
+        assert_eq!(max_tls_end, tls.mem_size());
+        // Archive extraction order can change padding between TLS inputs.
+        // The x86-64 static TLS allocation rounds both templates to p_align.
+        aligned_tls_sizes.push(tls.mem_size().next_multiple_of(tls.align()));
         run_executable(executable).success().stdout(stdout);
     }
+    assert_eq!(aligned_tls_sizes[0], aligned_tls_sizes[1]);
 }
 
 #[test]

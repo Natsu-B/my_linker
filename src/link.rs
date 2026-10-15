@@ -38,6 +38,7 @@ pub struct ElfData {
     pub header_vaddr: u64,
     pub sizeof_headers: u64,
     pub script_symbols: HashMap<String, u64>,
+    pub script_symbol_sections: HashMap<String, usize>,
     pub tls: Option<TlsSegment>,
 }
 
@@ -101,6 +102,14 @@ enum MappedItem<'s> {
 }
 
 impl MappedOutput<'_> {
+    fn orphan_class(&self, inputs: &[Input]) -> (Elf64SectionFlags, bool) {
+        let nobits = self.statements.iter().all(|statement| match statement {
+            MappedStatement::Input(index) => inputs[*index].section.data.is_none(),
+            _ => true,
+        });
+        orphan_class(self.flags, nobits)
+    }
+
     fn is_tls(&self) -> bool {
         Elf64SectionFlags::from_bits(self.flags).get(Elf64SectionFlags::SHF_TLS) != 0
     }
@@ -224,6 +233,7 @@ pub fn link<'a>(object_files: Vec<ObjectFile<'a>>, script: &Script) -> Result<Li
                     .context("script places no allocatable output sections")?,
                 sizeof_headers,
                 script_symbols: layout.script_symbols,
+                script_symbol_sections: layout.script_symbol_sections,
                 tls,
             };
             let section_index = index_sections(&sections);
@@ -356,14 +366,24 @@ fn map_sections<'s>(script: &'s Script, inputs: &[Input]) -> Result<Vec<MappedIt
             output.add_input(index, inputs);
         } else {
             pr_info!(
-                "orphan section {} placed after the last output section with matching flags",
+                "orphan section {} placed after the last output section with matching attributes",
                 input.section.name
             );
-            let after = items
-                .iter()
-                .rposition(
-                    |item| matches!(item, MappedItem::Output(output) if output.flags == flags),
-                )
+            let class = orphan_class(flags, input.section.data.is_none());
+            let matching = |item: &MappedItem| match item {
+                MappedItem::Output(output) => output.orphan_class(inputs) == class,
+                _ => false,
+            };
+            // Prefer the related section name (rodata.cst32 follows .rodata),
+            // then fall back to the last output with the same memory attributes.
+            let related = items.iter().rposition(|item| {
+                let MappedItem::Output(output) = item else {
+                    return false;
+                };
+                matching(item) && section_family(&output.name) == section_family(input.section.name)
+            });
+            let after = related
+                .or_else(|| items.iter().rposition(matching))
                 .map_or(items.len(), |index| index + 1);
             let mut output = MappedOutput {
                 name: input.section.name.to_string(),
@@ -378,6 +398,34 @@ fn map_sections<'s>(script: &'s Script, inputs: &[Input]) -> Result<Vec<MappedIt
         }
     }
     Ok(items)
+}
+
+fn section_family(name: &str) -> &str {
+    name.trim_start_matches('.').split('.').next().unwrap_or("")
+}
+
+fn orphan_class(flags: u64, nobits: bool) -> (Elf64SectionFlags, bool) {
+    // MERGE and STRINGS describe the contents, not their memory permissions.
+    // Keep TLS and zero-fill separate from ordinary initialized data.
+    let flags = Elf64SectionFlags::from_bits(flags);
+    let attributes = Elf64SectionFlags::new()
+        .set(
+            Elf64SectionFlags::SHF_ALLOC,
+            flags.get(Elf64SectionFlags::SHF_ALLOC),
+        )
+        .set(
+            Elf64SectionFlags::SHF_WRITE,
+            flags.get(Elf64SectionFlags::SHF_WRITE),
+        )
+        .set(
+            Elf64SectionFlags::SHF_EXECINSTR,
+            flags.get(Elf64SectionFlags::SHF_EXECINSTR),
+        )
+        .set(
+            Elf64SectionFlags::SHF_TLS,
+            flags.get(Elf64SectionFlags::SHF_TLS),
+        );
+    (attributes, nobits)
 }
 
 fn select_inputs(
@@ -498,6 +546,10 @@ struct Layout<'s> {
     symbols: &'s SymbolTable,
     section_symbols: HashMap<(FileId, u16), Vec<&'s ResolvedSymbol>>,
     script_symbols: HashMap<String, u64>,
+    script_symbol_sections: HashMap<String, usize>,
+    symbol_sections: HashMap<String, usize>,
+    current_section: Option<usize>,
+    dot_section: Option<usize>,
     header_vaddr: Option<u64>,
 }
 
@@ -534,6 +586,10 @@ impl<'s> Layout<'s> {
             symbols,
             section_symbols,
             script_symbols: HashMap::new(),
+            script_symbol_sections: HashMap::new(),
+            symbol_sections: HashMap::new(),
+            current_section: None,
+            dot_section: None,
             header_vaddr: None,
         }
     }
@@ -546,10 +602,60 @@ impl<'s> Layout<'s> {
         if assignment.name == "." {
             self.context.dot = value;
         } else {
+            // Section identity cannot be reconstructed from an address: an
+            // absolute constant may equal an address, and end symbols lie on
+            // boundaries. Carry the association alongside the numeric value.
+            let section = self
+                .current_section
+                .or(self.expression_section(&assignment.value)?);
+            if let Some(section) = section {
+                self.script_symbol_sections
+                    .insert(assignment.name.clone(), section);
+                self.symbol_sections
+                    .insert(assignment.name.clone(), section);
+            } else {
+                self.script_symbol_sections.remove(&assignment.name);
+                self.symbol_sections.remove(&assignment.name);
+            }
             self.context.symbols.insert(assignment.name.clone(), value);
             self.script_symbols.insert(assignment.name.clone(), value);
         }
         Ok(())
+    }
+
+    fn expression_section(&self, expr: &Expr) -> Result<Option<usize>> {
+        Ok(match &expr.kind {
+            ExprKind::Dot => self.dot_section,
+            ExprKind::Symbol(name) => self.symbol_sections.get(name).copied(),
+            ExprKind::Binary(op, left, right) => {
+                let left = self.expression_section(left)?;
+                let right = self.expression_section(right)?;
+                match op {
+                    BinaryOp::Add => left.or(right),
+                    BinaryOp::Subtract if right.is_none() => left,
+                    _ => None,
+                }
+            }
+            ExprKind::Conditional(condition, yes, no) => {
+                self.expression_section(if eval::evaluate(condition, &self.context)? != 0 {
+                    yes
+                } else {
+                    no
+                })?
+            }
+            ExprKind::Call(Function::Align, args) => {
+                if args.len() == 1 {
+                    self.dot_section
+                } else {
+                    self.expression_section(&args[0])?
+                }
+            }
+            ExprKind::Call(Function::DataSegmentRelroEnd, args) => {
+                self.expression_section(&args[1])?
+            }
+            ExprKind::Call(Function::DataSegmentEnd, args) => self.expression_section(&args[0])?,
+            _ => None,
+        })
     }
 
     fn place<'a>(
@@ -626,6 +732,8 @@ impl<'s> Layout<'s> {
                         }
                     }
                     self.context.dot = va;
+                    self.current_section = Some(sections.len());
+                    self.dot_section = self.current_section;
                     let mut section = SectionPlacement {
                         name: output.name.clone(),
                         flags,
@@ -680,6 +788,8 @@ impl<'s> Layout<'s> {
                                             .checked_add(value)
                                             .context("symbol address exceeds u64")?,
                                     );
+                                    self.symbol_sections
+                                        .insert(symbol.name.clone(), sections.len());
                                 }
                                 self.context.dot = self
                                     .context
@@ -711,6 +821,7 @@ impl<'s> Layout<'s> {
                         section.size
                     );
                     sections.push(section);
+                    self.current_section = None;
                 }
             }
         }
@@ -760,6 +871,8 @@ mod tests {
                 idx: 1,
                 name,
                 flags: Elf64SectionFlags::from_bits(flags),
+                section_type: elf::Elf64SectionType::SHT_PROGBITS,
+                entry_size: 0,
                 align,
                 data: Some(std::borrow::Cow::Borrowed(&[1])),
                 size: 1,
