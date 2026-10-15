@@ -2,11 +2,11 @@
 
 mod common;
 
-use std::{path::Path, process::Command as StdCommand};
+use std::process::Command as StdCommand;
 
 use common::toolchain::{
     cargo_linker_with_debug, compile_c_object, glibc_static_toolchain, parse_elf64,
-    read_output_bytes,
+    read_output_bytes, run_executable,
 };
 use elf::{ElfFileType, ElfMachineType};
 use tempfile::tempdir;
@@ -21,21 +21,6 @@ int main(void) {
 "#;
 
 const HELLO_STDOUT: &str = "hello, glibc\n";
-
-fn run_and_assert_hello(executable: &Path) {
-    let output = StdCommand::new(executable).output().unwrap_or_else(|err| {
-        panic!("failed to run {}: {err}", executable.display());
-    });
-
-    assert!(
-        output.status.success(),
-        "{} exited with {}\nstderr:\n{}",
-        executable.display(),
-        output.status,
-        String::from_utf8_lossy(&output.stderr),
-    );
-    assert_eq!(String::from_utf8_lossy(&output.stdout), HELLO_STDOUT);
-}
 
 /// Sanity check for the toolchain itself: GNU ld must be able to link the same inputs.
 #[test]
@@ -60,7 +45,7 @@ fn gnu_ld_links_static_glibc_hello_world() {
         String::from_utf8_lossy(&result.stderr),
     );
 
-    run_and_assert_hello(&output);
+    run_executable(&output).success().stdout(HELLO_STDOUT);
 }
 
 #[test]
@@ -83,5 +68,5 @@ fn links_static_glibc_hello_world() {
     assert_eq!(elf.elf_type(), ElfFileType::ET_EXEC);
     assert_eq!(elf.arch(), ElfMachineType::EM_X86_64);
 
-    run_and_assert_hello(&output);
+    run_executable(&output).success().stdout(HELLO_STDOUT);
 }

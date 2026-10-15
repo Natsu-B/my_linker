@@ -1,10 +1,12 @@
 use std::{
     fs::{OpenOptions, Permissions},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::PermissionsExt,
 };
 
 use anyhow::{Ok, Result};
-use elf::{ExecElf64Writer, LoadSegment};
+use elf::{
+    Elf64ProgramHeaderFlags, ElfProgramHeaderType, ExecElf64Writer, LoadSegment, ProgramHeader,
+};
 use memmap2::MmapMut;
 
 use crate::link::{ElfData, PAGE_SIZE, SectionPlacement};
@@ -39,6 +41,18 @@ pub fn output(
         };
         writer.add_load_segment(segment);
     }
+    writer.add_program_header(ProgramHeader {
+        segment_type: ElfProgramHeaderType::PT_GNU_STACK,
+        flags: Elf64ProgramHeaderFlags::new()
+            .set(Elf64ProgramHeaderFlags::readable, 1)
+            .set(Elf64ProgramHeaderFlags::writable, 1),
+        offset: 0,
+        vaddr: 0,
+        paddr: 0,
+        file_size: 0,
+        mem_size: 0,
+        align: 16,
+    });
 
     let file_size = writer.file_size()?;
     let file = OpenOptions::new()
@@ -46,7 +60,6 @@ pub fn output(
         .write(true)
         .create(true)
         .truncate(true)
-        .mode(0o755)
         .open(&output_file)?;
 
     file.set_len(file_size)?;

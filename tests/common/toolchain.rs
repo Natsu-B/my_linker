@@ -188,6 +188,11 @@ pub fn cargo_linker_with_debug(debug: u8) -> Command {
     command
 }
 
+#[allow(dead_code)]
+pub fn run_executable(path: &Path) -> assert_cmd::assert::Assert {
+    Command::new(path).assert()
+}
+
 pub fn read_output_bytes(path: &Path) -> Vec<u8> {
     fs::read(path).unwrap_or_else(|err| {
         panic!("failed to read output file {}: {err}", path.display());

@@ -4,9 +4,9 @@ mod common;
 
 use std::{fs, os::unix::fs::PermissionsExt};
 
-use assert_cmd::Command;
 use common::toolchain::{
     assemble_object, cargo_linker_with_debug, create_archive, parse_elf64, read_output_bytes,
+    run_executable,
 };
 use elf::{ElfFileType, ElfMachineType, ElfProgramHeaderType, PF_R, PF_W, PF_X};
 use tempfile::tempdir;
@@ -58,7 +58,7 @@ _start:
         fs::metadata(&output).unwrap().permissions().mode() & 0o7777,
         0o755
     );
-    Command::new(&output).assert().success();
+    run_executable(&output).success();
 }
 
 #[test]
@@ -128,7 +128,7 @@ foo:
         Some(&0xC3),
         "call target {target:#x} should land on foo's ret instruction",
     );
-    Command::new(&output).assert().success();
+    run_executable(&output).success();
 }
 
 #[test]
@@ -199,7 +199,7 @@ foo:
         Some(&0xC3),
         "call target {target:#x} should land on foo's ret instruction",
     );
-    Command::new(&output).assert().code(37);
+    run_executable(&output).code(37);
 }
 
 #[test]
@@ -248,8 +248,9 @@ zero_slot:
         .filter(|header| header.segment_type() == ElfProgramHeaderType::PT_LOAD)
         .collect::<Vec<_>>();
 
-    assert!(
-        load_segments.len() == 5,
+    assert_eq!(
+        load_segments.len(),
+        5,
         "expected distinct PT_LOAD segments for headers, text, data, rodata, and bss",
     );
     assert!(
@@ -278,7 +279,7 @@ zero_slot:
             .any(|header| header.flags() == (PF_R | PF_W) && header.mem_size() > header.file_size()),
         "expected a bss-like segment with mem_size > file_size",
     );
-    Command::new(&output).assert().success();
+    run_executable(&output).success();
 }
 
 #[test]
@@ -368,5 +369,5 @@ exit:
     assert_eq!(stacks[0].file_size(), 0);
     assert_eq!(stacks[0].mem_size(), 0);
 
-    Command::new(&output).assert().success();
+    run_executable(&output).success();
 }
